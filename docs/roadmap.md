@@ -22,12 +22,37 @@
 | 外键强制 | ✅ 非法 `job_id` 插入抛 IntegrityError |
 | `jh --help` | ✅ 19 个顶层命令全部可见 |
 | 占位命令 | ✅ 退出码 2 + "该功能尚未实现 + 计划阶段" |
+| **CI（GitHub Actions）** | ✅ **ubuntu-latest + windows-latest 双平台全绿**<br>https://github.com/tuya12345/jobhunter/actions/runs/34926006464 |
 
-### P0 期间实测发现并修掉的问题（都是真实踩坑）
+### ★ CI 第一次跑就抓到一个真 bug（这就是双平台的价值）
+
+第一次 CI：**ubuntu 全绿，windows 挂在「确认 CLI 入口可用」**。
+
+- **现象**：GitHub Actions 的 windows runner 控制台编码是 **cp1252**（英文 Windows），
+  而 `jh --help` 文案里有 `→`、`·`、`⚠️`、emoji，rich 写流时抛
+  `UnicodeEncodeError: 'charmap' codec can't encode characters in position 12-15`
+  → **`jh --help` 整个命令非 0 退出**。也就是说：CLI 在英文 Windows 上完全不可用。
+- **为什么本地发现不了**：中文 Windows 是 cp936，也编不了这些字符，
+  但触发时机不同（我的 `setup_logging` 恰好先 reconfigure 了 stdout）；
+  ubuntu 是 UTF-8，永远正常。**只有"英文 Windows + 真实 CI"这个组合能暴露它。**
+- **根因**：rich 的 `Console` 在**构造时**缓存终端编码，而各命令模块的
+  `console = Console()` 是模块级对象（import 时创建）→ 在入口点里改编码已经太晚。
+- **修法**：`utils/io.py` 加 `force_utf8_output()`（stdout/stderr 切
+  `utf-8 + errors="replace"`，幂等、无 `reconfigure` 的流静默跳过），
+  并在 `jobhunter/__init__.py` 包导入的**最前面**调用。
+- **固化**：新增回归测试 `test_cli_survives_non_utf8_console`
+  （子进程 + `PYTHONIOENCODING` 分别设 cp1252 / gbk / ascii，
+  断言退出码 0、无 UnicodeEncodeError、中文与命令名都在输出里）。
+
+**结论**：如果只跑 ubuntu，"英文 Windows 上 CLI 完全不可用"这个致命问题会一直藏着 ——
+这正好印证了技术评审那句"CI 只有 Ubuntu 是**虚假安全感**"。
+
+### P0 期间实测发现并修掉的工程问题（都是真实踩坑）
 
 | 问题 | 现象 | 修法 |
 |---|---|---|
 | **Windows 无系统 tzdata** | `ZoneInfo("Asia/Shanghai")` 抛 `ZoneInfoNotFoundError`，整个包 import 失败 | 主依赖加 `tzdata`（不是可选项，展示时区固定北京时间） |
+| **★ 非 UTF-8 控制台 CLI 崩溃** | GitHub Actions **windows-latest**（cp1252）跑 `jh --help` 抛 `UnicodeEncodeError` → 命令非 0 退出，CLI 在英文 Windows 上完全不可用 | 包导入时 `force_utf8_output()`；新增子进程回归测试（cp1252/gbk/ascii） |
 | **Alembic 用系统编码读 `alembic.ini`** | 中文注释 → `UnicodeDecodeError: 'gbk' codec can't decode byte 0x85`，迁移根本跑不起来 | `alembic.ini` 保持**纯 ASCII**（并写明原因，防止后人再写中文） |
 | **`add_typer` 不传 name** | 只发一条 UserWarning 就把子命令摊平到顶层 → `jh today`、`jh weak` 等命令**整体消失** | 注册表显式给名字 + `test_no_orphan_subcommands_at_top_level` 守住 |
 | **组回调带位置参数 → 子命令无法分派** | `jh apply timeline 5` 里 `timeline` 被当成位置参数，子命令不执行 | `apply` 改单命令应用；`--timeline` / `--status` 走选项（详见 architecture.md §4.5） |
