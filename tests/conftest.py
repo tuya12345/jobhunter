@@ -82,7 +82,8 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     #     · 测试实际接触了用户的个人配置，违背"测试只碰 tmp"的隔离原则。
     #   把它指向一个不存在的文件，测试就只依赖显式设置的环境变量。
     monkeypatch.setattr(
-        AppSettings, "model_config",
+        AppSettings,
+        "model_config",
         {**AppSettings.model_config, "env_file": str(tmp_path / "nonexistent.env")},
     )
 

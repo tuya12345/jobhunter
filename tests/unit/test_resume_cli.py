@@ -112,9 +112,7 @@ def test_add_is_idempotent(initialized: Path, resume_docx: Path) -> None:
     assert listing.output.count("★") == 1
 
 
-def test_add_reports_parse_warnings(
-    initialized: Path, tmp_path: Path
-) -> None:
+def test_add_reports_parse_warnings(initialized: Path, tmp_path: Path) -> None:
     """解析不完整时给出**可操作**的提示（而不是假装成功）。"""
     target = tmp_path / "只有姓名.txt"
     target.write_text("林小满\n13800000000\n", encoding="utf-8")
@@ -166,9 +164,7 @@ def test_split_gives_suggestions(initialized: Path, resume_docx: Path) -> None:
     assert result.output.count("该前置的项目") >= 2
 
 
-def test_split_defaults_to_default_resume(
-    initialized: Path, resume_docx: Path
-) -> None:
+def test_split_defaults_to_default_resume(initialized: Path, resume_docx: Path) -> None:
     """不传 id 时用默认简历（并明确告诉用户用了哪一份）。"""
     runner.invoke(app, ["--no-remind", "resume", "add", str(resume_docx)])
     result = runner.invoke(app, ["--no-remind", "resume", "split"])
@@ -176,9 +172,7 @@ def test_split_defaults_to_default_resume(
     assert "未指定简历" in result.output
 
 
-def test_split_with_explicit_direction(
-    initialized: Path, resume_docx: Path
-) -> None:
+def test_split_with_explicit_direction(initialized: Path, resume_docx: Path) -> None:
     """`--direction` 可以指定要拆的方向（可重复）。"""
     runner.invoke(app, ["--no-remind", "resume", "add", str(resume_docx)])
     result = runner.invoke(
@@ -213,9 +207,7 @@ def test_split_save_writes_markdown(initialized: Path, resume_docx: Path) -> Non
     assert "不得新增" in text or "不允许新增" in text
 
 
-def test_split_does_not_touch_the_resume_file(
-    initialized: Path, resume_docx: Path
-) -> None:
+def test_split_does_not_touch_the_resume_file(initialized: Path, resume_docx: Path) -> None:
     """★ 产品纪律：`split` 绝不改动简历文件（P1 只给建议）。
 
     用哈希前后比对来守 —— 这也是 P5 导出简历时"原文件 hash 不变"那条测试的雏形。
