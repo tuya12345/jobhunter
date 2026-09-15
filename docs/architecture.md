@@ -287,8 +287,53 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 
 ---
 
-## 5. 三层防线的落地位置（面试可讲）
+## 4.6 P2 现场补充：去重的三层判定与字段白名单
 
+`services/job_svc.py` 里有一条**必须原文照读**的纪律，写在模块顶部：
+
+> 去重命中时**绝不覆盖人工决策字段**。
+
+实现方式是两份显式字段清单：
+
+| 清单 | 内容 | 规则 |
+|---|---|---|
+| `REFRESHABLE_FIELDS` | company / title / city / experience / education / is_intern / salary_* / jd_text / jd_hash / jd_fetch_status / url / source_keyword / platform_job_id / dedup_norm_hash | 重复遇到同一岗位时**允许刷新** |
+| `DECISION_FIELDS` | status / match_score / llm_score / rule_score / rule_detail_json / reason_json / matched_resume_id / jd_keywords_json / found_at | **任何情况下都不被去重逻辑覆盖** |
+
+两条测试从两个方向守住它：
+- `test_dedup_never_touches_decision_fields`：把决策字段写成"不可能由代码推导"的值，
+  再跑一次 upsert，断言它们一个都没变、而抓取字段确实刷新了；
+- `test_decision_fields_and_refreshable_fields_do_not_overlap`：两份清单不许有交集
+  （元测试 —— 将来有人往可刷新清单里加 `status` 会立刻失败）。
+
+### 去重的三层判定（③ 是否决条件，最容易漏）
+
+```
+① platform + platform_job_id 精确命中          → 同一岗位（最可靠）
+② dedup_norm_hash 命中（公司+职位+城市 归一化） → 同一岗位（兜底）
+③ 否决：两个**都非空且不同**的平台 ID 之间，即使 ② 命中也不合并
+```
+
+**为什么必须有 ③**（实测踩出来的真实缺陷）：同一家公司在同一城市挂两个相似标题的岗位
+（`AI Agent 开发工程师` 与 `AI Agent 开发工程师（急招）`），平台 ID 是 job-001 / job-002。
+没有 ③ 时 ② 会命中，接着"刷新"逻辑会把库里那条的 `platform_job_id` 从 job-001
+**改成 job-002** —— 记录换了个身份，而用户如果已经投过 job-001，
+投递记录就会挂到 job-002 上，完全对不上账。
+
+### 第二层去重的"宁漏不错"取舍
+
+`compute_dedup_norm_hash` 在**三个字段缺任何一个**时返回 `None`（放弃模糊匹配）：
+
+- **错合并**的代价：两个岗位的记录被并成一个 → 用户看到"我没投过这个岗位却显示已投"；
+- **漏合并**的代价：清单里多一条相似记录 → 手动 `jh job skip` 一下即可。
+
+所以选了保守的一方。归一化只穿透"HR 改标题不改岗位"那类噪音
+（大小写/空格/全角/薪资/急招之类的修饰词/公司的城市括号与"有限公司"后缀），
+而**刻意保留** `（实习）`（实习与全职是两个岗位，合并会造成错投）。
+
+---
+
+## 5. 三层防线的落地位置（面试可讲）
 | 防线 | 代码位置 | 测试位置 |
 |---|---|---|
 | 不做全自动投递 | `adapters/manual.py` 只读不写；CLI 无"提交"动作 | 代码评审 + COMPLIANCE.md 自检 |
@@ -304,7 +349,8 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 | 提示词 0 | 目录结构 + schema/Alembic 方案 + P0 计划 | ✅ 已产出（3 份 docs） |
 | **P0** | 骨架 + 工程底座 + CI + README | ✅ **已完成**（结束时 107 测试绿；双平台 CI 绿） |
 | **P1** | 简历导入解析 + `jh resume split` | ✅ **已完成**（176 测试绿；双平台 CI 绿） |
-| P2 | `jh job add <url\|--file\|--manual>` 主路径 + 去重（+BOSS spike 可选） | 未开始（**等确认**） |
+| **P2** | `jh job add <url\|--file\|--manual\|--html>` + 两层去重 | ✅ **已完成**（254 测试绿；抓取链路端到端验证通过） |
+| P3 | 共享层 + 两级匹配 + `jh match explain` + `jh gap` | 未开始（**等确认**） |
 | P3 | 共享层 + 两级匹配 + `jh match explain` + `jh gap` | 未开始 |
 | P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | 未开始 |
 | P4.5 | 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | 未开始 |

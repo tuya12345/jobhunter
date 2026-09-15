@@ -24,10 +24,9 @@
 from __future__ import annotations
 
 import typer
-from rich.console import Console
 from sqlalchemy import inspect
 
-from jobhunter.cli.common import print_kv, success, warn
+from jobhunter.cli.common import console, print_kv, success, warn
 from jobhunter.config.settings import get_settings
 from jobhunter.storage.db import check_pragmas, create_db_engine
 from jobhunter.storage.migrate import current_revision, upgrade_head
@@ -38,7 +37,6 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 
-console = Console()
 
 # 期望的 PRAGMA 值（与 storage/db.py 的 EXPECTED_PRAGMAS 一致，
 # 这里独立写一份是为了让"校验"和"设置"两处不共享同一个可能被改错的常量）

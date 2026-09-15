@@ -80,7 +80,18 @@ jh --help
 | `uv sync --extra llm` | 调用 DeepSeek | P3+ |
 | `uv sync --extra emulator` | 安卓模拟器抓屏（技术验证） | P7 |
 
-装完可选依赖后，Playwright 还需要下载浏览器内核：`uv run playwright install chromium`。
+装完可选依赖后，还需要下载浏览器内核：
+
+```bash
+uv run playwright install chromium
+uv run playwright install chromium-headless-shell   # ★ 别漏这条
+```
+
+> **为什么要装两个**：Playwright 1.62 起，**默认的无头模式用的是
+> `chromium-headless-shell`**（一个更精简的独立二进制），
+> 只装 `chromium` 会在抓取时报
+> `BrowserType.launch: Executable doesn't exist ... chrome-headless-shell.exe`。
+> 这个坑很隐蔽：安装命令成功、包也在，只有真正 launch 的时候才失败。
 
 ### 配置密钥
 

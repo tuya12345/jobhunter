@@ -35,11 +35,10 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from jobhunter.cli.common import EXIT_NOT_IMPLEMENTED, success, warn
+from jobhunter.cli.common import EXIT_NOT_IMPLEMENTED, console, err_console, success, warn
 from jobhunter.config.settings import get_settings
 from jobhunter.services import resume_svc
 from jobhunter.storage.db import database_ready, get_session_factory
@@ -48,8 +47,6 @@ from jobhunter.utils.logging import setup_logging
 
 app = typer.Typer(name="resume", help="简历：导入解析 / 列表 / 拆分方向（P1）")
 
-console = Console()
-err_console = Console(stderr=True)
 
 #: 数据库还没初始化时的统一提示（比 "no such table: resumes" 可读得多）
 _INIT_HINT = "[yellow]数据库还没初始化。请先运行：[bold]jh init[/bold][/yellow]"

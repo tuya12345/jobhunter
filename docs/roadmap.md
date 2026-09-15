@@ -1,10 +1,54 @@
-﻿# JobHunter · 实现计划与进度（提示词 0 产出③ + P0/P1 实测记录）
+# JobHunter · 实现计划与进度（提示词 0 产出③ + P0/P1/P2 实测记录）
 
 > **P0 目标**：搭骨架 + 把工程底座一次性建好（评审原话："2 小时的事，省掉后续返工"）。
 > **P0 边界**：除 `jh init` 外，所有命令都是**占位**；**不写任何 P1+ 业务逻辑**。
 > 原则：**骨架优先（skeleton-first）** —— 先把所有文件和各层契约立起来（含 P1+ 的空壳与
 > 已定死的接口），再填工程底座。这样后续每个阶段都是"往已有格子填内容"，
 > 不会因为"当时没想清楚分层"而返工。
+
+---
+
+## P2 完成情况（岗位录入：人给链接 → 抓详情 → 入库 + 两层去重）
+
+| 验证项 | 结果 |
+|---|---|
+| `jh job add <url>`（主路径） | ✅ Playwright 抓取链路**端到端验证通过**（本地 file:// 页面：公司/职位/城市/薪资数值化/JD 正文全部抽出） |
+| `jh job add --file jobs.txt` | ✅ 批量解析（容忍注释与空行）；全部失败时退出码 1 并提示改用 `--manual` |
+| `jh job add --manual` / `--text` | ✅ 手动粘贴（网络不通也能用）；空输入被拒 |
+| `jh job add --html page.html` | ✅ 从本地保存的网页解析（离线重放） |
+| `jh job list / show / skip` | ✅ 列表（宽表不截断）、详情（默认不打印正文）、人工跳过 |
+| 两层去重 | ✅ platform_job_id → dedup_norm_hash → **否决条件**（见 architecture §4.6） |
+| 不覆盖人工决策字段 | ✅ 专项测试（决策字段写成不可推导的值后仍原样保留） |
+| `spikes/boss_search_spike.py` | ✅ 默认干跑不发请求；支持 `--live`（单页）与 `--html` 离线分析 |
+| `pytest` | ✅ **254 passed**（9 个测试文件） |
+| `ruff check` / `format --check` | ✅ 零告警 / 全部已格式化 |
+
+### P2 期间修掉的真 bug（都有测试守住）
+
+1. **`jd_fetch_status` 从来没被刷新过** —— 循环里用 `getattr(detail, name)` 取新值，
+   而**列名与 `JobDetail` 的字段名不一样**（列叫 `jd_fetch_status`，dataclass 上叫 `fetch_status`）
+   → 永远取到 `None` → 抓失败的岗位仍显示 `ok`，P3 会基于空文本打分而用户不知原因。
+   补了字段名映射 + 一条"每个可刷新字段都要能取到值"的元测试。
+2. **两个不同平台 ID 的岗位被合并** —— 见 architecture §4.6 的否决条件。
+3. **`（实习）` 被归一化掉** —— 实习与全职被并成一个岗位（会造成错投）；
+   改成只去"括号里是城市名"的注释。
+4. **`本科及以上` 的学历正则**交替顺序不对。
+5. **rich 表格按终端宽度截断** —— `jh job list` 里公司/职位名变成 `…`；
+   console 改固定 `width=200 + soft_wrap`（这类数据表不该裁信息）。
+6. **Playwright 1.62 默认 headless 用 `chromium-headless-shell`** ——
+   只装 `chromium` 会在 launch 时报 `Executable doesn't exist`（安装命令本身是成功的，很隐蔽）。
+   已写进 README 的安装步骤。
+
+### 抓取链路的验证方式（为什么测试里没有它）
+
+真实抓取要网络、要目标站点可达、随时可能改版 —— 写进 CI 等于装了个随机红灯。
+所以分工是：
+
+    抓取（要浏览器/网络）→ adapters/manual.py       ← 本地手动验证
+    解析（纯函数）        → adapters/parse_html.py    ← 测试主力（mock HTML，确定性）
+
+本次用**本地 HTML + file:// URL 走真实 Playwright**做了一次端到端验证，
+既覆盖了浏览器启动/页面加载路径，又不需要访问任何真实站点。
 
 ---
 

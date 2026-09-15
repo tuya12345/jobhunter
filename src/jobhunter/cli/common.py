@@ -30,9 +30,21 @@ __all__ = [
     "warn",
 ]
 
-console = Console()
+# ★ 为什么固定 width=200 而不是让它按终端宽度自适应（踩过的坑）：
+#
+#   岗位/公司的名字经常很长（"某某网络科技有限公司"），rich 的表格会按**可用宽度**
+#   裁列，超出部分直接变成 `…` —— 于是 `jh job list` 里看不到完整的公司名与职位名，
+#   而用户最需要看的就是这两个字段。
+#
+#   事实是：这类"数据表"本来就该完整打印（需要时重定向到文件或加 --json），
+#   按终端宽度裁掉信息反而有害。定成 200 列足够覆盖常见终端与表格宽度；
+#   真要换行也还有 soft_wrap 兜着。
+#
+#   注：这也让 CliRunner 下的测试能看到完整文本（否则断言会因截断而失败，
+#   测试会变得"看终端宽度脸色"，那是最难查的一类不稳定测试）。
+console = Console(width=200, soft_wrap=True)
 # 错误走 stderr：这样 `jh xxx > out.txt` 时错误不会被吞进文件里
-err_console = Console(stderr=True)
+err_console = Console(stderr=True, soft_wrap=True)
 
 # 未实现退出码：与 Typer/click 的用法错误（也是 2）一致，
 # 语义上确实属于"用法层面：这个功能还没做"。

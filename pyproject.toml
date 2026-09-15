@@ -98,6 +98,12 @@ ignore = [
 # 这些函数都有详细的注释与针对性测试，所以这里放宽复杂度限制。
 "src/jobhunter/services/resume_svc.py" = ["PLR0912", "PLR0915"]
 "src/jobhunter/utils/docx.py" = ["PLR0912", "PLR0915"]
+# 岗位入库的 upsert：字段白名单 + JD/抓取状态/平台 ID 三处特殊分支，
+# 拆开反而会让"哪些字段会被覆盖"这条关键逻辑变得难读。
+"src/jobhunter/services/job_svc.py" = ["PLR0912", "PLR0915"]
+# CLI 命令的参数很多（Typer 的写法天然如此），分支数也随参数增长
+"src/jobhunter/cli/commands/job_cmd.py" = ["PLR0912"]
+"src/jobhunter/cli/commands/resume_cmd.py" = ["PLR0912"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
