@@ -299,13 +299,12 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 ---
 
 ## 6. 阶段推进状态
-
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 提示词 0 | 目录结构 + schema/Alembic 方案 + P0 计划 | ✅ 已产出（3 份 docs） |
-| **P0** | 骨架 + 工程底座 + CI + README | ✅ **已完成**（103 测试绿 / ruff 零告警 / `jh init` 可跑） |
-| P1 | 简历导入解析 + `jh resume split` | 未开始（**等确认**） |
-| P2 | `jh job add <url\|--file\|--manual>` 主路径 + 去重（+BOSS spike 可选） | 未开始 |
+| **P0** | 骨架 + 工程底座 + CI + README | ✅ **已完成**（结束时 107 测试绿；双平台 CI 绿） |
+| **P1** | 简历导入解析 + `jh resume split` | ✅ **已完成**（176 测试绿；双平台 CI 绿） |
+| P2 | `jh job add <url\|--file\|--manual>` 主路径 + 去重（+BOSS spike 可选） | 未开始（**等确认**） |
 | P3 | 共享层 + 两级匹配 + `jh match explain` + `jh gap` | 未开始 |
 | P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | 未开始 |
 | P4.5 | 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | 未开始 |
