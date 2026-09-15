@@ -1,0 +1,129 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jobhunter"
+version = "0.1.0"
+description = "JobHunter · 求职猎手 —— 本地优先的开源求职辅助工具（抓岗位详情 / 两级匹配打分 / 按 JD 定制开场白 / 跟踪投递全流程）"
+readme = "README.md"
+license = { text = "MIT" }
+# 只声明下界：保证 3.13 语义（含 PEP 695、`datetime.UTC` 等）。上界不封，避免每年改一次。
+requires-python = ">=3.13"
+authors = [{ name = "JobHunter" }]
+keywords = ["job-hunting", "cli", "sqlite", "llm", "typer"]
+
+# ---- 主依赖：全项目都要用的东西才放这里 ----------------------------------------
+# 取舍：把"重"且只有部分阶段需要的依赖（浏览器/文档/LLM SDK/模拟器）拆成 extras，
+# 这样 `uv sync` 的默认安装又小又快，CI 也不会因为 playwright 下载浏览器而变慢。
+dependencies = [
+    "typer>=0.12",              # CLI 框架：基于 click，原生支持类型注解
+    "rich>=13.7",               # 终端表格/面板/颜色
+    "pydantic>=2.7",            # 所有跨层数据契约（结构化输出、配置校验）
+    "pydantic-settings>=2.3",   # 配置来源合并（yaml + .env）
+    "SQLAlchemy>=2.0.30",       # ORM（2.0 风格：Mapped[] / mapped_column）
+    "alembic>=1.13",            # 数据库迁移：以后加字段不删库
+    "PyYAML>=6.0",              # 读写 config.yaml / 技能别名表
+    "httpx>=0.27",              # 通用 HTTP（可达性检查、将来可能的 API）
+    "python-dateutil>=2.9",     # 宽松日期解析（用户手输 "9-11"、面试时间等）
+    # ★ Windows 和精简版 Linux 镜像没有系统 tzdata，
+    #   `ZoneInfo("Asia/Shanghai")` 会直接抛 ZoneInfoNotFoundError。
+    #   本项目的展示时区固定用北京时间，所以这个依赖不是可选的。
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+# --extra browser：只有 P2 抓岗位详情 / P7 抓屏才需要
+browser = ["playwright>=1.45"]
+# --extra docx：只有 P1 解析简历 / P5 导出简历才需要
+docx = ["python-docx>=1.1"]
+# --extra llm：DeepSeek 走 OpenAI 兼容协议，所以直接用 openai SDK
+llm = ["openai>=1.30"]
+# --extra emulator：P7 的"技术验证"才用。★ 钉死版本：uiautomator2 上游改动频繁，
+# 不钉版本会导致半年前能跑的脚本突然失灵，而这种环境问题最难排查。
+emulator = ["uiautomator2==3.2.2"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",   # P3 的 LLM 并发精评要测
+    "pytest-cov>=5.0",        # P9 加覆盖率
+    "ruff>=0.5",              # lint + format（同时充当"编码必须显式"的守卫）
+    "mypy>=1.10",             # 类型检查（P0 不进 CI，见 docs/roadmap.md 说明）
+]
+
+[project.scripts]
+# `jh` 是唯一的用户入口。main 里不要写业务逻辑，只组装 Typer app。
+jh = "jobhunter.cli.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jobhunter"]
+
+# ================================ ruff ========================================
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = [
+    "alembic/versions",  # 自动生成的迁移脚本不参与风格检查
+    "docs",              # 文档里的示例代码块不该被代码格式化器改写（它会把对齐注释挪乱）
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle error
+    "W",    # pycodestyle warning
+    "F",    # pyflakes：未使用的导入/变量
+    "I",    # isort：导入顺序
+    "N",    # pep8-naming
+    "UP",   # pyupgrade：写出更现代、更地道的写法
+    "B",    # flake8-bugbear：常见逻辑陷阱
+    "PL",   # pylint
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "PLR0913",  # 参数过多：CLI 命令天然参数多，这条噪音太大
+    "PLR0917",  # 同上（位置参数版）
+    "PLR2004",  # 魔法数字：0/1/100 这类阈值很常见
+    # 函数内 import 在本项目是**刻意的**：用来打断循环依赖
+    # （storage/db.py 晚绑定 settings；config/settings.py 晚绑定 paths），
+    # 以及让 CLI 的可选依赖（playwright 等）只在真正用到时才 import。
+    "PLC0415",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许 assert、允许 from x import * 之外的一切正常写法
+"tests/**" = ["PLR0915", "S101"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# =============================== pytest =======================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -ra：末尾列出所有非通过用例的原因；--strict-markers：写错 marker 直接报错而不是静默忽略。
+# -m 'not live and not emulator'：本地和 CI 用同一套默认过滤条件，
+# 不想让"本地绿、CI 红"这种事发生。需要真跑联网/模拟器测试时显式覆盖：pytest -m live
+addopts = "-ra --strict-markers --strict-config -m 'not live and not emulator'"
+asyncio_mode = "auto"
+markers = [
+    "live: 需要真实网络或真实大模型调用的测试（默认排除，只在 nightly 跑）",
+    "emulator: 需要安卓模拟器 / uiautomator2 的测试（默认排除，P7 用）",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/jobhunter"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+# =============================== mypy =========================================
+[tool.mypy]
+python_version = "3.13"
+mypy_path = "src"
+packages = ["jobhunter"]
+# P0 阶段不追求全绿（SQLAlchemy 的 Mapped[] 推断、Typer 装饰器都需要插件调优），
+# 所以这里只做宽松配置，等骨架稳定后再逐步收紧。
+ignore_missing_imports = true
+warn_unused_ignores = false

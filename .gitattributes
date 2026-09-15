@@ -1,0 +1,33 @@
+# ============================================================================
+# 统一换行符为 LF（重要，别删）
+# ----------------------------------------------------------------------------
+# Windows 上 Git 默认 core.autocrlf=true：检出时把 LF 换成 CRLF、提交时再换回来。
+# 对本项目有两个实际危害：
+#   1. 每次 add 都刷一大堆 "LF will be replaced by CRLF" 警告，真正的改动被淹没；
+#   2. 如果有人 autocrlf 配置不同，diff 会显示"整个文件都变了"，没法 review。
+# 显式声明 LF 后行为一致，跨平台协作不会出现换行符噪音。
+# ============================================================================
+
+* text=auto eol=lf
+
+# 二进制文件不参与换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.docx binary
+*.db binary
+*.xlsx binary
+
+# 明确这些是文本（供 GitHub 语言统计与 diff 正确渲染）
+*.md text
+*.py text
+*.toml text
+*.yaml text
+*.yml text
+*.json text
+*.ini text
+*.cfg text
+*.txt text
