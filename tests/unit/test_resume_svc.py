@@ -187,6 +187,23 @@ def test_project_names_are_clean(content: resume_svc.ResumeContent) -> None:
         assert project.name.strip() == project.name
 
 
+def test_project_bullets_exclude_pure_metadata(content: resume_svc.ResumeContent) -> None:
+    """★ 每条描述必须是**实质内容**，不能是"AI 协同开发"这种元信息碎片。
+
+    实测来历：真实简历的标题行是
+        `AgentFlow · 可视化 AI 流水线编排平台（个人项目 · AI 协同开发，2026.08）`
+    抠掉时间段与角色词之后，残留的 `· AI 协同开发，` 曾被当成一条描述 ——
+    它既不是项目内容，也不该占一条 bullet，展示出来像解析错位了。
+    """
+    for project in content.projects:
+        for bullet in project.bullets:
+            residue = bullet.strip(" 　·—|()（）,，")
+            assert residue, f"{project.name} 里有一条空描述"
+            assert "协同开发" not in residue, f"{project.name} 的描述里混进了元信息：{bullet!r}"
+            # 实质描述都有一定长度；元信息碎片都很短
+            assert len(residue) >= 6, f"{project.name} 的描述过短，疑似碎片：{bullet!r}"
+
+
 def test_parses_skills_without_java_javascript_confusion(content: resume_svc.ResumeContent) -> None:
     """技能表要含 JavaScript、且**不能**因为有 JavaScript 就把 Java 也算上……
 

@@ -1369,7 +1369,23 @@ def _split_title_line(raw: str) -> tuple[str, str, str, str]:
                 candidate = candidate.replace(piece, " ")
         description = candidate.strip(" 　-—|()（）")
 
+    # ★ 丢掉"只剩元信息"的描述片段。
+    #   实测：真实简历的第一条描述是 `· AI 协同开发，` —— 它是标题行括号里的
+    #   "开发方式"说明，既不是项目内容，也不该占一条 bullet
+    #   （展示出来会让用户以为解析错位了）。
+    if description and _is_only_metadata(description):
+        description = ""
+
     return name or primary or raw, role, period, description
+
+
+def _is_only_metadata(text: str) -> bool:
+    """判断一段文字是否"只有元信息"（开发方式 / 项目性质，不含实质内容）。"""
+    residue = text
+    for word in sorted(_INFO_WORDS, key=len, reverse=True):
+        residue = residue.replace(word, "")
+    residue = re.sub(r"[\s·•,，、;；:：|/\\()（）\[\]【】\-—]+", "", residue)
+    return len(residue) <= 1
 
 
 #: 学历行（教育经历）的特征：`学校 | 专业 · 学位 | 时间`
