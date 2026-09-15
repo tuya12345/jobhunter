@@ -23,19 +23,27 @@ Windows 上 `open("简历.txt")` 用的是**系统区域编码**（中文系统�
       让导出文件在 Git 里产生"整文件都改了"的假 diff；
     · 原子写（先写同目录临时文件再 replace）：写导出文件时中途崩掉，
       不会留下一个半截的、看起来正常的文件。
+
+★ 第四层（CI 实测补上的）：**标准输出也要强制 UTF-8**，见 `force_utf8_output()`。
+  GitHub Actions 的 windows-latest 控制台是 **cp1252**，
+  `jh --help` 里的 `→` 和 emoji 会直接让 rich 抛 UnicodeEncodeError 而**整个命令失败**。
+  这不是"显示不好看"，是程序崩了 —— 所以必须在**任何输出发生之前**改掉 stdout/stderr 的编码。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "ENCODING",
     "append_text",
     "ensure_dir",
+    "force_utf8_output",
     "from_json",
     "read_json",
     "read_text",
@@ -46,6 +54,45 @@ __all__ = [
 
 # 全项目统一的编码常量。不要在任何地方另写 "utf-8" 字面量，统一引用这里。
 ENCODING = "utf-8"
+
+
+def force_utf8_output() -> None:
+    """把 stdout / stderr 强制切成 UTF-8（**幂等**，可重复调用）。
+
+    为什么必须做，而不是"用 emoji 要小心一点"：
+        Python 的 stdio 编码取自运行环境。
+          · Windows 控制台：默认 cp936（中文）/ cp1252（英文）
+          · GitHub Actions windows runner：cp1252
+          · Linux/macOS：通常本来就是 UTF-8
+        一旦是 cp1252，本项目 CLI 里的 `→`、`·`、`✓`、emoji 全都会抛
+        `UnicodeEncodeError: 'charmap' codec can't encode characters`，
+        **直接让命令以非 0 退出**。也就是说在英文 Windows 上，`jh --help` 都是崩的。
+
+    为什么要在**模块导入时**调用（见 jobhunter/__init__.py）：
+        rich 的 `Console` 在构造时就会探测并**缓存**底层终端的编码，
+        而各命令模块里的 `console = Console()` 是模块级对象（import 时就创建）。
+        如果在 `main()` 里才改编码，那些 Console 已经拿着 cp1252 了，改了也没用。
+
+    为什么用 `errors="replace"` 而不是默认的 `strict`：
+        这是**最后一道保险**。即使某个环境连 UTF-8 都写不出去
+        （比如被重定向到一个用别的编码打开的管道），
+        也只会把个别字符显示成 `?`，而不是让整个命令崩掉。
+        —— "输出有个别乱码"远好于"工具直接不能用"。
+
+    为什么用 `getattr` / try-except 而不是直接调：
+        `sys.stdout` 在嵌入式环境、被 pytest 捕获时、或换成自定义流时
+        可能没有 `reconfigure()`。这里静默跳过，绝不让"修编码"本身成为新的崩溃点。
+    """
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding=ENCODING, errors="replace")
+        except (ValueError, OSError, AttributeError):
+            # 流已关闭 / 不支持重配置 → 算了，保持原样
+            continue
 
 
 # ---------------------------------------------------------------------------

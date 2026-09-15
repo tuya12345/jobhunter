@@ -22,6 +22,15 @@
 
 from __future__ import annotations
 
+# ★ 必须在**任何** rich/typer 的 Console 被构造之前执行，所以放在包导入时最前面：
+#   rich 构造 Console 时会探测并缓存终端编码，而各命令模块的 `console = Console()`
+#   是模块级对象（import 时就建好了）。等到 main() 里再改编码已经太晚。
+#   背景：GitHub Actions 的 windows-latest 控制台是 cp1252，
+#   `jh --help` 里的 → 和 emoji 会让 rich 抛 UnicodeEncodeError，命令直接崩。
+from jobhunter.utils.io import force_utf8_output as _force_utf8_output
+
+_force_utf8_output()
+
 __version__ = "0.1.0"
 
 # 当前阶段标记：CLI 占位命令会用它生成"该功能在 PX 阶段实现"的提示。

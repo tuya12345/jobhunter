@@ -16,12 +16,22 @@
 
     这两类问题的共同点是"程序不报错、只表现得很怪"，所以必须由测试守住形状。
 
-另外还守着一条产品原则：**占位命令不假装成功**。
-    P0 阶段 18 个命令还没实现，如果它们静默返回 0，用户会以为"跑过了、没数据"。
-    所以断言：退出码非 0 + 输出里必须出现"该功能尚未实现"和目标阶段。
+另外还守着两条产品原则：
+    ① **占位命令不假装成功**。P0 阶段 18 个命令还没实现，如果它们静默返回 0，
+       用户会以为"跑过了、没数据"。所以断言：退出码非 0 + 输出里必须出现
+       "该功能尚未实现"和目标阶段。
+    ② **非 UTF-8 控制台下也不能崩**（见文件末尾的 test_cli_survives_non_utf8_console）。
+       这条是 GitHub Actions 的 windows-latest 实测逼出来的：它的控制台是 cp1252，
+       `jh --help` 里的 `→` 和 emoji 会让 rich 抛 UnicodeEncodeError，
+       于是 **CLI 在英文 Windows 上直接不可用**。
 """
 
 from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -270,3 +280,80 @@ def test_missing_config_file_is_rejected(tmp_path) -> None:
     """不存在的 --config 路径应该被 click 挡在参数校验阶段。"""
     result = runner.invoke(app, ["--config", str(tmp_path / "nope.yaml"), "init"])
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# ④ 编码健壮性：非 UTF-8 控制台下也不能崩（★ CI 实测逼出来的回归测试）
+# ---------------------------------------------------------------------------
+def _project_root() -> Path:
+    """项目根（pyproject.toml 所在目录）。"""
+    for candidate in (Path(__file__).resolve(), *Path(__file__).resolve().parents):
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    raise AssertionError("找不到项目根（pyproject.toml）")
+
+
+@pytest.mark.parametrize("io_encoding", ["cp1252", "gbk", "ascii"])
+def test_cli_survives_non_utf8_console(io_encoding: str) -> None:
+    """★ 在**非 UTF-8 控制台**下，`jh --help` 必须正常退出且不乱码。
+
+    这个测试来自一次真实的 CI 失败：
+        GitHub Actions 的 `windows-latest`（英文 Windows）控制台编码是 **cp1252**，
+        而 `jh --help` 的文案里有 `→`、`·`、`⚠️`、emoji ——
+        rich 往 cp1252 流里写这些字符时抛
+        `UnicodeEncodeError: 'charmap' codec can't encode characters in position 12-15`，
+        于是 **`jh --help` 整个命令以非 0 退出**。
+        也就是说：CLI 在英文 Windows 上是完全不可用的，而这在任何中文开发机上
+        都复现不出来（中文 Windows 是 cp936，也编不了这些字符，但触发时机不同）。
+
+    修法：在包导入时就调用 `force_utf8_output()`（见 utils/io.py），
+    在**任何 Console 被构造之前**把 stdio 切成 UTF-8。
+
+    ★ 为什么要用子进程测：`PYTHONIOENCODING` 只影响新起的解释器进程，
+      而 pytest 已经捕获了 sys.stdout（无法真实模拟"cp936 管道"）。
+      必须起一个真进程、给它一个真的 cp1252 stdio，才能验证这条路径。
+
+    覆盖三种"编不了中文"的编码：
+        cp1252 英文 Windows 控制台 / gbk 理论上有中文但也有编不了的字符 / ascii 极端情况
+    """
+    root = _project_root()
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = io_encoding
+    env["PYTHONPATH"] = str(root / "src")
+    env["JH_CONFIG"] = str(root / "config.yaml")
+    # 用临时数据目录，确保这个子进程不会碰真实库
+    env["JH_DATA_DIR"] = str(root / "state" / "_encoding_test")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "jobhunter", "--no-remind", "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        cwd=str(root),
+        timeout=120,
+        check=False,
+    )
+
+    assert "UnicodeEncodeError" not in result.stderr, (
+        f"在 {io_encoding} 控制台下报了编码错误：\n{result.stderr[-2000:]}"
+    )
+    assert result.returncode == 0, (
+        f"在 {io_encoding} 控制台下 jh --help 退出码是 {result.returncode}\n"
+        f"stderr:\n{result.stderr[-2000:]}"
+    )
+    # 关键命令必须真的打印出来了（而不是崩在半路只输出了一半）
+    for name in ("init", "today", "apply", "tailor"):
+        assert name in result.stdout, f"{io_encoding} 下 --help 输出缺少命令 {name}"
+    # 中文文案要能以 UTF-8 正确取出（证明我们改的是编码，不是把中文丢掉）
+    assert "求职" in result.stdout
+
+
+def test_force_utf8_output_is_idempotent() -> None:
+    """`force_utf8_output()` 必须可以重复调用（包导入 + 入口点都会调）。"""
+    from jobhunter.utils.io import ENCODING, force_utf8_output
+
+    force_utf8_output()
+    force_utf8_output()
+    assert sys.stdout.encoding.lower().replace("-", "") == ENCODING.replace("-", "")
