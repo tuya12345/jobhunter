@@ -67,7 +67,12 @@ EXPECTED_COMMANDS = (
     "demo",
 )
 
-# P0 阶段应该报"未实现"的命令（除 init 外全部）
+# P0/P1 阶段应该报"未实现"的命令（已实现的不在此列）
+#
+# ★ 注意 `resume` 三个子命令**不在**这里：P1 已经把它们实现了。
+#   `init`（P0）与 `resume add/list/split`（P1）是当前唯二真能跑的命令组；
+#   它们在没有数据库时会报"请先运行 jh init"（exit 1），那是**正确的**行为，
+#   由下面单独的用例覆盖。
 PLACEHOLDER_INVOCATIONS: list[list[str]] = [
     ["today"],
     ["gap"],
@@ -76,7 +81,6 @@ PLACEHOLDER_INVOCATIONS: list[list[str]] = [
     ["report"],
     ["demo"],
     ["followup", "1"],
-    ["resume", "list"],
     ["job", "list"],
     ["match", "run"],
     ["apply", "3=applied", "7=replied"],
@@ -209,6 +213,27 @@ def test_init_is_not_a_placeholder() -> None:
     result = runner.invoke(app, ["--no-remind", "init"])
     assert "该功能尚未实现" not in result.output
     assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    ("invocation", "expected_hint"),
+    [
+        (["resume", "list"], "jh init"),
+        (["resume", "add", "x.docx"], "找不到文件"),
+        (["resume", "split", "1"], "jh init"),
+    ],
+)
+def test_resume_commands_are_implemented(invocation: list[str], expected_hint: str) -> None:
+    """★ P1 的 `resume` 三个子命令必须**不再是占位**。
+
+    没有数据库时应提示"请先运行 jh init"；文件不存在时应提示"找不到文件" ——
+    但都不是"该功能尚未实现"。这两种提示对用户的含义完全不同：
+    前者是"你少做了一步 / 参数不对"，后者是"这功能还没做"。
+    """
+    result = runner.invoke(app, ["--no-remind", *invocation])
+    assert "该功能尚未实现" not in result.output, result.output
+    assert result.exit_code == 1, result.output
+    assert expected_hint in result.output
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,139 @@
+# ============================================================================
+# 方向画像（用于 `jh resume split` 的拆分建议）
+# ----------------------------------------------------------------------------
+# 一句话解释这个文件的作用：
+#   把"某个方向看重什么"变成**数据**，而不是散落在代码里的 if-else。
+#   你想加一个方向（比如"测试开发"）、想调某个方向的权重，只改这个文件，不动代码。
+#
+# 每个方向包含：
+#   label       显示名（也是简历 direction 字段建议填的值）
+#   aliases     我在 config.yaml 的 keywords 里可能写的同义说法（做匹配归并用）
+#   core_skills 这个方向**必须**有的技能（简历没有 → 进 gaps）
+#   plus_skills 加分项技能
+#   weak_skills 与这个方向**关系不大**的技能 → split 时建议弱化
+#   title_hints 岗位标题常见词（P3 判断岗位方向时会复用同一份词表，保持口径一致）
+#   priority_keywords
+#               项目/经历的排序偏好词：出现的越靠前，越该在简历里前置
+#
+# 调参建议：先跑 `jh resume split <id>` 看建议是否合理，不合理就回来改这里的词表。
+# ============================================================================
+
+directions:
+  ai_agent:
+    label: "AI Agent"
+    aliases: ["AI Agent", "AI应用", "智能体", "Agent", "AI 应用"]
+    core_skills:
+      - Python
+      - LangChain
+      - RAG
+      - LLM
+      - Prompt
+      - Agent
+    plus_skills:
+      - FastAPI
+      - 向量数据库
+      - Milvus
+      - FAISS
+      - Dify
+      - Coze
+      - MCP
+      - Function Calling
+      - 多智能体
+      - 微调
+      - LoRA
+      - OpenAI
+      - DeepSeek
+      - Docker
+      - Redis
+    weak_skills:
+      - Vue
+      - 微信小程序
+      - 响应式布局
+      - jQuery
+    title_hints: ["AI", "Agent", "智能体", "大模型", "算法", "LLM", "应用开发"]
+    priority_keywords: ["Agent", "智能体", "大模型", "LLM", "RAG", "对话", "工作流", "编排"]
+
+  llm_app:
+    label: "大模型应用"
+    aliases: ["大模型应用", "LLM应用", "大模型", "AIGC"]
+    core_skills:
+      - Python
+      - LLM
+      - Prompt
+      - RAG
+    plus_skills:
+      - LangChain
+      - FastAPI
+      - 向量数据库
+      - 微调
+      - LoRA
+      - DeepSeek
+      - OpenAI
+      - 流式输出
+      - Dify
+      - Docker
+    weak_skills:
+      - Vue
+      - 微信小程序
+      - 响应式布局
+    title_hints: ["大模型", "LLM", "AIGC", "算法", "AI"]
+    priority_keywords: ["大模型", "LLM", "RAG", "Prompt", "微调", "推理", "评测"]
+
+  python_backend:
+    label: "Python 开发"
+    aliases: ["Python 开发", "Python后端", "后端开发", "服务端"]
+    core_skills:
+      - Python
+      - 数据库
+      - HTTP
+    plus_skills:
+      - FastAPI
+      - Django
+      - Flask
+      - SQL
+      - MySQL
+      - PostgreSQL
+      - Redis
+      - Docker
+      - Linux
+      - 消息队列
+      - Celery
+      - 单元测试
+      - 并发
+      - 性能优化
+    weak_skills:
+      - Vue
+      - 微信小程序
+      - 响应式布局
+      - 视觉设计
+    title_hints: ["后端", "服务端", "Python", "服务开发", "平台开发"]
+    priority_keywords: ["接口", "架构", "并发", "性能", "数据库", "部署", "分布式"]
+
+  frontend:
+    label: "前端开发"
+    aliases: ["前端开发", "前端", "Web前端", "H5"]
+    core_skills:
+      - JavaScript
+      - CSS
+      - HTML
+    plus_skills:
+      - TypeScript
+      - Vue
+      - React
+      - 微信小程序
+      - Vite
+      - Webpack
+      - Node.js
+      - 响应式布局
+      - 组件库
+      - 性能优化
+      - ECharts
+      - Axios
+    weak_skills:
+      - Docker
+      - Kubernetes
+      - 微调
+      - LoRA
+      - 向量数据库
+    title_hints: ["前端", "Web", "H5", "大前端", "客户端"]
+    priority_keywords: ["组件", "交互", "样式", "可视化", "性能", "适配", "工程化"]

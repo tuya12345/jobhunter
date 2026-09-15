@@ -93,6 +93,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # 测试里允许 assert、允许 from x import * 之外的一切正常写法
 "tests/**" = ["PLR0915", "S101"]
+# 解析器天然是"一个函数里很多分支"：中文简历的排版写法五花八门，
+# 把分支拆成小函数会让"读代码就能对照简历原文"这件事变得很难。
+# 这些函数都有详细的注释与针对性测试，所以这里放宽复杂度限制。
+"src/jobhunter/services/resume_svc.py" = ["PLR0912", "PLR0915"]
+"src/jobhunter/utils/docx.py" = ["PLR0912", "PLR0915"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

@@ -57,8 +57,11 @@ from jobhunter.utils.io import ensure_dir
 __all__ = [
     "check_pragmas",
     "create_db_engine",
+    "database_ready",
+    "get_session_factory",
     "make_session_factory",
     "session_scope",
+    "sqlite_version",
 ]
 
 logger = logging.getLogger(__name__)
@@ -207,3 +210,50 @@ def check_pragmas(engine: Engine) -> dict[str, str]:
 def sqlite_version() -> str:
     """返回底层 SQLite 版本。排查"为什么 WAL/迁移行为不一样"时的第一手信息。"""
     return sqlite3.sqlite_version
+
+
+def get_session_factory(
+    url: str | None = None,
+) -> tuple[Engine, sessionmaker[Session]]:
+    """按当前配置创建 engine + sessionmaker（CLI 命令的标准入口）。
+
+    ★ 为什么每次都新建而**不做全局单例缓存**：
+      CLI 是短进程，一条命令跑完就退出 —— 缓存没有收益，反而会在测试里
+      造成"上一个用例的库被下一个用例复用"的串味问题
+      （本项目对"测试不许碰真实库"是零容忍的，见 tests/conftest.py）。
+
+    Returns:
+        (engine, session_factory)。**调用方负责在结束时 engine.dispose()**，
+        否则 Windows 上已打开的 SQLite 文件会拦住删除/重命名操作。
+
+    ★ 不做"库不存在就自动建"的事：那是 `jh init` 的职责。
+      这里的调用方应该先判断库文件是否存在，给出"请先运行 jh init"的友好提示。
+    """
+    engine = create_db_engine(url)
+    return engine, make_session_factory(engine)
+
+
+def database_ready(url: str | None = None) -> bool:
+    """数据库是否已经初始化过（库文件存在且业务表在）。
+
+    用途：`jh resume add` 等命令在库还没建时给出"请先运行 jh init"，
+    而不是抛一句 `no such table: resumes` —— 后者对用户完全不可读。
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    if url is None:
+        from jobhunter.config.settings import get_settings
+
+        url = get_settings().database_url
+
+    db_file = _sqlite_file_path(url)
+    if db_file is not None and not db_file.is_file():
+        return False
+
+    engine = create_db_engine(url, ensure_directory=False)
+    try:
+        return "resumes" in set(sa_inspect(engine).get_table_names())
+    except Exception:  # noqa: BLE001 - 库损坏/路径异常都当作"没准备好"
+        return False
+    finally:
+        engine.dispose()
