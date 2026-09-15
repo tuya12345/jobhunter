@@ -26,7 +26,7 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from jobhunter.config.paths import find_project_root
-from jobhunter.config.settings import get_settings, reset_settings
+from jobhunter.config.settings import AppSettings, get_settings, reset_settings
 from jobhunter.storage.db import create_db_engine, make_session_factory
 from jobhunter.storage.migrate import upgrade_head
 
@@ -72,6 +72,19 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     monkeypatch.setenv("JH_CONFIG", str(config_file))
     # 清掉密钥环境变量：避免本机 .env / 环境变量影响"未配置 LLM"的判断
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    # ★ 让配置**完全忽略仓库根目录的 `.env`**（踩过的坑）
+    #
+    #   `AppSettings.model_config` 里写了 `env_file=".env"`，而 pytest 的工作目录
+    #   就是仓库根 —— 于是开发机上的个人 `.env`（含默认简历路径、真实密钥）
+    #   会被测试读到。后果有两个，都很糟：
+    #     · "没配默认简历"这类用例在本机失败、在 CI 上通过（CI 没有 .env）；
+    #     · 测试实际接触了用户的个人配置，违背"测试只碰 tmp"的隔离原则。
+    #   把它指向一个不存在的文件，测试就只依赖显式设置的环境变量。
+    monkeypatch.setattr(
+        AppSettings, "model_config",
+        {**AppSettings.model_config, "env_file": str(tmp_path / "nonexistent.env")},
+    )
 
     # 清缓存：配置单例 + 项目根目录缓存（find_project_root 是 lru_cache）
     reset_settings()
