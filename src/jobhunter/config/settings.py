@@ -371,9 +371,15 @@ def reset_settings() -> None:
 
 
 def load_settings(config_file: Path | str | None = None) -> AppSettings:
-    """按指定文件加载配置（不污染全局单例）。
+    """按指定文件加载配置（**不污染全局单例**）。
 
-    用途：`jh --config other.yaml ...`，以及测试里构造隔离配置。
+    与 `--config` 的区别（别搞混，两条路是分开的）：
+        · `jh --config other.yaml` 走的是**环境变量**：`cli/app.py` 把路径写进
+          `JH_CONFIG` 再 `reset_settings()`，这样所有命令拿到的都是同一份配置；
+        · 这个函数不碰单例与环境变量，**直接构造一个独立的 AppSettings**，
+          适合测试里要两个不同配置同时存在的场合。
+
+    传 None 时退化成 `get_settings()`（即走单例/常规加载路径）。
     """
     if config_file is None:
         return get_settings()
@@ -390,9 +396,16 @@ def load_settings(config_file: Path | str | None = None) -> AppSettings:
 def settings_snapshot(settings: AppSettings) -> dict[str, Any]:
     """导出可打印的配置快照（**不含密钥**）。
 
-    用途：`jh --verbose` 或排查"为什么分数和预期不一样"时，
-    一眼看到当前生效的权重/阈值/额度。
-    ★ 绝不包含 deepseek_api_key —— 这个函数可能被打印到终端或日志里。
+    ★ 绝不包含 deepseek_api_key —— 这个函数就是"打印配置"这件事的安全出口。
+      注意 `utils/logging.py` 的脱敏 Filter 只处理手机号/邮箱/身份证，
+      **不认 API key**，所以"别把整个 settings 对象 dump 出去"必须靠这条纪律：
+      要打印配置，就调这个函数（白名单字段），不要 `settings.model_dump()`。
+
+    ★ 状态说明（免得下一个人以为它有隐藏调用方）：
+      目前**没有调用点**。保留它是因为 P3 要调 `match_weights` / `threshold`，
+      那时"为什么这个岗位只打了 52 分"的第一步就是确认"当前到底用的什么权重"；
+      到那一刻它自然会接上 `jh match explain` 或 `jh config`。
+      在那之前它也不是白占地方 —— 它把"哪些字段可以安全打印"写成了代码。
     """
     return {
         "keywords": settings.keywords,
