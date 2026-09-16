@@ -31,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,10 @@ _WAIT_UNTIL = "domcontentloaded"
 
 #: 默认超时（毫秒）。给得宽松一些：招聘站点本身不快，超时太短会误判成"抓不到"。
 _DEFAULT_TIMEOUT_MS = 30_000
+
+#: 渲染文本被视为"可用 JD"的最小长度。低于它说明页面基本是空的
+#: （验证页 / 登录墙 / 岗位已下架），此时宁可用 HTML 解析的结果。
+_MIN_RENDERED_JD_LENGTH = 120
 
 
 def is_playwright_available() -> bool:
@@ -134,7 +139,7 @@ class ManualAdapter(JobSource):
         self._polite_delay()
 
         try:
-            html = self._render(url)
+            html, rendered_jd, title_hint = self._render_page(url)
         except Exception as exc:  # noqa: BLE001 - 网络/浏览器异常一律降级
             logger.warning("抓取失败（%s）：%s", url, exc)
             return None
@@ -144,6 +149,22 @@ class ManualAdapter(JobSource):
             return None
 
         detail = html_to_detail(html, url, platform=platform)
+
+        # ★★ 渲染文本优先（见 _clean_rendered_text 的说明）：
+        #   清理后的头部就是"岗位名 + 工作地点 + 部门 + 更新时间"，
+        #   正文就是完整的岗位职责。它比"从 HTML 里猜"准得多 ——
+        #   所以这里**不仅覆盖正文，还从这段文本里补结构化字段**。
+        #
+        #   注意不要跟 HTML 版本比长度：清理过的版本天生更短，
+        #   比长度会把带导航的噪音版本选回来（实测踩过）。
+        if rendered_jd and len(rendered_jd) >= _MIN_RENDERED_JD_LENGTH:
+            detail.jd_text = rendered_jd
+            detail.fetch_status = "ok"
+            _fill_fields_from_rendered(detail, rendered_jd, platform)
+
+        if title_hint and not detail.title:
+            detail.title = title_hint
+
         # 补一层：页面没给出平台的岗位 ID 时，从 URL 再试一次
         if detail.platform_job_id is None:
             detail.platform_job_id = extract_platform_job_id(url, platform)
@@ -172,6 +193,25 @@ class ManualAdapter(JobSource):
 
     def _render(self, url: str) -> str:
         """用 Playwright 打开页面并取回 HTML（同步 API，CLI 场景够用）。"""
+        return self._render_page(url)[0]
+
+    def _render_page(self, url: str) -> tuple[str, str | None, str | None]:
+        """打开页面，返回 `(html, 渲染后最长的文本块, data-test=jobTitle 的文本)`。
+
+        ★★ 为什么要在**浏览器里**就把 JD 取出来，而不是拿 HTML 回来再解析
+
+            现代招聘站（字节、腾讯、美团…）是 React/Vue 单页应用：字段由 JS 渲染，
+            服务端 HTML 里没有可用的 DOM 结构，也**没有** schema.org 的 JSON-LD。
+            实测字节的岗位页：`<title>` 是干净的岗位名，但正文只能靠"整页文本"兜底，
+            结果把导航、页脚、甚至模板注释残留（`-->`）一起当成 JD 入库。
+
+            而在浏览器里可以直接问"渲染后哪个元素的文本最长" —— 那几乎总是 JD 正文
+            （页面其余部分是导航与推荐位，都很短）。让浏览器做这件事，
+            比把 500 万字符的 HTML 拿回来再用正则猜可靠得多，也快得多。
+
+            `data-test` 属性（如 `data-test="jobTitle"`）是前端写自动化测试用的，
+            比 class 名稳定得多（class 常带哈希后缀，改版就变），所以也顺手取一下。
+        """
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
@@ -191,13 +231,298 @@ class ManualAdapter(JobSource):
                 page = context.new_page()
                 page.route("**/*", _block_heavy_resources)
                 page.goto(url, wait_until=_WAIT_UNTIL, timeout=_DEFAULT_TIMEOUT_MS)
-                # JD 正文常常是异步渲染的：给一个"尽量等、等不到就算了"的宽限
                 # 有些页面永远不会 idle（长轮询、埋点请求），等不到就算了
                 with contextlib.suppress(Exception):
                     page.wait_for_load_state("networkidle", timeout=5_000)
-                return page.content()
+                # 单页应用首屏渲染完还要一点时间（对这类站点很关键）
+                with contextlib.suppress(Exception):
+                    page.wait_for_timeout(1_500)
+
+                html = page.content()
+                jd_text = _longest_rendered_text(page)
+                title_hint = _data_test_title(page)
+                return html, jd_text, title_hint
             finally:
                 browser.close()
+
+
+#: JD 正文的**起始特征词**（出现即认为"从这里开始是正文"）
+#:
+#: ★ 为什么用"特征词"而不是站点选择器（实测得出的结论）：
+#:   浏览器取到的"最长文本块"必然是**整个内容区**，前面一定带着导航
+#:   （首页 / 社会招聘 / 登录…）、后面带着页脚（相关网站 / 联系我们…）。
+#:   与其去猜站点结构，不如用"JD 里一定会出现的词"做机械截断 ——
+#:   各家招聘站在这一点上高度一致，而且这类词不会因为前端改版而消失。
+_JD_START_MARKERS: tuple[str, ...] = (
+    "职位描述",
+    "岗位职责",
+    "工作职责",
+    "职位职责",
+    "部门介绍",
+    "团队介绍",
+    "岗位介绍",
+    "任职要求",
+    "职位要求",
+    "工作内容",
+)
+
+#: 页脚特征词（出现即认为"正文到此结束"）
+_JD_END_MARKERS: tuple[str, ...] = (
+    "相关网站",
+    "联系我们",
+    "候选人反馈",
+    "官网使用体验",
+    "版权所有",
+    "ICP备",
+    "隐私政策",
+    "举报邮箱",
+    "相关职位",
+    "相似职位",
+    "热门职位",
+)
+
+
+def _longest_rendered_text(page: Any, *, min_length: int = 80) -> str | None:
+    """在**渲染后的页面**里找"最长的文本块"，清理后当作 JD 正文。
+
+    ★ 判据是长度：页面上其余部分（导航、按钮、推荐位）都很短，
+      而 JD 正文通常几百到几千字。这个判据对改版免疫 ——
+      不需要知道站点用了什么 class 名。
+    """
+    script = """
+    () => {
+      let best = '';
+      const nodes = document.querySelectorAll(
+        'div, section, article, main, td, ul, [class*=detail], [class*=desc]'
+      );
+      for (const node of nodes) {
+        const text = (node.innerText || '').trim();
+        if (text.length > best.length) best = text;
+      }
+      return best;
+    }
+    """
+    try:
+        result = page.evaluate(script)
+    except Exception:  # noqa: BLE001 - 页面脚本异常不该让整次抓取失败
+        return None
+    if not isinstance(result, str):
+        return None
+    text = _clean_rendered_text(result)
+    return text if len(text) >= min_length else None
+
+
+#: 页面**导航菜单**里的常见词。整行只由这些词组成时，判定为菜单项而不是内容。
+#:
+#: ★ 为什么要显式列出来：浏览器取到的"最长文本块"是整个内容区，
+#:   开头就是一条导航（实测美团：`首页 / LongCat人才招聘 / 北斗计划 / 社会招聘 /
+#:   校园招聘 / 美团赛事 / 了解美团 / Global Careers 登录`）。
+#:   留在 JD 正文里既污染 P3 的关键词抽取，又让人看着不专业。
+_NAV_LINE_WORDS: tuple[str, ...] = (
+    "首页",
+    "登录",
+    "注册",
+    "社会招聘",
+    "校园招聘",
+    "全球招聘",
+    "人才招聘",
+    "了解美团",
+    "关于我们",
+    "招聘动态",
+    "成长与回报",
+    "产品与技术",
+    "技术人才项目",
+    "我的简历",
+    "投递记录",
+    "消息中心",
+    "搜索职位",
+    "分享",
+    "收藏",
+    "立即申请",
+    "申请职位",
+    "返回首页",
+    "查看更多",
+)
+
+
+def _fill_fields_from_rendered(detail: JobDetail, rendered: str, platform: str) -> None:
+    """从清理后的渲染文本里补结构化字段（**只填空、不覆盖已确认的值**）。
+
+    ★ 这段文本的结构是稳定的（见 `_clean_rendered_text`）：
+        第 1 行       = 岗位名
+        `XX：YY` 行   = 工作地点 / 部门 / 更新时间 / 工作经验
+        特征词之后     = JD 正文
+
+      所以可以直接、机械地取字段，而不必再猜 DOM：
+        · **岗位名**：第一行（导航已经被丢掉了）
+        · **城市**：`工作地点：北京市` 里认城市 —— 这往往是页面上**唯一**
+          明确写出城市的地方（正文里未必再写），而城市是匹配的硬条件维度
+        · **经验/学历**：从整段里认（复用 parse_text 的规则）
+        · **公司**：`岗位名 - 公司` 这种写法里，" - " 后面那段
+    """
+    from jobhunter.adapters.parse_text import (
+        extract_city,
+        extract_education,
+        extract_experience,
+    )
+
+    lines = [line.strip() for line in rendered.splitlines() if line.strip()]
+    if not lines:
+        return
+
+    # ---- 岗位名：第一行 ----
+    first_line = lines[0]
+    if not detail.title or detail.title in {"职位详情", "校招", platform}:
+        # 去掉 `｜` 之后的方向说明？不 —— 那部分是有用信息（LLM / AI Agent 方向）
+        detail.title = first_line[:80]
+
+    # ---- 城市：优先从"工作地点/办公地点"字段行取 ----
+    if not detail.city:
+        for line in lines[:10]:
+            if re.match(r"^(工作地点|办公地点|地点|城市)\s*[:：]", line):
+                city = extract_city(line)
+                if city:
+                    detail.city = city
+                    break
+        if not detail.city:
+            detail.city = extract_city(" ".join(lines[:10]))
+
+    # ---- 经验 / 学历：整段里认（字段行优先） ----
+    header_text = "\n".join(lines[:10])
+    if not detail.experience:
+        detail.experience = extract_experience(header_text) or extract_experience(rendered[:1500])
+    if not detail.education:
+        detail.education = extract_education(header_text) or extract_education(rendered[:1500])
+
+    # ---- 公司：`岗位名 - 公司` 这种写法（页面 title 常见） ----
+    if not detail.company:
+        pattern = (
+            r"^(?P<role>[^-–—|｜]{2,60})\s*[-–—]\s*"
+            r"(?P<company>[^-–—|｜]{2,40})\s*$"
+        )
+        match = re.match(pattern, first_line)
+        if match and not _is_probably_role_only(match.group("company")):
+            detail.company = match.group("company").strip()
+
+
+def _is_probably_role_only(text: str) -> bool:
+    """判断一段文字是不是"岗位级别"而不是公司名（如 `社招-正式`、`日常实习`）。"""
+    markers = ("社招", "校招", "实习", "正式", "兼职", "全职", "急招", "校招-正式")
+    return any(marker in text for marker in markers)
+
+
+def _is_nav_line(line: str) -> bool:
+    """判断一行是不是导航菜单项（短行且含菜单词）。"""
+    stripped = line.strip()
+    if not stripped or len(stripped) > 24:
+        return False
+    return any(word in stripped for word in _NAV_LINE_WORDS)
+
+
+def _clean_rendered_text(raw: str) -> str:
+    """清理"最长文本块"：丢掉导航，保留"信息头 + 正文"。
+
+    ★★ 为什么要用"两区段"规则，而不是列出所有导航词（实测教训）
+
+        我一开始想用菜单词表（首页 / 登录 / 社会招聘…）逐行丢掉导航，
+        但**词表不可能穷举** —— 实测残留了"北斗计划""美团赛事"这种
+        站点专有栏目名，而且每个站的导航都不一样。
+
+        换成结构化的规则就稳了：JD 正文必然以某个特征词开头
+        （职位描述 / 岗位职责 / 部门介绍…），所以：
+
+            区段 A（特征词之前）= 页面头部 → 只保留"像信息"的行
+                · 带冒号的字段行：`工作地点：北京市`、`部门：…`、`更新时间：…`
+                · 岗位名那一行：`算法工程师｜LLM / AI Agent 方向`
+                → 这些是有用信息（**城市往往只能从这里拿到**）
+                → 其余短行一律当导航丢掉
+            区段 B（特征词之后）= JD 正文 → 全部保留，直到页脚特征词
+
+        这个规则不依赖任何站点专有名词，因此改版免疫。
+    """
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    lines = [line for line in lines if not _is_filler_line(line)]
+
+    # 找正文起点
+    start_index = len(lines)
+    for index, line in enumerate(lines):
+        if any(marker in line for marker in _JD_START_MARKERS):
+            start_index = index
+            break
+
+    header, body = lines[:start_index], lines[start_index:]
+
+    # 头部：只留"像信息"的行（带冒号，或是岗位名那一行）
+    title_line = _pick_header_title_line(header)
+    kept_header: list[str] = []
+    for line in header:
+        if line is title_line:
+            kept_header.append(line)
+            continue
+        # 字段行：`工作地点：北京市` / `更新时间：…` / `部门：…` / `工作经验：不限`
+        if re.match(r"^[\u4e00-\u9fffA-Za-z ]{2,10}\s*[:：]", line):
+            kept_header.append(line)
+
+    # 正文：到页脚特征词处停下
+    for index, line in enumerate(body):
+        if any(marker in line for marker in _JD_END_MARKERS):
+            body = body[:index]
+            break
+
+    return "\n".join([*kept_header, *body]).strip()
+
+
+def _pick_header_title_line(header: list[str]) -> str | None:
+    """从页面头部里挑出"岗位名那一行"。
+
+    判据：**最长的那一行**。导航项都是"首页""登录"这种极短词，
+    而岗位名通常带方向与级别（实测 `算法工程师｜LLM / AI Agent 方向`）。
+    """
+    candidates = [line for line in header if len(line) >= 4]
+    if not candidates:
+        return None
+    return max(candidates, key=len)
+
+
+def _is_filler_line(line: str) -> bool:
+    """判断一行是不是"模板残留"（空 bullet、注释尾巴、纯符号）。
+
+    实测例子：`·`、`· 岗位名 - 公司 - 站点 -->`。
+    这类行会把 JD 开头搞得像乱码，而它们有共同特征：
+    以 bullet 开头且去掉符号后什么都不剩，或者以 `-->` 结尾。
+    """
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped.endswith("-->"):
+        return True
+    residue = re.sub(r"[\s·•●○\-–—*>|]+", "", stripped)
+    return len(residue) <= 1
+
+
+def _data_test_title(page: Any) -> str | None:
+    """取 `data-test="jobTitle"`（或类似）元素的文本。
+
+    ★ 为什么值得单独取：`data-test` 是前端为自动化测试写的属性，
+      比 class 名稳定得多（class 常带哈希后缀，改版就变）。
+      取到它，标题就不必去猜 `<h1>`（很多站点的 h1 是站点 logo 或导航）。
+    """
+    for selector in (
+        "[data-test='jobTitle']",
+        "[data-test*='jobTitle' i]",
+        "[data-test*='job-title' i]",
+        ".job-title",
+        "#job-title",
+    ):
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0:
+                text = (locator.inner_text() or "").strip()
+                if text:
+                    return text.split("\n")[0].strip()
+        except Exception:  # noqa: BLE001 - 选择器不匹配是正常情况
+            continue
+    return None
 
 
 def _block_heavy_resources(route: Any) -> None:

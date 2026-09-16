@@ -111,6 +111,23 @@ def test_add_empty_stdin_is_rejected(initialized: Path) -> None:
     assert "空" in result.output or result.exit_code != 0
 
 
+def test_manual_paste_with_bom_still_parses_company(initialized: Path) -> None:
+    """★ Windows 管道带 UTF-8 BOM 时，字段标签仍要能解析出来。
+
+    实测来历：`Get-Content jd.txt | jh job add --manual` 会把 BOM 一起送进管道，
+    首行变成 `\\ufeff公司：某某科技` → 公司名标签匹配失败 → **公司字段整段丢失**，
+    而职位/薪资/城市都正常，所以很难联想到是 BOM 的问题。
+
+    修法是按 `utf-8-sig` 解码标准输入。
+    """
+    bom_text = "\ufeff" + SAMPLE_JD
+    result = runner.invoke(app, ["--no-remind", "job", "add", "--manual"], input=bom_text)
+    assert result.exit_code == 0, result.output
+
+    listing = runner.invoke(app, ["--no-remind", "job", "list"])
+    assert "某某网络科技有限公司" in listing.output, "带 BOM 时公司名没能解析出来"
+
+
 def test_dry_run_does_not_write(initialized: Path) -> None:
     """`--dry-run` 只解析不写库（频率克制的一部分：先看看会入库什么）。"""
     result = runner.invoke(app, ["--no-remind", "job", "add", "--text", SAMPLE_JD, "--dry-run"])

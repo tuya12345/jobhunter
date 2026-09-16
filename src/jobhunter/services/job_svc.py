@@ -186,29 +186,31 @@ def compute_dedup_norm_hash(
 # 去重查找
 # ---------------------------------------------------------------------------
 def find_duplicate(session: Session, detail: JobDetail) -> tuple[Job | None, str | None]:
-    """按两层顺序查找是否已存在同一个岗位。
+    """按三层顺序查找是否已存在同一个岗位。
 
     Returns:
-        `(命中的 Job 或 None, 命中的层名 'platform_job_id' / 'dedup_norm_hash' / None)`
+        `(命中的 Job 或 None, 命中的层名)`
 
-    ★ 三层判定顺序，以及一个容易忽略的**否决条件**：
+    ★ 三层判定 + 一个**否决条件**：
 
-        ① 平台 + platform_job_id 精确命中        → 同一个岗位（最可靠）
-        ② 归一化 hash 命中                        → 同一个岗位（兜底）
-        ③ **否决**：如果"新抓到的平台 ID"与"库里那条的平台 ID"**都非空且不同**，
-           那么即使归一化 hash 相同，也**不合并**。
+        ① 平台 + platform_job_id 精确命中   → 同一个岗位（最可靠）
+        ② **URL 完全相同**                   → 同一个岗位
+        ③ 归一化 hash（公司 + 职位 + 城市）   → 同一个岗位（兜底）
+        ④ 否决：两个"都非空且不同"的平台 ID 之间，不做模糊合并
 
-    ③ 为什么必须有（实测踩出来的真实缺陷）：
+    ②（URL）为什么必须单独加一层（实测踩出来的缺陷）：
 
-        同一家公司在同一城市挂两个相似标题的岗位（"AI Agent 开发工程师" 与
-        "AI Agent 开发工程师（急招）"）时，平台 ID 是 job-001 / job-002 ——
-        它们**是两个不同的岗位**。归一化后标题一样，于是第二层会命中，
-        接着"刷新"逻辑会把库里那条的 `platform_job_id` 从 job-001 **改成 job-002**，
-        记录 A 的身份就被记录 B 顶掉了：`jh job list` 里只剩一条，
-        而用户如果已经投过 A，那个投递记录会挂到 B 上 —— 完全对不上账。
+        公司自建招聘站（美团这类）的页面**根本不写公司名** ——
+        于是 ③ 需要的"公司 + 职位 + 城市"三件套缺一件，直接放弃匹配。
+        实测后果：**同一个链接加三次，库里出现三条一模一样的记录**。
 
-        平台 ID 是"这就是那个岗位"的强证据；两个**互不相同**的强证据之间，
-        不该用弱证据（标题哈希）去把它们合并。
+        而"URL 一模一样"是极强的证据：同一个链接第二次打开还是同一个岗位。
+        它比 ③ 可靠、又比 ① 宽容（很多站点把岗位 ID 藏在 JS 里，URL 里取不到）。
+
+    ④ 为什么必要（另一个实测缺陷）：同一家公司同城挂两个相似标题的岗位
+        （`AI Agent 开发工程师` 与 `…（急招）`），平台 ID 是 job-001 / job-002。
+        没有 ④ 时 ③ 会命中，接着"刷新"逻辑会把那条的 `platform_job_id`
+        **从 job-001 改成 job-002** —— 记录换了身份，而用户已投递的那条会挂错岗位。
     """
     if detail.platform_job_id:
         found = session.scalars(
@@ -219,6 +221,11 @@ def find_duplicate(session: Session, detail: JobDetail) -> tuple[Job | None, str
         ).first()
         if found is not None:
             return found, "platform_job_id"
+
+    if detail.url:
+        found = session.scalars(select(Job).where(Job.url == detail.url)).first()
+        if found is not None:
+            return found, "url"
 
     norm_hash = compute_dedup_norm_hash(detail.company, detail.title, detail.city)
     if norm_hash:

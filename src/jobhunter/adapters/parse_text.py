@@ -129,6 +129,11 @@ def strip_html(html: str) -> str:
     if not html:
         return ""
     text = html
+    # 0) 注释整段丢掉。
+    #    ★ 为什么必须显式处理（实测踩过）：模板里常有注释残留（`… -->`），
+    #      去标签的正则不会动注释内容，于是 JD 正文里会混进
+    #      `· 岗位名 - 公司 - 站点 -->` 这种半截模板文字。
+    text = re.sub(r"(?s)<!--.*?-->", " ", text)
     # 1) 脚本/样式整段丢掉（它们的文本不是内容）
     text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
     # 2) 块级标签换成换行（保住段落结构）
@@ -161,11 +166,26 @@ def strip_html(html: str) -> str:
 #: 薪资写法（都被真实招聘页面用过）：
 #:     15-25K      15~25k      1.5-2.5万      20K-40K      13薪/14薪
 #:     8千-1.2万   6000-8000元/月             面议/薪资面议
+#:
+#: ★★ 为什么要求"带单位"（实测踩过的坑）：
+#:   原来把单位写成可选（`[kK千万]?`），于是 `20190806-145804` 这种
+#:   **时间戳 / 内部 ID** 也被当成薪资区间抽了出来（页面里恰好有 "K"，
+#:   连上下文检查都没拦住）。后果很隐蔽：`jh job list` 里薪资显示成
+#:   `20190806-145804`，而 P4 的"按钱筛"会基于这个数字下判断。
+#:
+#:   现在的规则：**整个区间必须带单位，或者带"元/薪/月"这类钱的特征**。
+#:   代价是 `15-25` 这种裸数字区间不再被识别 —— 那本来就需要靠上下文猜，
+#:   而"猜错的代价（把时间戳当薪资）远大于留空"。
 _SALARY_RANGE_RE = re.compile(
-    r"(?P<low>\d+(?:\.\d+)?)\s*(?P<low_unit>[kK千万])?\s*[-~—–至到]\s*"
-    r"(?P<high>\d+(?:\.\d+)?)\s*(?P<high_unit>[kK千万])?"
+    # ★ 单位与数字之间**不留 `\s*`**：留了的话正则会在 `15-25K` 里从 `-` 之后
+    #   重新开始匹配，把区间切成单个 `25K`（实测踩过，区间信息就丢了）。
+    #   要求"单位紧贴数字"符合真实写法（`15-25K`、`1.5-2.5万`），
+    #   而 `15 - 25 K` 这种带空格的写法本来也极少见。
+    r"(?P<low>\d+(?:\.\d+)?)(?P<low_unit>[kK千万])?\s*[-~—–至到]\s*"
+    r"(?P<high>\d+(?:\.\d+)?)(?P<high_unit>[kK千万])?"
+    r"\s*(?:元|块)?(?:/月|每月|月薪)?"
 )
-_SALARY_SINGLE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[kK千万])")
+_SALARY_SINGLE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[kK千万])(?!\d)")
 #: "13薪 / 14薪 / 15薪" → 发几个月
 _SALARY_MONTHS_RE = re.compile(r"(?P<months>1[0-9])\s*薪")
 #: 薪资相关的上下文词（用来确认"这一段确实是在说钱"，避免把"3-5年"当薪资）
@@ -212,18 +232,30 @@ def extract_salary(text: str) -> tuple[str | None, int | None, int | None]:
     months_match = _SALARY_MONTHS_RE.search(normalized)
     months_text = f"{months_match.group('months')}薪" if months_match else ""
 
-    range_match = _SALARY_RANGE_RE.search(normalized)
-    if range_match:
-        low = _to_yuan(
-            range_match.group("low"), range_match.group("low_unit"), range_match.group("high_unit")
-        )
-        high = _to_yuan(
-            range_match.group("high"), range_match.group("high_unit"), range_match.group("low_unit")
-        )
+    # 区间薪资：必须"带单位"或"带元/月这类钱的特征"。
+    # 只用"上下文里有 K"来兜底是不够的（实测：时间戳所在的那段文字里恰好有 K）。
+    #
+    # ★ 注意"单位只写在高位"是最常见的写法：`15-25K` 里的 `K` 同时管两边。
+    #   所以判据是"**至少有一边带单位**"，而不是"两边都带" ——
+    #   要求两边都带会把 `15-25K` 直接漏掉（实测踩过）。
+    for range_match in _SALARY_RANGE_RE.finditer(normalized):
+        low_unit = range_match.group("low_unit")
+        high_unit = range_match.group("high_unit")
+        tail = range_match.group(0)
+        has_money_tail = bool(re.search(r"(元|块|/月|每月|月薪)", tail))
+        if not (low_unit or high_unit or has_money_tail):
+            continue
+        # 高位单位是共享单位（`15-25K` 的 K 管两边）
+        shared_unit = high_unit or low_unit
+        low = _to_yuan(range_match.group("low"), low_unit, shared_unit)
+        high = _to_yuan(range_match.group("high"), high_unit, shared_unit)
         # 上限比下限小 → 大概率是"5-8千"这类写法被识别反了，交换一下更安全
         if low is not None and high is not None and low > high:
             low, high = high, low
-        display = range_match.group(0).strip()
+        # 数值离谱（比如把 8 位数字当薪资）→ 丢掉，宁可留空
+        if low is not None and not (500 <= low <= 2_000_000):
+            continue
+        display = tail.strip()
         if months_text and months_text not in display:
             display = f"{display}·{months_text}"
         return display, low, high

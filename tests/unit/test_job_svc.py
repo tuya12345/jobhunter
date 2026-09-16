@@ -33,7 +33,15 @@ from jobhunter.services import job_svc
 
 
 def make_detail(**overrides: Any) -> JobDetail:
-    """构造一个"抓取成功"的岗位详情（字段可覆盖）。"""
+    """构造一个"抓取成功"的岗位详情（字段可覆盖）。
+
+    ★ URL 默认跟随 `platform_job_id` 变化，而不是写死一个常量。
+
+      为什么较真（踩过的坑）：URL 现在是去重的一层（公司自建招聘站靠它兜底），
+      如果所有测试岗位共用一个 URL，它们会被判成同一个岗位 ——
+      而现实里**每个岗位的 URL 必然不同**。测试助手必须反映这一点，
+      否则测出来的是"助手写错了"，不是产品行为。
+    """
     base: dict[str, Any] = {
         "platform": "boss",
         "platform_job_id": "job-001",
@@ -47,10 +55,13 @@ def make_detail(**overrides: Any) -> JobDetail:
         "salary_min": 15000,
         "salary_max": 25000,
         "jd_text": "岗位职责：负责 AI Agent 应用的架构设计与开发。\n" * 5,
-        "url": "https://www.zhipin.com/job_detail/job-001.html",
         "fetch_status": "ok",
     }
     base.update(overrides)
+    if "url" not in overrides:
+        # 同一个 platform_job_id → 同一个 URL；不同 ID → 不同 URL（贴合现实）
+        identifier = base.get("platform_job_id") or base.get("title") or "job"
+        base["url"] = f"https://www.zhipin.com/job_detail/{identifier}.html"
     return JobDetail(**base)
 
 
@@ -102,6 +113,37 @@ def test_layer1_dedup_by_platform_job_id(session) -> None:
     assert second.job_id == first.job_id
     assert second.matched_by == "platform_job_id"
     assert session.query(Job).count() == 1
+
+
+def test_url_dedup_catches_company_self_hosted_sites(session) -> None:
+    """★ 公司自建招聘站必须靠 **URL** 去重（实测踩出来的缺陷）。
+
+    实测来历：美团这类公司自建招聘页**根本不写公司名** ——
+    于是"归一化 hash（公司+职位+城市）"因为缺公司而直接放弃匹配，
+    结果是**同一个链接加三次，库里出现三条一模一样的记录**。
+
+    修法是加一层"URL 完全相同即同一岗位"：同一个链接第二次打开还是同一个岗位，
+    这比模糊匹配可靠、又比平台 ID 宽容（很多站点把岗位 ID 藏在 JS 里，URL 里取不到）。
+    """
+    url = "https://zhaopin.example.com/web/position/detail?jobUnionId=4592562550"
+    # 模拟"页面没写公司名"的真实情况
+    manual = make_detail(
+        platform="official",
+        platform_job_id=None,
+        company=None,
+        url=url,
+        title="算法工程师｜LLM / AI Agent 方向",
+    )
+
+    first = job_svc.upsert_job(session, manual)
+    second = job_svc.upsert_job(session, manual)
+    third = job_svc.upsert_job(session, manual)
+
+    assert first.outcome == "created"
+    assert second.matched_by == "url"
+    assert third.matched_by == "url"
+    assert {second.job_id, third.job_id} == {first.job_id}
+    assert session.query(Job).count() == 1, "同一个 URL 产生了重复记录"
 
 
 def test_layer1_wins_over_layer2(session) -> None:

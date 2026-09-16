@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -82,6 +83,16 @@ PLATFORM_JOB_ID_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "liepin": (re.compile(r"/job/(?P<id>\d+)"),),
     "zhilian": (re.compile(r"/jobs/(?P<id>[A-Za-z0-9_~\-]+)"),),
     "linkedin": (re.compile(r"/jobs/view/(?P<id>\d+)"),),
+    # ★ 各家公司自建招聘站的岗位 ID 都在查询参数里（实测：美团用 `jobUnionId`）。
+    #   这类站点域名千变万化，但参数名高度重复，所以按"参数名"而不是"域名"来配。
+    "official": (
+        re.compile(r"[?&]jobUnionId=(?P<id>[A-Za-z0-9_~\-]+)", re.IGNORECASE),
+        re.compile(r"[?&]jobId=(?P<id>[A-Za-z0-9_~\-]+)", re.IGNORECASE),
+        re.compile(r"[?&](?:positionId|postId|job_id)=(?P<id>[A-Za-z0-9_~\-]+)", re.IGNORECASE),
+        re.compile(r"/position/(?P<id>\d{6,})"),
+        re.compile(r"/positions?/(?P<id>[A-Za-z0-9_~\-]{4,})", re.IGNORECASE),
+        re.compile(r"/job/(?P<id>[A-Za-z0-9_~\-]{4,})", re.IGNORECASE),
+    ),
 }
 
 #: 平台选择器（**尽力而为，不是唯一依赖**）。
@@ -152,6 +163,165 @@ def extract_platform_job_id(url: str, platform: str | None = None) -> str | None
 _ATTR_VALUE_RE = re.compile(r"""(?:class|id)\s*=\s*["'](?P<value>[^"']+)["']""", re.IGNORECASE)
 #: 页面标题 `<title>…</title>`（很多站点的 title 就是"岗位-公司-薪资"）
 _TITLE_TAG_RE = re.compile(r"(?is)<title[^>]*>(?P<text>.*?)</title>")
+#: `<meta property="og:title" content="…">`（两种属性顺序都要认）
+_META_RE = re.compile(
+    r"""(?is)<meta[^>]+(?:property|name)\s*=\s*["'](?P<key>[^"']+)["'][^>]*"""
+    r"""content\s*=\s*["'](?P<value>[^"']*)["']"""
+)
+_META_RE_REVERSED = re.compile(
+    r"""(?is)<meta[^>]+content\s*=\s*["'](?P<value>[^"']*)["'][^>]*"""
+    r"""(?:property|name)\s*=\s*["'](?P<key>[^"']+)["']"""
+)
+#: JSON-LD 结构化数据块（schema.org）
+_JSONLD_RE = re.compile(
+    r'(?is)<script[^>]+type\s*=\s*["\']application/ld\+json["\'][^>]*>(?P<body>.*?)</script>'
+)
+#: schema.org 里我们要的岗位类型
+_JSONLD_JOB_TYPES = frozenset({"JobPosting"})
+
+
+def _meta_map(html: str) -> dict[str, str]:
+    """把页面里的 `<meta>` 收集成 `{property/name(小写): content}`。"""
+    metas: dict[str, str] = {}
+    for pattern in (_META_RE, _META_RE_REVERSED):
+        for match in pattern.finditer(html or ""):
+            key = match.group("key").strip().lower()
+            value = match.group("value").strip()
+            if key and value and key not in metas:
+                metas[key] = value
+    return metas
+
+
+def _flatten_jsonld(data: Any) -> list[dict[str, Any]]:
+    """把 JSON-LD 展开成对象列表（处理数组与 `@graph` 嵌套）。"""
+    if isinstance(data, list):
+        flattened: list[dict[str, Any]] = []
+        for item in data:
+            flattened.extend(_flatten_jsonld(item))
+        return flattened
+    if not isinstance(data, dict):
+        return []
+    objects = [data]
+    graph = data.get("@graph")
+    if graph is not None:
+        objects.extend(_flatten_jsonld(graph))
+    return objects
+
+
+def _iter_jsonld_objects(html: str) -> list[dict[str, Any]]:
+    """解析页面里所有 JSON-LD 块，返回其中的对象列表。"""
+    objects: list[dict[str, Any]] = []
+    for match in _JSONLD_RE.finditer(html or ""):
+        body = match.group("body").strip()
+        if not body:
+            continue
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            # 有些站点会在 JSON-LD 里留注释或尾随逗号 → 跳过这块，不影响其他来源
+            continue
+        objects.extend(_flatten_jsonld(data))
+    return objects
+
+
+def _pick_jsonld_job(html: str) -> dict[str, Any] | None:
+    """挑出 JSON-LD 里的 `JobPosting` 对象。
+
+    ★ 为什么值得专门做这一步（真实站点实测的结论）：
+
+        现代招聘站（字节、腾讯、美团这类）都是 SPA，字段由 JS 渲染，
+        服务端 HTML 里**没有**干净的 DOM 可抽。实测后果：
+            · 公司名抽成了页面上的其他文字；
+            · 标题抽成了导航词；
+            · JD 只能退回"整页文本"，把导航/页脚/时间戳一起算进去。
+
+        其中一部分站点会输出 **schema.org 的 `JobPosting` JSON-LD**（为了搜索引擎收录），
+        那是公开标准、字段语义明确（title / hiringOrganization / jobLocation /
+        description / employmentType …），而且**改版免疫**。
+
+        ⚠️ 它只是**优先来源**，不是唯一来源：拿不到时仍走 DOM 选择器与整页兜底。
+
+    ★★ 必须校验 `@type`，不能"解析出 dict 就用"（实测踩过）：
+        字节的页面里那个 `application/ld+json` 块**其实是段 JS**
+        （`(function(nav){…})`）。用正则 `json.loads` 当然会失败，
+        但要是哪天它恰好是合法 JSON（比如 `{}` 或某个配置对象），
+        "有 dict 就用"就会把垃圾当字段来源 —— 所以这里强制要求 `@type` 命中 JobPosting。
+    """
+    best: dict[str, Any] | None = None
+    for obj in _iter_jsonld_objects(html):
+        type_value = obj.get("@type")
+        types = {type_value} if isinstance(type_value, str) else set(type_value or [])
+        if not (types & _JSONLD_JOB_TYPES):
+            continue
+        if obj.get("title") or obj.get("description"):
+            return obj
+        best = best if best is not None else obj
+    return best
+
+
+def _salary_from_dom(html: str) -> str:
+    """从页面上"看起来是薪资"的元素里取文本（比全文搜数字可靠）。
+
+    ★ 为什么要有这一档（实测踩过）：原来直接在**整页 HTML** 上跑薪资正则，
+      结果把页面里无关的 `4K`（图片/分辨率之类的字样）当成了月薪写进库。
+      先在 class/id 含 salary/薪资/工资 的元素里找，命不中才退回全文，
+      可以把这类误判压到最低。
+    """
+    for token in ("salary", "job-salary", "salary-text", "薪资", "工资"):
+        for text in _text_of_elements_with_class(html, token):
+            cleaned = strip_html(text)
+            if cleaned and any(ch.isdigit() for ch in cleaned):
+                return cleaned
+    return ""
+
+
+def _jsonld_location_text(job: dict[str, Any]) -> str:
+    """把 `jobLocation` 压成文本（可能是字符串、对象或数组）。"""
+
+    def _extract(node: Any) -> list[str]:
+        if isinstance(node, str):
+            return [node]
+        if isinstance(node, list):
+            parts: list[str] = []
+            for item in node:
+                parts.extend(_extract(item))
+            return parts
+        if isinstance(node, dict):
+            address = node.get("address", node)
+            if isinstance(address, dict):
+                candidates = (
+                    address.get("addressLocality"),
+                    address.get("addressRegion"),
+                    address.get("addressCountry"),
+                )
+                return [str(value) for value in candidates if value]
+            if isinstance(address, str):
+                return [address]
+        return []
+
+    return " ".join(_extract(job.get("jobLocation"))).strip()
+
+
+def _jsonld_salary_text(job: dict[str, Any]) -> str:
+    """把 `baseSalary` 压成一段可读文本（数值化仍交给 parse_text）。"""
+    salary = job.get("baseSalary")
+    if isinstance(salary, str):
+        return salary
+    if not isinstance(salary, dict):
+        return ""
+
+    value = salary.get("value", salary)
+    if not isinstance(value, dict):
+        return str(value)
+
+    unit = salary.get("currency") or value.get("unitText") or ""
+    low = value.get("minValue") or value.get("value")
+    high = value.get("maxValue")
+    if low is None:
+        return ""
+    if high and high != low:
+        return f"{low}-{high}{unit}"
+    return f"{low}{unit}"
 
 
 def _selector_matches(html: str, selector: str) -> list[str]:
@@ -256,34 +426,58 @@ def parse_detail_from_html(
 
     normalizer = html or ""
     title = _page_title(normalizer)
-    salary_text, salary_min, salary_max = extract_salary(normalizer)
+    metas = _meta_map(normalizer)
+    structured = _pick_jsonld_job(normalizer)
 
-    selectors = PLATFORM_SELECTORS.get(platform, {})
-    jd_candidates: list[str] = []
-    for selector in selectors.get("jd", ()):
-        # 选择器形如 ".job-sec-text" → 取所有匹配 class 的内层文本
-        token = selector.lstrip(".").split()[0]
-        if selector.startswith("."):
-            jd_candidates.extend(_text_of_elements_with_class(normalizer, token))
-    # 通用兜底：class 里含这些词的块
-    for token in ("job-sec-text", "job-detail", "job-desc", "job_bt", "job_msg", "description"):
-        jd_candidates.extend(_text_of_elements_with_class(normalizer, token))
-
-    jd_text = _longest_meaningful(jd_candidates)
+    # ---- JD 正文：① JSON-LD → ② 平台选择器/通用候选（取最长）→ ③ 整页兜底 -----
+    jd_text: str | None = None
     fetch_status = "ok"
+
+    if structured is not None:
+        jd_text = _longest_meaningful([str(structured.get("description") or "")])
+        if jd_text:
+            fetch_status = "ok"
+
+    if not jd_text:
+        selectors = PLATFORM_SELECTORS.get(platform, {})
+        jd_candidates: list[str] = []
+        for selector in selectors.get("jd", ()):
+            # 选择器形如 ".job-sec-text" → 取所有匹配 class 的内层文本
+            token = selector.lstrip(".").split()[0]
+            if selector.startswith("."):
+                jd_candidates.extend(_text_of_elements_with_class(normalizer, token))
+        # 通用兜底：class 里含这些词的块
+        for token in (
+            "job-sec-text",
+            "job-detail",
+            "job-desc",
+            "job_bt",
+            "job_msg",
+            "description",
+        ):
+            jd_candidates.extend(_text_of_elements_with_class(normalizer, token))
+        jd_text = _longest_meaningful(jd_candidates)
 
     if not jd_text:
         # 再退一步：整页纯文本（去掉脚本与样式之后仍然够长就用它）
         plain = strip_html(normalizer)
-        if len(plain) >= _MIN_JD_LENGTH:
-            jd_text = plain
-            fetch_status = "partial"
-        else:
-            jd_text = plain
-            fetch_status = "failed"
+        jd_text = plain
+        fetch_status = "partial" if len(plain) >= _MIN_JD_LENGTH else "failed"
 
-    company = _guess_company(normalizer, title)
-    title_text = _guess_job_title(normalizer, title)
+    # ---- 结构化字段：JSON-LD 优先，其次 DOM/title/meta 启发式 -----------------
+    company, title_text, city_text, salary_source = _resolve_basic_fields(
+        normalizer, title, metas, structured
+    )
+
+    # 薪资：优先用 JSON-LD / 页面上的薪资元素；都没有就**在纯文本里**找。
+    #
+    # ★★ 绝不能把原始 HTML 喂给 extract_salary（实测踩过的坑）：
+    #   美团页面 1.6 MB 的 HTML 里有大量 SVG 路径与内联样式数据，
+    #   里面恰好出现 `1k` 这样的片段，于是薪资被抽成 `1k`（1000 元/月）——
+    #   而那个岗位页面**根本没写薪资**。先 strip_html 再抽，就不会误判。
+    if not salary_source:
+        salary_source = _salary_from_dom(normalizer)
+    salary_text, salary_min, salary_max = extract_salary(salary_source or strip_html(normalizer))
 
     return JobDetail(
         platform=platform,
@@ -291,17 +485,103 @@ def parse_detail_from_html(
         platform_job_id=job_id,
         company=company,
         title=title_text,
-        city=extract_city(normalizer[:4000]) or extract_city(title or ""),
+        city=city_text or extract_city(normalizer[:4000]) or extract_city(title or ""),
         experience=extract_experience(normalizer[:4000]),
         education=extract_education(normalizer[:4000]),
-        is_intern=looks_like_intern(f"{title_text or ''} {jd_text or ''}"),
+        is_intern=looks_intern_from(normalizer, structured, title_text, jd_text),
         salary_text=salary_text,
         salary_min=salary_min,
         salary_max=salary_max,
         url=url,
         fetch_status=fetch_status,
-        raw={"title_tag": title or "", "jd_length": len(jd_text or "")},
+        raw={
+            "title_tag": title or "",
+            "jd_length": len(jd_text or ""),
+            "jsonld": structured is not None,
+        },
     )
+
+
+def _resolve_basic_fields(
+    html: str,
+    page_title: str | None,
+    metas: dict[str, str],
+    structured: dict[str, Any] | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """解析公司 / 职位 / 城市 / 薪资文本，按可靠性从高到低取。
+
+    Returns:
+        `(company, title, city, salary_source)`
+
+    优先级（每一档都是"有就用、没有就下一档"）：
+        ① **JSON-LD**（`hiringOrganization` / `title` / `jobLocation` / `baseSalary`）
+           —— 机器可读、语义明确、改版免疫；
+        ② DOM 选择器（公司区块 / `h1`）；
+        ③ `<meta og:title>` 与 `<title>`（`岗位_公司_薪资_城市_招聘` 这种写法）；
+        ④ 城市：JSON-LD 的地点 → 全文认城市。
+    """
+    company: str | None = None
+    title: str | None = None
+    city: str | None = None
+    salary_source: str | None = None
+
+    if structured is not None:
+        raw_title = structured.get("title")
+        title = str(raw_title).strip() if raw_title else None
+
+        organization = structured.get("hiringOrganization")
+        if isinstance(organization, dict):
+            name = organization.get("name")
+            company = str(name).strip() if name else None
+        elif isinstance(organization, str):
+            company = organization.strip() or None
+
+        location_text = _jsonld_location_text(structured)
+        if location_text:
+            city = extract_city(location_text)
+
+        salary_text = _jsonld_salary_text(structured)
+        if salary_text:
+            salary_source = salary_text
+
+    company = company or _guess_company(html, page_title)
+    title = title or _guess_job_title(html, page_title)
+
+    # `<meta og:title>` 常比 `<title>` 干净（没有站点后缀）
+    if not title:
+        og_title = metas.get("og:title") or metas.get("twitter:title")
+        if og_title:
+            parts = _split_page_title(og_title)
+            title = parts[0] if parts else og_title
+    if not company:
+        og_site = metas.get("og:site_name")
+        # og:site_name 常常是"BOSS直聘"这种站点名，不能当公司名 →
+        # 只在与页面 title 的分段结果一致时才用（那是真公司名的强信号）
+        parts = _split_page_title(page_title)
+        if og_site and len(parts) >= 2 and og_site.strip() == parts[1]:
+            company = og_site.strip()
+
+    return company, title, city, salary_source
+
+
+def looks_intern_from(
+    html: str,
+    structured: dict[str, Any] | None,
+    title: str | None,
+    jd_text: str | None,
+) -> bool | None:
+    """判断是否实习岗：JSON-LD 的 `employmentType` 优先，其次标题与正文。"""
+    if structured is not None:
+        employment = structured.get("employmentType")
+        if isinstance(employment, list):
+            employment = " ".join(str(item) for item in employment)
+        if isinstance(employment, str) and employment:
+            lowered = employment.lower()
+            if "intern" in lowered:
+                return True
+            if "full" in lowered or "part" in lowered or "contract" in lowered:
+                return False
+    return looks_like_intern(f"{title or ''} {jd_text or ''}")
 
 
 def parse_detail_from_text(
@@ -355,10 +635,50 @@ def _page_title(html: str) -> str | None:
     return text or None
 
 
-#: 页面 title 的常见写法：`岗位-公司-薪资-城市-招聘`。
-#: ★ 分隔符要把**下划线**也收进来：BOSS 等站点用的是 `岗位_公司_薪资_城市_招聘-BOSS直聘`
-#:   （实测：只按 `-` 切会把整个 title 当成一个字段，公司名直接抽不出来）。
+#: 页面 title 的常见写法：`岗位-公司-薪资-城市-招聘` 或 `岗位_公司_薪资_城市_招聘`。
+#: ★ 分隔符要把**下划线**与**全角空格**都收进来 —— BOSS 用 `岗位_公司_…-BOSS直聘`，
+#:   字节用 `岗位 - 公司 - 站点名`（实测两种都遇到过）。
 _TITLE_SPLIT_RE = re.compile(r"\s*[-–—_|｜·]\s*")
+
+#: 招聘站点自己的名字。它们出现在 title 的**末段**，不是公司名。
+#:
+#: ★ 为什么需要这个名单（实测踩过）：`<title>` 常写成
+#:   `岗位 - 公司 - 站点名`。如果不识别站点名，就会把"公司"取错位置 ——
+#:   实测把 `豆包AI大模型产品解决方案实习生 - 火山方舟 - 字节跳动` 里的公司
+#:   取成了"火山方舟"（那是**团队/业务线**），而正确公司名是最后一段"字节跳动"。
+_SITE_NAMES = (
+    "字节跳动",
+    "boss直聘",
+    "boss",
+    "拉勾",
+    "拉勾网",
+    "前程无忧",
+    "智联招聘",
+    "猎聘",
+    "猎聘网",
+    "脉脉",
+    "linkedin",
+    "领英",
+    "看准网",
+    "实习僧",
+    "牛客",
+    "牛客网",
+    "大街网",
+    "中华英才网",
+    "智联",
+    "58同城",
+    "招聘",
+    "官网",
+    "首页",
+    "校园招聘",
+    "社会招聘",
+)
+
+
+def _is_site_name(text: str) -> bool:
+    """判断一段文字是不是"招聘站点自己的名字"。"""
+    lowered = text.strip().lower()
+    return any(name in lowered for name in _SITE_NAMES)
 
 
 def _split_page_title(title: str | None) -> list[str]:
@@ -366,27 +686,45 @@ def _split_page_title(title: str | None) -> list[str]:
         return []
     parts = [part.strip() for part in _TITLE_SPLIT_RE.split(title) if part.strip()]
     # 去掉明显的噪音段（"招聘""BOSS直聘"这类站点后缀）
-    noise = ("招聘", "boss直聘", "boss", "拉勾", "前程无忧", "智联招聘", "猎聘", "官网", "首页")
-    return [p for p in parts if not any(word in p.lower() for word in noise)]
+    return [part for part in parts if not _is_site_name(part)]
 
 
 def _guess_job_title(html: str, title: str | None) -> str | None:
-    """猜岗位名：先看 `h1`，再用页面 title 的第一段。"""
-    h1_match = re.search(r"(?is)<h1[^>]*>(?P<text>.*?)</h1>", html or "")
-    if h1_match:
-        text = strip_html(h1_match.group("text"))
-        if text:
-            return text.split("\n")[0].strip() or None
+    """猜岗位名：① 显式的岗位名容器 → ② 页面 title 的第一段。
+
+    ★ 为什么**不**直接取 `<h1>`（实测踩过）：很多站点的第一个 `<h1>` 是
+      站点 logo / 导航（字节的岗位页第一个 h1 是"校园招聘"），
+      直接把导航词当成岗位名写进库，而它是**完全错的字段**。
+
+      所以这里只认"语义明确的岗位名容器"：
+        · `data-test="jobTitle"`（前端为自动化测试写的属性，最稳）
+        · class 里明确含 `job-title` / `jobTitle` 的元素
+      都没有时，退回页面 `<title>` 的第一段 —— 那是站点给搜索引擎看的，
+      几乎所有招聘站都会写成"岗位名 - 公司 - 站点"。
+    """
+    for pattern in (
+        r"""(?is)<[^>]+data-test\s*=\s*["'][^"']*job[-_]?title[^"']*["'][^>]*>(?P<text>.*?)</""",
+        r"""(?is)<[^>]+class\s*=\s*["'][^"']*job[-_]?title[^"']*["'][^>]*>(?P<text>.*?)</""",
+    ):
+        for match in re.finditer(pattern, html or ""):
+            candidate = strip_html(match.group("text")).split("\n")[0].strip()
+            # 过滤掉明显不是标题的（空的、或过长的整段文字）
+            if candidate and 2 <= len(candidate) <= 80:
+                return candidate
+
     parts = _split_page_title(title)
     return parts[0] if parts else None
 
 
 def _guess_company(html: str, title: str | None) -> str | None:
-    """猜公司名：先看公司区块，再用页面 title 的第二段兜底。
+    """猜公司名：先看公司区块，再用页面 title 兜底。
 
-    ★ 为什么不只用 title：`某某科技` 这种简称在 title 里很常见，
-      而页面上通常有完整公司名（`某某科技（深圳）有限公司`）。
-      但**两个都不能保证存在**，所以按可靠性排：公司区块 → title。
+    ★ title 的两种真实布局（实测）：
+        · `岗位_公司_薪资_城市_招聘-BOSS直聘` → 第二段是公司
+        · `岗位 - 公司 - 站点名`（字节）      → **去掉站点名后，最后一段是公司**
+      站点名（"字节跳动""BOSS直聘"…）会被 `_split_page_title` 滤掉，
+      所以规则可以统一成：**取"去掉站点名之后"的最后一段**。
+      （第一段永远是岗位名，取最后一段对两种布局都成立。）
     """
     for token in ("company-info", "company-name", "company_name", "cname", "company"):
         for text in _text_of_elements_with_class(html or "", token):
@@ -395,8 +733,8 @@ def _guess_company(html: str, title: str | None) -> str | None:
                 return cleaned.split("\n")[0].strip() or None
 
     parts = _split_page_title(title)
-    if len(parts) >= 2 and parts[1]:
-        return parts[1]
+    if len(parts) >= 2 and parts[-1]:
+        return parts[-1]
     return None
 
 

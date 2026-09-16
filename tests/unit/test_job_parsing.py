@@ -54,7 +54,7 @@ from jobhunter.adapters.parse_text import (
         ("20K-40K", "20K-40K", 20000, 40000),
         ("1.5-2.5万", "1.5-2.5万", 15000, 25000),
         ("8千-1.2万", "8千-1.2万", 8000, 12000),
-        ("6000-8000元/月", "6000-8000", 6000, 8000),
+        ("6000-8000元/月", "6000-8000元/月", 6000, 8000),
         ("薪资：25K", "25K", 25000, 25000),
     ],
 )
@@ -215,6 +215,26 @@ def test_extract_platform_job_id() -> None:
     assert extract_platform_job_id("https://careers.example.com/apply") is None
 
 
+def test_extract_platform_job_id_from_company_sites() -> None:
+    """★ 公司自建招聘站的岗位 ID 在**查询参数**里，也要能抠出来。
+
+    实测来历：美团用 `?jobUnionId=4592562550`。抠不到这个 ID 会连锁出两个问题：
+    去重第一层失效，而第二层又因为"页面没写公司名"而放弃 →
+    **同一个链接加三次产生三条重复记录**。
+    """
+    assert (
+        extract_platform_job_id(
+            "https://zhaopin.meituan.com/web/position/detail?jobUnionId=4592562550&x=1"
+        )
+        == "4592562550"
+    )
+    assert extract_platform_job_id("https://careers.example.com/job?jobId=ABC-123") == "ABC-123"
+    assert (
+        extract_platform_job_id("https://jobs.bytedance.com/campus/position/7672308679/detail")
+        == "7672308679"
+    )
+
+
 # ===========================================================================
 # HTML → JobDetail
 # ===========================================================================
@@ -332,6 +352,31 @@ def test_parse_detail_from_html_marks_failed_on_empty_page() -> None:
     detail = parse_detail_from_html("<html><body></body></html>", "https://x.com/job/1")
     assert detail.fetch_status == "failed"
     assert detail.jd_text == ""
+
+
+def test_salary_is_not_scraped_from_raw_markup() -> None:
+    """★ 绝不能从原始 HTML 的 SVG / 样式数据里"抽"出薪资。
+
+    实测来历：美团岗位页 1.6 MB 的 HTML 里有大量 SVG 路径与内联样式，
+    里面恰好出现 `1k` 片段，于是薪资被抽成 `1k`（1000 元/月）——
+    而那个页面**根本没写薪资**。这种误判比留空糟得多：
+    用户会拿这个假数字去比较 offer，P4 的"按钱筛"也会跟着错。
+
+    修法：薪资只在**纯文本**上抽（先 `strip_html`）。
+    """
+    html = (
+        '<html><body><div class="job-sec-text">'
+        "岗位职责：负责 AI Agent 应用开发，熟悉 Python 与 RAG 检索链路。"
+        "任职要求：本科及以上，具备良好的工程习惯与沟通能力。"
+        "</div>"
+        # 下面这些是"看起来像薪资"的标记噪音（真实页面里到处都是）
+        '<svg viewBox="0 0 1k 1k"><path d="M1k 1k L2k 2k"/></svg>'
+        "<style>.icon{width:1k;height:2k}</style>"
+        "</body></html>"
+    )
+    detail = parse_detail_from_html(html, "https://zhaopin.example.com/job/1")
+    assert detail.salary_text is None, f"从标记里抽出了假薪资：{detail.salary_text!r}"
+    assert detail.salary_min is None
 
 
 # ===========================================================================

@@ -408,8 +408,21 @@ def _read_stdin() -> str:
     ★ 为什么要显式提示"怎么结束输入"：Windows 上是 Ctrl+Z 再回车、
       macOS/Linux 是 Ctrl+D —— 不说清楚的话，用户会卡在"光标不动"的状态，
       以为程序死了。这是纯粹的体验问题，但很影响"愿不愿意用它"。
+
+    ★★ 为什么要用 `utf-8-sig` 解码，而不是 `sys.stdin.read()`（实测踩到的坑）：
+
+        Windows 上 `Get-Content jd.txt | jh job add --manual` 会把 **UTF-8 BOM**
+        一起送进管道，于是首行变成 `\\ufeff公司：某某科技` —— 字段标签匹配失败，
+        **公司名整段解析不出来**。而其他字段（职位/薪资/城市）都正常，
+        所以极难联想到是 BOM 的问题。
+
+        用 `utf-8-sig` 解码会自动吃掉开头的 BOM；没有 BOM 时它与 utf-8 完全等价，
+        因此对 Linux/macOS 以及 `--text` 路径都没有影响。
     """
-    if sys.stdin is None or sys.stdin.isatty():
+    if sys.stdin is None:
+        return ""
+
+    if sys.stdin.isatty():
         console.print(
             Panel(
                 "请粘贴 JD 文本，粘贴完按 [bold]Ctrl+Z[/bold] 再回车（Windows）"
@@ -419,7 +432,15 @@ def _read_stdin() -> str:
                 border_style="cyan",
             )
         )
-    return sys.stdin.read() if sys.stdin is not None else ""
+
+    # 优先走二进制流自己解码（只有这样才能用 utf-8-sig 处理 BOM）
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is not None:
+        try:
+            return buffer.read().decode("utf-8-sig", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover - 流不可读时退回文本读
+            pass
+    return sys.stdin.read().lstrip("\ufeff")
 
 
 def _print_details(details: list[JobDetail], failures: list[str]) -> None:
