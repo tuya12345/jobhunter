@@ -32,7 +32,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -202,9 +202,48 @@ class AppSettings(BaseSettings):
     show_reminders: bool = True
 
     # ---- 密钥（只从 .env / 环境变量来）-------------------------------------
-    deepseek_api_key: str = ""
-    deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-chat"
+    # ★★ 为什么这三个字段要写 `validation_alias`（P3 验收时发现的 P0 老 bug）
+    #
+    #   上面 model_config 里有 `env_prefix="JH_"`，它对本类**所有**字段生效，
+    #   于是 `deepseek_api_key` 实际去找的环境变量名是 `JH_DEEPSEEK_API_KEY`。
+    #   但 `.env.example`（以及按它写的真实 `.env`）里写的是 `DEEPSEEK_API_KEY`
+    #   —— 名字对不上，密钥**从来没有被读进来过**，而且完全静默：
+    #   命令照跑，只是 LLM 层一直"未配置"，用户会以为是自己没充钱。
+    #
+    #   修法用 `AliasChoices` 同时接受三种写法（顺序即优先级）：
+    #     · DEEPSEEK_API_KEY      —— .env.example 里的官方写法（保持不变）
+    #     · JH_DEEPSEEK_API_KEY   —— 尊重 env_prefix 的通用写法
+    #     · deepseek_api_key      —— 字段名本身（保证 yaml / 代码里构造仍可用）
+    deepseek_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "DEEPSEEK_API_KEY", "JH_DEEPSEEK_API_KEY", "deepseek_api_key"
+        ),
+    )
+    deepseek_base_url: str = Field(
+        default="https://api.deepseek.com",
+        validation_alias=AliasChoices(
+            "DEEPSEEK_BASE_URL", "JH_DEEPSEEK_BASE_URL", "deepseek_base_url"
+        ),
+    )
+    deepseek_model: str = Field(
+        default="deepseek-chat",
+        validation_alias=AliasChoices("DEEPSEEK_MODEL", "JH_DEEPSEEK_MODEL", "deepseek_model"),
+    )
+
+    # ---- LLM 行为 -----------------------------------------------------------
+    # ★ 为什么要有 provider 开关（而不是"有 key 就走真模型"）：
+    #   ① 测试必须能在**完全确定性**的条件下跑匹配（`JH_LLM_PROVIDER=mock`），
+    #      否则 CI 会因网络抖动随机变红 → 最后大家把这些测试删掉 → 等于没测；
+    #   ② `jh demo` 要用假数据跑通全流程，不能真的花钱。
+    llm_provider: Literal["deepseek", "mock"] = "deepseek"
+    # 并发度：DeepSeek 对并发比较宽松，但这里是**个人工具**，
+    # 4 路已经能把 30 条岗位压到十几秒；再高收益极小，只会更容易触发限流。
+    llm_concurrency: int = Field(default=4, ge=1, le=16)
+    # 业务层重试次数（空 content / 坏 JSON）。默认只重试 1 次：
+    # 空 content 是**偶发**的，重试一次基本就好；连续两次失败说明不是抖动，
+    # 继续烧 token 不如直接降级到规则分（用户至少还能看到分数）。
+    llm_max_retries: int = Field(default=1, ge=0, le=3)
 
     # ---- 本地路径（可选覆盖）-----------------------------------------------
     # 直接给 sqlite URL 时优先用它；否则按 paths 推导

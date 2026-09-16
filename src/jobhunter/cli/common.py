@@ -19,12 +19,16 @@ from rich.console import Console
 from rich.panel import Panel
 
 from jobhunter import CURRENT_PHASE
+from jobhunter.config.settings import get_settings
+from jobhunter.storage.db import database_ready, get_session_factory
+from jobhunter.utils.logging import setup_logging
 
 __all__ = [
     "console",
     "err_console",
     "not_implemented",
     "print_kv",
+    "require_db",
     "success",
     "warn",
 ]
@@ -114,6 +118,33 @@ def print_kv(pairs: dict[str, object], *, title: str | None = None) -> None:
         console.print(f"[bold]{title}[/bold]")
     for key, value in pairs.items():
         console.print(f"  [dim]{key}[/dim]：{value}")
+
+
+#: 数据库还没初始化时的统一提示（比 "no such table: jobs" 可读得多）
+INIT_HINT = "[yellow]数据库还没初始化。请先运行：[bold]jh init[/bold][/yellow]"
+
+
+def require_db() -> tuple[object, object]:
+    """确认数据库可用，返回 `(engine, session_factory)`。
+
+    ★ 为什么每个要读库的命令都得先过这一关：
+      SQLAlchemy 在表不存在时报的是 `no such table: jobs` ——
+      对用户来说完全不知道该怎么办。这里换成一句"请先运行 jh init"。
+
+    ★ 为什么它从各命令模块搬到了这里（P3 做的重构）：
+      在 P2 时 `job_cmd` 与 `resume_cmd` 各写了一份**几乎一样**的 `_require_db`。
+      两份代码的复制本身还能忍，真正的问题是**提示语会漂移**：
+      以后想加一句"或 jh init --force"，很可能只改了其中一处。
+      P3 又多了 match / gap 两个使用者 —— 到了"四处重复"这一步，
+      抽出来的收益才真正大于成本（**别为两个调用点提前造抽象，
+      到了三四个的时候就该动手了**）。
+    """
+    setup_logging()
+    settings = get_settings()
+    if not database_ready(settings.database_url):
+        err_console.print(INIT_HINT)
+        raise typer.Exit(code=1)
+    return get_session_factory(settings.database_url)
 
 
 # ───────────────────────────────────────────────────────────────────────────

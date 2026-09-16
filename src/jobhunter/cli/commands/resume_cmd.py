@@ -38,33 +38,19 @@ import typer
 from rich.panel import Panel
 from rich.table import Table
 
-from jobhunter.cli.common import EXIT_NOT_IMPLEMENTED, console, err_console, success, warn
+from jobhunter.cli.common import (
+    EXIT_NOT_IMPLEMENTED,
+    console,
+    err_console,
+    require_db,
+    success,
+    warn,
+)
 from jobhunter.config.settings import get_settings
 from jobhunter.services import resume_svc
-from jobhunter.storage.db import database_ready, get_session_factory
 from jobhunter.utils.io import write_text
-from jobhunter.utils.logging import setup_logging
 
 app = typer.Typer(name="resume", help="简历：导入解析 / 列表 / 拆分方向（P1）")
-
-
-#: 数据库还没初始化时的统一提示（比 "no such table: resumes" 可读得多）
-_INIT_HINT = "[yellow]数据库还没初始化。请先运行：[bold]jh init[/bold][/yellow]"
-
-
-def _require_db() -> tuple[object, object]:
-    """确认数据库可用，返回 (engine, session_factory)。
-
-    ★ 为什么每个命令都要先过这一关：SQLAlchemy 在表不存在时报的是
-      `no such table: resumes` —— 对用户来说完全不知道该怎么办。
-      这里换成一句"请先运行 jh init"。
-    """
-    setup_logging()
-    settings = get_settings()
-    if not database_ready(settings.database_url):
-        err_console.print(_INIT_HINT)
-        raise typer.Exit(code=1)
-    return get_session_factory(settings.database_url)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +98,7 @@ def resume_add(
         err_console.print(f"[red]找不到文件：{target}[/red]")
         raise typer.Exit(code=1)
 
-    engine, factory = _require_db()
+    engine, factory = require_db()
     try:
         with factory() as session:
             try:
@@ -170,7 +156,7 @@ def resume_add(
 @app.command("list")
 def resume_list() -> None:
     """列出已导入的简历。"""
-    engine, factory = _require_db()
+    engine, factory = require_db()
     try:
         with factory() as session:
             rows = resume_svc.list_resumes(session)
@@ -230,7 +216,7 @@ def resume_split(
 ) -> None:
     """拆分方向建议：哪些项目该前置、哪些该弱化、还缺什么（**只给建议，不改简历**）。"""
     settings = get_settings()
-    engine, factory = _require_db()
+    engine, factory = require_db()
     try:
         with factory() as session:
             if resume_id is None:

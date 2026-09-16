@@ -77,6 +77,7 @@ __all__ = [
     "compute_content_hash",
     "content_from_json",
     "derive_direction",
+    "education_end_year",
     "extract_skills",
     "list_resumes",
     "load_direction_profiles",
@@ -558,6 +559,27 @@ def _period_sort_key(display: str) -> tuple[int, int] | None:
     if match.group("y2"):
         return (int(match.group("y2")), int(match.group("m2") or 1))
     return (int(match.group("y1")), int(match.group("m1") or 1))
+
+
+def education_end_year(period: str) -> int | None:
+    """从一段教育经历的 period 里取**结束年份**（判"是不是应届生"用）。
+
+    ★ 为什么把它做成公开函数（而不是让 P3 直接用 `_period_sort_key`）：
+      "应届生判定"是 P3 匹配的**业务规则**，它依赖"教育经历的结束年份"这个
+      业务含义；而 `_period_sort_key` 是排序用的内部工具。
+      直接跨模块用私有函数，将来改排序逻辑会**静默改掉应届判定** ——
+      这类耦合最难查。包一层之后，两边的意图都写在名字里了。
+
+    ★ 为什么"至今"（9999）要特判成 None：
+      教育经历写"2023.09 至今"说明还在读 —— 这当然是应届，
+      但返回 9999 会让调用方算出"9999 年毕业"这种荒唐结论。
+      由调用方按 None 处理成"判不出来"，比在这里猜一个年份诚实。
+    """
+    key = _period_sort_key(period or "")
+    if key is None:
+        return None
+    year, _month = key
+    return None if year >= 9999 else year
 
 
 def _strip_periods(text: str, spans: list[tuple[int, int, str]]) -> str:

@@ -73,17 +73,16 @@ EXPECTED_COMMANDS = (
 #     · `init`（P0）
 #     · `resume` 三个子命令（P1）
 #     · `job` 四个子命令（P2）
+#     · `match` 三个子命令 + `gap`（P3）
 #   它们在没有数据库时会报"请先运行 jh init"（exit 1）—— 那是**正确的**行为，
 #   由 `test_*_commands_are_implemented` 那几条用例单独覆盖。
 PLACEHOLDER_INVOCATIONS: list[list[str]] = [
     ["today"],
-    ["gap"],
     ["weak"],
     ["stats"],
     ["report"],
     ["demo"],
     ["followup", "1"],
-    ["match", "run"],
     ["apply", "3=applied", "7=replied"],
     ["apply", "1", "--status", "applied"],
     ["apply", "--pending"],

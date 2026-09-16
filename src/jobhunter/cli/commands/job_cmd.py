@@ -38,27 +38,12 @@ from rich.table import Table
 
 from jobhunter.adapters.base import JobDetail
 from jobhunter.adapters.parse_html import parse_detail_from_text
-from jobhunter.cli.common import console, err_console, success, warn
+from jobhunter.cli.common import console, err_console, require_db, success, warn
 from jobhunter.config.settings import get_settings
 from jobhunter.services import job_svc
-from jobhunter.storage.db import database_ready, get_session_factory
 from jobhunter.utils.io import read_text
-from jobhunter.utils.logging import setup_logging
 
 app = typer.Typer(name="job", help="岗位：给链接抓详情 / 批量 / 手动粘贴 / 列表（P2）")
-
-
-_INIT_HINT = "[yellow]数据库还没初始化。请先运行：[bold]jh init[/bold][/yellow]"
-
-
-def _require_db() -> tuple[object, object]:
-    """确认数据库可用（否则给"请先运行 jh init"而不是 `no such table`）。"""
-    setup_logging()
-    settings = get_settings()
-    if not database_ready(settings.database_url):
-        err_console.print(_INIT_HINT)
-        raise typer.Exit(code=1)
-    return get_session_factory(settings.database_url)
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +125,7 @@ def job_add(
         warn("--dry-run：以上结果没有写入数据库")
         return
 
-    engine, factory = _require_db()
+    engine, factory = require_db()
     try:
         with factory() as session:
             created = refreshed = unchanged = 0
@@ -207,7 +192,7 @@ def job_list(
     limit: Annotated[int, typer.Option("--limit", "-n", help="最多显示几条")] = 20,
 ) -> None:
     """列出已录入的岗位。"""
-    engine, factory = _require_db()
+    engine, factory = require_db()
     try:
         with factory() as session:
             rows = job_svc.list_jobs(session, status=status, platform=platform, limit=limit)
@@ -257,7 +242,7 @@ def job_show(
     jd: Annotated[bool, typer.Option("--jd", help="打印完整 JD 正文")] = False,
 ) -> None:
     """看一条岗位的完整字段（`--jd` 才打印正文）。"""
-    engine, factory = _require_db()
+    engine, factory = require_db()
     try:
         with factory() as session:
             job = job_svc.get_job(session, job_id)
@@ -310,7 +295,7 @@ def job_skip(
     reason: Annotated[str | None, typer.Option("--reason", help="为什么跳过（只记日志）")] = None,
 ) -> None:
     """标为"不投"（人工决策；后续抓到这个岗位也不会把它改回 new）。"""
-    engine, factory = _require_db()
+    engine, factory = require_db()
     try:
         with factory() as session:
             job = job_svc.mark_skipped(session, job_id, reason=reason)

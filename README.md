@@ -100,6 +100,11 @@ copy .env.example .env      # Windows（macOS/Linux: cp .env.example .env）
 # 编辑 .env，填入 DEEPSEEK_API_KEY
 ```
 
+> ★ **不填也能用**：规则层打分（`jh match run --no-llm`）和 `jh gap` 完全不需要密钥，
+> 它们是纯本地的。只有 LLM 精评需要 —— 没配时命令会**明确提示并降级**，
+> 而不是抛一个看不懂的连接错误。
+> 环境变量名写 `DEEPSEEK_API_KEY` 或 `JH_DEEPSEEK_API_KEY` 都可以。
+
 `config.yaml` 是**个人求职偏好**（关键词 / 城市 / 分数线 / 权重 / 禁用词…），可以直接提交；
 `.env` 只放密钥，**永不提交**。
 
@@ -138,8 +143,34 @@ jh job skip 1                   # 标为"不投"（后续再抓到也不会改�
 JH_DEFAULT_RESUME_PATH=D:/path/to/你的简历.docx
 ```
 
-> 当前进度：**P0（骨架+工程底座）/ P1（简历解析）/ P2（岗位录入）已完成**，
-> 其余命令仍是**占位**，执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
+```bash
+# ④ 两级匹配打分（P3）
+jh match run                    # 规则层全量打分 → 只对规则分 Top N 走 LLM 精评
+jh match run --no-llm           # 只跑规则层：0 成本、秒出
+jh match explain 1              # ★ 看某个岗位的分维度得分明细（调权重靠它）
+jh match set 1 --verdict skip   # 人工裁决：我的话比模型大
+jh match set 1 --resume 2       # 指定这个岗位用哪份简历
+
+# ⑤ 反向技能缺口（P3）—— 告诉我"该补什么"，而不是"这个岗位缺什么"
+jh gap                          # 跨所有岗位聚合：某技能出现在 78% 的 JD 里而我没有
+jh gap -n 10 --min-ratio 0.3    # 只看出现率 ≥30% 的前 10 项
+```
+
+打分口径（权重都在 `config.yaml` 的 `match_weights` 里，可调）：
+
+| 维度 | 默认权重 | 怎么算 |
+|---|---|---|
+| 岗位方向 | 30% | JD 方向 vs 简历方向；方向不同但核心技能对得上 → 可跨投 |
+| 硬条件 | 30% | 经验年限 / 学历 / 城市 / 实习与否，四项等权 |
+| 技能交集 | 40% | JD 抽到的技能里简历命中了多少（覆盖率） |
+
+> ★ 硬条件不满足是**大幅降分，不是直接淘汰** —— 应届生投"3 年以下"的岗位很常见，
+> 直接淘汰等于静默丢掉机会。
+> ★ 判不出来的维度（比如 JD 太短、一个技能词都没抽到）会把权重**让给**其余维度，
+> 而不是给 0 分；`jh match explain` 里会写明 `redistributed`。
+
+> 当前进度：**P0 / P1 / P2 / P3 已完成**，其余命令仍是**占位**，
+> 执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
 
 ### 合规边界（本工具的"只做什么"）
 
@@ -158,7 +189,7 @@ JH_DEFAULT_RESUME_PATH=D:/path/to/你的简历.docx
 | **P0** | 骨架 + 工程底座（uv 锁 / Alembic / WAL+外键 / UTC / 强制 UTF-8 / 日志脱敏 / CI 双平台） | ✅ |
 | **P1** | 简历导入解析 + `jh resume split`（帮我拆方向） | ✅ |
 | **P2** | ⭐ `jh job add <url｜--file｜--manual>` 主路径 + 三层去重 | ✅ |
-| P3 | ⭐ 共享层 + 两级匹配 + `jh match explain` + `jh gap` 反向缺口分析 | ⬜ 下一步 |
+| **P3** | ⭐ 共享层 + 两级匹配 + `jh match explain` + `jh gap` 反向缺口分析 | ✅ |
 | P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | ⬜ |
 | **P4.5** | ⭐ 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | ⬜ |
 | P5 | AI 定制简历（先 `tailor brief`，再完整版 + **FidelityGuard**） | ⬜ |
@@ -189,10 +220,14 @@ JH_DEFAULT_RESUME_PATH=D:/path/to/你的简历.docx
 ```
 src/jobhunter/
 ├── cli/          Typer 命令层（只解析参数 + 渲染，不含业务逻辑）
-├── services/     业务层（resume_svc / job_svc 已实现；match / gap / greeting … 待做）
+├── services/     业务层：resume_svc（简历解析/拆分）
+│                 job_svc（岗位入库 + 三层去重）
+│                 match_svc（★ 共享中间层：JD↔简历规则层打分 + gap 聚合）
+│                 match_llm_svc（LLM 精评：并发 + 缓存 + 重试降级）
 ├── adapters/     外部世界：manual.py（人给 URL 抓详情，主路径）
 │                 + parse_html.py / parse_text.py（抓取与解析分开，见下）
-├── llm/          Provider 抽象 + mock（测试用）+ llm_cache；DeepSeek 实现待 P3
+├── llm/          base（Provider 契约）/ deepseek（DeepSeek 实现）/ mock（测试用）
+│                 cache（cache_key + llm_cache 读写）/ factory（按配置挑 Provider）
 ├── storage/      engine / session / PRAGMA / Alembic 调用
 ├── models/       11 张表的 ORM 定义
 ├── config/       pydantic-settings 配置（config.yaml + .env）+ direction_profiles.yaml
