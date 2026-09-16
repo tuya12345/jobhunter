@@ -355,11 +355,6 @@ def _covered_ratio(candidate: str, haystack: str, *, min_run: int = 10) -> float
     return covered / length
 
 
-def _chunks(text: str, size: int) -> list[str]:
-    """把长文本切成固定长度的碎片（保留给需要"粗粒度切片"的场合使用）。"""
-    return [text[index : index + size] for index in range(0, len(text), size)]
-
-
 def _paragraph_text(paragraph: object) -> str:
     """把一段 `w:p` 的元素还原成文本（**正确处理被拆碎的 run**）。
 

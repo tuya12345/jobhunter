@@ -312,39 +312,6 @@ def _longest_rendered_text(page: Any, *, min_length: int = 80) -> str | None:
     return text if len(text) >= min_length else None
 
 
-#: 页面**导航菜单**里的常见词。整行只由这些词组成时，判定为菜单项而不是内容。
-#:
-#: ★ 为什么要显式列出来：浏览器取到的"最长文本块"是整个内容区，
-#:   开头就是一条导航（实测美团：`首页 / LongCat人才招聘 / 北斗计划 / 社会招聘 /
-#:   校园招聘 / 美团赛事 / 了解美团 / Global Careers 登录`）。
-#:   留在 JD 正文里既污染 P3 的关键词抽取，又让人看着不专业。
-_NAV_LINE_WORDS: tuple[str, ...] = (
-    "首页",
-    "登录",
-    "注册",
-    "社会招聘",
-    "校园招聘",
-    "全球招聘",
-    "人才招聘",
-    "了解美团",
-    "关于我们",
-    "招聘动态",
-    "成长与回报",
-    "产品与技术",
-    "技术人才项目",
-    "我的简历",
-    "投递记录",
-    "消息中心",
-    "搜索职位",
-    "分享",
-    "收藏",
-    "立即申请",
-    "申请职位",
-    "返回首页",
-    "查看更多",
-)
-
-
 def _fill_fields_from_rendered(detail: JobDetail, rendered: str, platform: str) -> None:
     """从清理后的渲染文本里补结构化字段（**只填空、不覆盖已确认的值**）。
 
@@ -409,14 +376,6 @@ def _is_probably_role_only(text: str) -> bool:
     """判断一段文字是不是"岗位级别"而不是公司名（如 `社招-正式`、`日常实习`）。"""
     markers = ("社招", "校招", "实习", "正式", "兼职", "全职", "急招", "校招-正式")
     return any(marker in text for marker in markers)
-
-
-def _is_nav_line(line: str) -> bool:
-    """判断一行是不是导航菜单项（短行且含菜单词）。"""
-    stripped = line.strip()
-    if not stripped or len(stripped) > 24:
-        return False
-    return any(word in stripped for word in _NAV_LINE_WORDS)
 
 
 def _clean_rendered_text(raw: str) -> str:

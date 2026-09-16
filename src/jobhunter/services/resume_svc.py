@@ -71,7 +71,6 @@ __all__ = [
     "ResumeContent",
     "ResumeParseError",
     "ResumeSummary",
-    "SkillHit",
     "SplitSuggestion",
     "add_resume",
     "analyze_split",
@@ -122,24 +121,6 @@ class InternshipItem(BaseModel):
     period: str = ""
     bullets: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
-
-
-class SkillHit(BaseModel):
-    """技能命中记录：技能名 + 在哪些地方出现过。
-
-    ★ `sources` 为什么重要：
-        "我在「专业技能」里写了 Vue" 和 "只在某个项目描述里提过一次 Vue"，
-        对方向的权重完全不同 —— 前者是主动声称，后者可能只是顺带用到。
-        split 的打分要能区分这两者。
-    """
-
-    name: str
-    #: explicit（专业技能栏主动列出）/ mentioned（项目或实习描述里提到）
-    sources: list[str] = Field(default_factory=list)
-
-    @property
-    def is_explicit(self) -> bool:
-        return "explicit" in self.sources
 
 
 class ResumeContent(BaseModel):
@@ -330,10 +311,6 @@ _BUILTIN_SKILLS: tuple[str, ...] = (
     "项目管理",
     "敏捷开发",
 )
-
-#: 技能匹配用的"边界"字符集：中英文标点、空白、括号等。
-#: 用于判断一个中文技能词出现的位置是不是一个"词"（中文没有 \b）。
-_BOUNDARY_CHARS = " \t\n\r、,，;；:：/|·。.()（）[]【】<>《》\"'“”‘’+-—~!！?？*#"
 
 
 def load_skill_vocabulary(settings: AppSettings | None = None) -> dict[str, list[str]]:
@@ -545,11 +522,6 @@ def _cell_texts(line: str) -> list[str]:
     if _CELL_SEP not in line:
         return [line]
     return [cell.strip() for cell in line.split(_CELL_SEP) if cell.strip()]
-
-
-def _first_cell(line: str) -> str:
-    """取表格行的第一个单元格；不是表格行就返回整行。"""
-    return _cell_texts(line)[0] if _CELL_SEP in line else line
 
 
 def _date_spans(text: str) -> list[tuple[int, int, str]]:

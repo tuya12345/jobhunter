@@ -324,38 +324,6 @@ def _jsonld_salary_text(job: dict[str, Any]) -> str:
     return f"{low}{unit}"
 
 
-def _selector_matches(html: str, selector: str) -> list[str]:
-    """极简 CSS 选择器匹配（只支持项目里实际用到的三种写法）。
-
-    支持：
-        `.class`            按 class 精确包含
-        `h1` / `div`        按标签名
-        `[class*=xxx]`      按 class 子串
-
-    ★ 为什么不用 BeautifulSoup / lxml.cssselect：
-      这里是"尽力而为"的字段抽取，命中不了就走通用兜底策略。
-      为它引入一个完整的 CSS 选择器引擎不划算（而且 lxml 已经作为 python-docx
-      的依赖存在，但没有 cssselect 扩展）。真需要复杂选择器时，
-      Playwright 侧本来就跑着完整浏览器，可以在那边做。
-    """
-    results: list[str] = []
-    if selector.startswith("[class*="):
-        needle = selector[len("[class*=") :].rstrip("]").strip("\"'")
-        for match in _ATTR_VALUE_RE.finditer(html):
-            if needle.lower() in match.group("value").lower():
-                results.append(match.group("value"))
-        return results
-    if selector.startswith("."):
-        needle = selector[1:].lower()
-        for match in _ATTR_VALUE_RE.finditer(html):
-            classes = [part.lower() for part in match.group("value").split()]
-            if needle in classes:
-                results.append(match.group("value"))
-        return results
-    # 标签名
-    return [selector] if re.search(rf"(?i)<{re.escape(selector)}\b", html) else []
-
-
 def _text_of_elements_with_class(html: str, class_token: str) -> list[str]:
     """取出"class 含该 token"的所有元素的内层文本（含嵌套标签）。
 
@@ -774,7 +742,3 @@ def _first_meaningful_line(text: str) -> str | None:
             return cleaned
         return None
     return None
-
-
-def _as_str(value: Any) -> str:
-    return value if isinstance(value, str) else ""
