@@ -372,3 +372,45 @@ def test_learning_whitelist_is_surfaced(content, settings) -> None:
         resume_with_learning, current_direction="AI Agent", wanted=["AI Agent"], settings=settings
     )
     assert suggestions[0].learning_skills == ["LangChain"]
+
+
+# ===========================================================================
+# ⑤ 脱敏助手（"人工的第二道保险"）
+#
+# ★ 为什么给一个"没有生产调用点"的函数写测试：
+#   它唯一的用途就是**在排障时保护隐私**。这类函数最危险的失败方式不是抛异常，
+#   而是"看起来打了码、其实漏了" —— 比如漏掉带 +86 前缀的号码、或者把邮箱的
+#   本地部分留下半个。所以用一组固定的假数据把行为钉死，将来谁改了正则，
+#   测试会立刻告诉他"你把脱敏改弱了"。
+#
+#   注意：这里用的是**虚构数据**（13800000000 / example.com），
+#   测试文件里出现任何真实手机号或邮箱都算事故。
+# ===========================================================================
+@pytest.mark.parametrize(
+    ("raw", "must_not_contain"),
+    [
+        ("联系电话：13800000000", "13800000000"),
+        ("手机 13800000000 备用", "13800000000"),
+        ("邮箱 linxiaoman@example.com", "linxiaoman"),
+        ("a@b.co", None),  # 单字符本地部分没什么可脱的，只要求不报错
+    ],
+)
+def test_strip_volatile_content_masks_phone_and_email(
+    raw: str, must_not_contain: str | None
+) -> None:
+    masked = resume_svc.strip_volatile_content(raw)
+    if must_not_contain is not None:
+        assert must_not_contain not in masked
+    # 打码不能把整段文本吃掉：非敏感内容必须原样保留（否则排障时看不出上下文）
+    assert len(masked) >= len(raw) - 4
+
+
+def test_strip_volatile_content_keeps_surrounding_text() -> None:
+    """脱敏只动敏感片段，前后文与行结构都不能变。"""
+    masked = resume_svc.strip_volatile_content(
+        "姓名：林小满\n电话：13800000000\n邮箱：linxiaoman@example.com"
+    )
+    assert masked.startswith("姓名：林小满")
+    assert masked.count("\n") == 2
+    assert "example.com" in masked  # 域名保留，否则看不出"这是个邮箱"
+    assert "13800000000" not in masked

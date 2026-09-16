@@ -16,7 +16,6 @@ from typing import NoReturn
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 
 from jobhunter import CURRENT_PHASE
 
@@ -25,7 +24,6 @@ __all__ = [
     "err_console",
     "not_implemented",
     "print_kv",
-    "print_table",
     "success",
     "warn",
 ]
@@ -96,33 +94,16 @@ def print_kv(pairs: dict[str, object], *, title: str | None = None) -> None:
         console.print(f"  [dim]{key}[/dim]：{value}")
 
 
-def print_table(
-    rows: list[dict[str, object]],
-    *,
-    columns: list[str] | None = None,
-    title: str | None = None,
-    ctx: typer.Context | None = None,
-    json_out: bool = False,
-) -> None:
-    """打印表格（或 `--json` 时打印 JSON）。
-
-    P0 还没有真正的列表输出，但接口先定下来：
-    P4 的 `jh today`、P6 的 `jh stats`、P7 的 `jh leads export` 都用它，
-    避免每个命令各写一套 rich 表格代码。
-
-    `--json` 的意义：方便你把清单喂给别的脚本（比如导出到自己的表格里），
-    也让将来 P8 的 Web 接口可以直接复用同一份数据结构。
-    """
-    if json_out:
-        console.print_json(data=rows)
-        return
-    if not rows:
-        console.print("[dim]（没有数据）[/dim]")
-        return
-    header = columns or list(rows[0].keys())
-    table = Table(title=title, show_header=True, header_style="bold cyan")
-    for name in header:
-        table.add_column(name)
-    for row in rows:
-        table.add_row(*[str(row.get(name, "")) for name in header])
-    console.print(table)
+# ───────────────────────────────────────────────────────────────────────────
+# 关于"表格输出"：这里**故意没有**一个通用的 print_table 包装
+#
+# P0 时我预判过"P4 的 jh today / P6 的 jh stats 都需要打印表格"，
+# 于是写了一个 `print_table(rows: list[dict])` 泛化包装。到 P2 为止它一次都没被用过 ——
+# 真正实现表格的地方（`jh job list`、`jh resume list`）都**直接用 rich.Table**，
+# 因为它们的列结构差异很大：有的要 `justify="right"`、有的要 `overflow="fold"`、
+# 有的列宽要固定。硬套一个泛化包装反而要在调用处写更多补偿代码。
+#
+# 结论（写给未来的自己）：**别为了"将来会用到"提前造抽象**。
+# 等到真有两个以上调用点、且它们的形状确实一致时再抽 —— 那时你才知道该抽什么。
+# 现在这个包装已删除，避免它成为"看起来能用、用起来别扭"的诱饵。
+# ───────────────────────────────────────────────────────────────────────────
