@@ -6,11 +6,12 @@
    所以占位命令一律：
         · 明确打印"该功能在 PX 阶段实现"；
         · 以**非 0 退出码**结束（2 = 用法/未实现，区别于业务失败）；
-        · 指出当前已实现的是什么（`jh init`），给出下一步动作。
+        · 指出当前已实现的是什么（`jh init` / `jh resume` / `jh job`），给出下一步动作。
 """
 
 from __future__ import annotations
 
+import textwrap
 from typing import NoReturn
 
 import typer
@@ -58,15 +59,23 @@ def not_implemented(feature: str, phase: str) -> NoReturn:
 
     为什么用富文本而不是纯 print：
         终端里 [P4] 之类的东西用颜色区分，扫一眼就知道"这不是报错，是还没做"。
+
+    ★ 为什么要自己折行（`_wrap_feature`）：
+        占位命令会把**它收到的参数原样回显**在 feature 里（`jh today（limit=None,
+        min_score=None, …）`），这是有意的 —— 用户能立刻确认"参数被认出来了，
+        只是功能还没做"。但这串东西很长，rich 的 Panel 在默认宽度下会把它**裁掉**
+        （实测末尾变成 `expor`），看起来像工具坏了。所以在这里按面板宽度手工折行。
     """
     err_console.print()
     err_console.print(
         Panel(
             f"[yellow]该功能尚未实现[/yellow]\n\n"
-            f"  功能：[bold]{feature}[/bold]\n"
+            f"{_wrap_feature(feature)}"
             f"  计划阶段：[bold cyan]{phase}[/bold cyan]\n"
-            f"  当前阶段：[bold]{CURRENT_PHASE}[/bold]（骨架 + 工程底座）\n\n"
+            f"  当前阶段：[bold]{CURRENT_PHASE}[/bold]\n\n"
             f"现在就可用：[green]jh init[/green]（建库 + 迁移）\n"
+            f"　　　　　　　[green]jh resume add | list | split[/green]（简历导入解析）\n"
+            f"　　　　　　　[green]jh job add | list | show | skip[/green]（岗位录入）\n"
             f"查看全部命令：[green]jh --help[/green]\n"
             f"实现计划：[green]docs/roadmap.md[/green]",
             title="🚧 未实现",
@@ -74,6 +83,19 @@ def not_implemented(feature: str, phase: str) -> NoReturn:
         )
     )
     raise typer.Exit(code=EXIT_NOT_IMPLEMENTED)
+
+
+def _wrap_feature(feature: str) -> str:
+    """把"功能 + 回显参数"折成多行（首行带 `功能：`，续行缩进对齐）。"""
+    # 宽度取 64：面板两边各有边框与内边距，默认 80 列终端下正文大致就这么多。
+    # 用 textwrap 而不是手写切片，是为了在空格处断行（参数之间用 ", " 分隔）。
+    lines = textwrap.wrap(feature, width=64, break_long_words=True) or [feature]
+    body = []
+    for index, line in enumerate(lines):
+        # 续行用"2 空格 + 4 个全角空格"对齐到 `功能：` 之后
+        prefix = "  功能：" if index == 0 else "  　　　　"
+        body.append(f"{prefix}[bold]{line}[/bold]\n")
+    return "".join(body)
 
 
 def success(message: str) -> None:
