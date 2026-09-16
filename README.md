@@ -108,7 +108,7 @@ copy .env.example .env      # Windows（macOS/Linux: cp .env.example .env）
 ## 快速开始
 
 ```bash
-jh init                     # 建库 + 跑迁移到最新（幂等，可重复执行）
+jh init                     # ① 建库 + 跑迁移到最新（幂等，可重复执行）
 jh --help                   # 看全部命令
 ```
 
@@ -116,8 +116,38 @@ jh --help                   # 看全部命令
 （11 张表）→ 打开连接并确认 PRAGMA（`journal_mode=WAL`、`busy_timeout=5000`、
 `foreign_keys=ON`）→ 打印小结。
 
-> 当前进度：**P0（骨架 + 工程底座）**。除 `jh init` 外的命令都是**占位**，
-> 执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
+```bash
+# ② 导入简历（解析成结构化数据；同一份内容重复导入不会新建记录）
+jh resume add 我的简历.docx
+jh resume list
+jh resume split            # ★ 帮我拆方向：哪些项目该前置、哪些该弱化、还缺什么技能
+                           #   --save 会把建议落成 Markdown
+
+# ③ 录入岗位（★ 主路径：人给链接 → 工具抓详情）
+jh job add https://example.com/job/123
+jh job add --file jobs.txt      # 批量（一行一个 URL，# 开头是注释）
+jh job add --manual             # 手动粘贴 JD（网络不通也能用，Ctrl+Z/Ctrl+D 结束）
+jh job list
+jh job show 1 --jd              # 看完整字段与 JD 正文
+jh job skip 1                   # 标为"不投"（后续再抓到也不会改回）
+```
+
+**配置默认简历**（可选但强烈建议）：在 `.env` 里写一行就不用每次输路径 ——
+
+```
+JH_DEFAULT_RESUME_PATH=D:/path/to/你的简历.docx
+```
+
+> 当前进度：**P0（骨架+工程底座）/ P1（简历解析）/ P2（岗位录入）已完成**，
+> 其余命令仍是**占位**，执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
+
+### 合规边界（本工具的"只做什么"）
+
+- `jh job add <url>` **只读取**页面内容：不点投递、不点赞、不私信，不做任何写操作；
+  不绕过验证码/风控/签名；请求之间有随机延时；失败即跳过，不重试轰炸。
+- 自动搜索翻页**不在主线**（BOSS 有 `__zp_stoken__` 签名 + 字体反爬）。
+  「刷到岗位 → 存下来打分」才是被支持的用法。
+- 导出一律**写新文件**；`jh resume split` 只给建议，**不改动你的简历文件**。
 
 ---
 
@@ -125,10 +155,10 @@ jh --help                   # 看全部命令
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| **P0** | 骨架 + 工程底座（uv 锁 / Alembic / WAL+外键 / UTC / 强制 UTF-8 / 日志脱敏 / CI 双平台） | ✅ 本阶段 |
-| P1 | 简历导入解析 + `jh resume split`（帮我拆方向） | ⬜ |
-| P2 | ⭐ `jh job add <url｜--file｜--manual>` 主路径 + 两级去重 | ⬜ |
-| P3 | ⭐ 共享层 + 两级匹配 + `jh match explain` + `jh gap` 反向缺口分析 | ⬜ |
+| **P0** | 骨架 + 工程底座（uv 锁 / Alembic / WAL+外键 / UTC / 强制 UTF-8 / 日志脱敏 / CI 双平台） | ✅ |
+| **P1** | 简历导入解析 + `jh resume split`（帮我拆方向） | ✅ |
+| **P2** | ⭐ `jh job add <url｜--file｜--manual>` 主路径 + 三层去重 | ✅ |
+| P3 | ⭐ 共享层 + 两级匹配 + `jh match explain` + `jh gap` 反向缺口分析 | ⬜ 下一步 |
 | P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | ⬜ |
 | **P4.5** | ⭐ 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | ⬜ |
 | P5 | AI 定制简历（先 `tailor brief`，再完整版 + **FidelityGuard**） | ⬜ |
@@ -159,18 +189,24 @@ jh --help                   # 看全部命令
 ```
 src/jobhunter/
 ├── cli/          Typer 命令层（只解析参数 + 渲染，不含业务逻辑）
-├── services/     业务层（resume / job / match / gap / greeting / track / fidelity …）
-├── adapters/     外部世界：manual.py（人给 URL 抓详情，主路径）/ boss.py（可选）
-├── llm/          Provider 抽象 + DeepSeek 实现 + llm_cache
+├── services/     业务层（resume_svc / job_svc 已实现；match / gap / greeting … 待做）
+├── adapters/     外部世界：manual.py（人给 URL 抓详情，主路径）
+│                 + parse_html.py / parse_text.py（抓取与解析分开，见下）
+├── llm/          Provider 抽象 + mock（测试用）+ llm_cache；DeepSeek 实现待 P3
 ├── storage/      engine / session / PRAGMA / Alembic 调用
 ├── models/       11 张表的 ORM 定义
-├── config/       pydantic-settings 配置（config.yaml + .env）
-└── utils/        io（强制 UTF-8）/ time（UTC）/ logging（脱敏）/ text / html
+├── config/       pydantic-settings 配置（config.yaml + .env）+ direction_profiles.yaml
+└── utils/        io（强制 UTF-8）/ time（UTC）/ logging（脱敏）/ docx（Word 读取）
 ```
+
+**一条值得说明的分层取舍**：抓取（`adapters/manual.py`，需要浏览器与网络）
+与解析（`adapters/parse_html.py` / `parse_text.py`，纯函数）是**分开**的。
+这样测试只需 mock HTML 就能精确断言解析行为，不需要访问真实招聘站点 ——
+把"会随机失败的部分"关在一个很薄的层里（详细理由见 `docs/architecture.md`）。
 
 详细分层职责、每一项技术决定的取舍，见 [`docs/architecture.md`](docs/architecture.md)；
 11 张表的设计与索引理由见 [`docs/data_model.md`](docs/data_model.md)；
-P0 实现计划见 [`docs/roadmap.md`](docs/roadmap.md)。
+各阶段实现计划与实测记录（含踩坑清单）见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ---
 
