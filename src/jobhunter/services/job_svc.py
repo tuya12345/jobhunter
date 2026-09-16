@@ -46,7 +46,6 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -449,23 +448,17 @@ def mark_skipped(session: Session, job_id: int, *, reason: str | None = None) ->
     return job
 
 
-def detail_to_summary(detail: JobDetail) -> dict[str, Any]:
-    """把 `JobDetail` 转成便于打印/落库的摘要（**不含 JD 正文**）。
-
-    用途：批量导入时逐个报告"抓到了什么"，以及 `--dry-run` 的输出。
-    ★ 不含正文是有意的：终端里刷一整页 JD 会淹掉真正要看的信息。
-    """
-    return {
-        "platform": detail.platform,
-        "platform_job_id": detail.platform_job_id,
-        "company": detail.company,
-        "title": detail.title,
-        "city": detail.city,
-        "salary": detail.salary_text,
-        "experience": detail.experience,
-        "education": detail.education,
-        "is_intern": detail.is_intern,
-        "jd_chars": len(detail.jd_text or ""),
-        "fetch_status": detail.fetch_status,
-        "missing_fields": detail.missing_fields(),
-    }
+# ───────────────────────────────────────────────────────────────────────────
+# 关于"把 JobDetail 转成摘要 dict"：这里**故意没有**这样一个函数
+#
+# P2 一开始写过一个 `detail_to_summary(detail) -> dict`，设想给"批量导入逐个报告"
+# 和 `--dry-run` 共用。实际实现时两处都没用它：真正要打印的地方是
+# `cli/commands/job_cmd.py::_print_details()`，它直接用 rich.Table 排 8 列
+# （公司/职位/城市/薪资/实习/JD 字数/抓取状态），比"先转成 dict 再猜列顺序"直接得多。
+#
+# 于是它就成了第二个定义"岗位摘要长什么样"的地方 —— 与 CLI 里的表格**必然漂移**：
+# 改了表头却忘了改 dict（或反过来），没人会发现。已删除。
+#
+# 结论同上一条：**别为了"将来两处共用"提前造中间层**，
+# 等两个调用点真的都出现了、且形状确实一致时再抽。
+# ───────────────────────────────────────────────────────────────────────────
