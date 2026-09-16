@@ -72,7 +72,6 @@ from jobhunter.adapters.parse_text import (
 )
 from jobhunter.config.settings import AppSettings, get_settings
 from jobhunter.models import Job, Resume
-from jobhunter.models.constants import JOB_STATUSES
 from jobhunter.services import resume_svc
 from jobhunter.services.resume_svc import DirectionProfile, ResumeContent
 from jobhunter.utils.io import from_json, to_json
@@ -92,7 +91,6 @@ __all__ = [
     "detect_direction",
     "explain_lines",
     "extract_jd_keywords",
-    "is_valid_job_status",
     "load_resume_candidates",
     "match_best_candidate",
     "match_jd_resume",
@@ -1340,11 +1338,6 @@ def _pick_resume_row(
     if row is not None:
         return row
     return session.scalars(select(Resume).order_by(Resume.id)).first()
-
-
-def is_valid_job_status(status: str) -> bool:
-    """`jh match set --verdict` 的取值校验（避免把状态写成拼错的值）。"""
-    return status in JOB_STATUSES
 
 
 def decode_keywords(raw: str | None) -> list[str]:

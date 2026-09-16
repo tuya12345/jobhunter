@@ -37,6 +37,6 @@ __version__ = "0.1.0"
 # ★ 每完成一个阶段都要记得改这里 —— 它是**用户唯一能一眼看到的阶段标记**
 #   （`jh --version` 与每个占位命令的面板都会打印它）。
 #   停更在这里 = 对用户说假话："明明能导简历了，工具还说自己在 P0"。
-CURRENT_PHASE = "P2"
+CURRENT_PHASE = "P3"
 
 __all__ = ["CURRENT_PHASE", "__version__"]

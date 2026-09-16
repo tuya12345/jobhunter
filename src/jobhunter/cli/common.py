@@ -80,6 +80,8 @@ def not_implemented(feature: str, phase: str) -> NoReturn:
             f"现在就可用：[green]jh init[/green]（建库 + 迁移）\n"
             f"　　　　　　　[green]jh resume add | list | split[/green]（简历导入解析）\n"
             f"　　　　　　　[green]jh job add | list | show | skip[/green]（岗位录入）\n"
+            f"　　　　　　　[green]jh match run | explain | set[/green]"
+            f"　[green]jh gap[/green]（两级匹配 + 技能缺口）\n"
             f"查看全部命令：[green]jh --help[/green]\n"
             f"实现计划：[green]docs/roadmap.md[/green]",
             title="🚧 未实现",
