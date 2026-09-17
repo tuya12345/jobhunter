@@ -373,8 +373,10 @@ def _alias_pattern(alias: str) -> re.Pattern[str] | None:
     所以按写法分两类处理：
 
         · **纯 ASCII 写法**（Java / Go / Vue / Node.js）
-          → 用 `\\b` 词边界；但 `C++` 这种以符号结尾的写法没有可靠的 `\\b`，
-            改用自定义边界字符集。
+          → **两侧都不用 `\\b`**，改用"只排除 ASCII 字母数字下划线"的环视
+            （见下面那段注释：`\\b` 是 Unicode 语义，汉字属 `\\w`，
+            于是 `\\bJava` 匹配不到"熟悉Java开发"）；
+            以符号结尾的写法（`C++`）不需要右边界。
 
         · **含中文的写法**（大模型 / 响应式布局）
           → `\\b` 完全不可用（见 `_has_cjk` 的说明）；边界只排除 ASCII 字母数字，
@@ -401,14 +403,21 @@ def _alias_pattern(alias: str) -> re.Pattern[str] | None:
 
     # ASCII 写法：按两侧字符类型分别决定边界策略
     #
-    # ★ 关键取舍：
-    #   · 左侧仍是 `\b`（不能在字母/数字中间起头）；
-    #   · **右侧不能只用 `\b`** —— 那样 `Vue` 匹配不上 `Vue3`、`TypeScript` 匹配不上
-    #     `TypeScript5`（实测踩过：技能栏写"Vue3 + TypeScript"，Vue 一个都没抽出来）。
-    #     正确的右边界是"后面不是**字母或下划线**"：数字允许（版本号很常见），
-    #     字母不允许（这才是 `Java` 不能命中 `JavaScript` 的关键）。
-    #   · 以符号结尾的写法（`C++`、`C#`）不需要右边界 —— `C++11` 也该算命中。
-    left = r"\b" if (alias[0].isalnum() or alias[0] == "_") else ""
+    # ★★ 两侧**都不能用 `\b`** —— 这是同一个坑的两半，曾经只修了右半边
+    #    （P3 验证会话用「熟悉Java开发」抓出来的，见 docs/ISSUES.md #1）
+    #
+    #   Python 正则的 `\b` 是 **Unicode 语义**的：`\w` 包含汉字，
+    #   所以"悉"与"J"之间**没有**词边界 → `\bJava` 匹配不到"熟悉Java开发"，
+    #   而中文 JD 里"熟悉Java开发"恰恰是最自然的写法（带空格的"熟悉 Java 开发"反而少见）。
+    #   后果不止技能维度：方向判定与 `jh gap` 都吃这同一份抽词结果。
+    #
+    #   正确做法（两侧对称）：边界只排除 **ASCII 字母数字下划线** ——
+    #     · 左侧 `(?<![A-Za-z0-9_])`：汉字/标点后面算合法起点，"XJava" 仍被拒；
+    #     · 右侧 `(?![A-Za-z_])`：**不含数字** —— `Vue` 必须命中 `Vue3`、
+    #       `TypeScript` 必须命中 `TypeScript5`（版本号很常见）；
+    #       字母必须排除，这才是 `Java` 不命中 `JavaScript` 的关键。
+    #     · 以符号结尾的写法（`C++`、`C#`）不需要右边界 —— `C++11` 也该算命中。
+    left = r"(?<![A-Za-z0-9_])" if (alias[0].isalnum() or alias[0] == "_") else ""
     is_word_tail = alias[-1].isalnum() or alias[-1] == "_"
     right = r"(?![A-Za-z_])" if is_word_tail else ""
 

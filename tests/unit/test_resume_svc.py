@@ -63,6 +63,38 @@ def test_go_does_not_match_google(settings) -> None:
     assert resume_svc._match_any("熟悉 Go 语言与并发", vocabulary["Go"])
 
 
+@pytest.mark.parametrize(
+    ("text", "canonical"),
+    [
+        ("熟悉Java开发", "Java"),
+        ("用Go写后端服务", "Go"),
+        ("熟练Python编程", "Python"),
+        ("使用Docker部署服务", "Docker"),
+        ("掌握Vue3组件开发", "Vue"),
+    ],
+)
+def test_ascii_skill_adjacent_to_chinese_is_matched(settings, text, canonical) -> None:
+    """★ 英文技能**紧贴汉字**时必须命中（最自然的写法）。
+
+    同一个 `\\b` 坑的另一半：Python 的 `\\b` 是 Unicode 语义，汉字属于 `\\w`，
+    所以"悉"与"J"之间没有词边界 → `\\bJava` 匹配不到 `熟悉Java开发`。
+    右边界早先已用 `(?![A-Za-z_])` 修掉、左边界漏改，导致中文 JD 里
+    "熟悉Java开发"这种写法**整词漏抽**（影响 技能匹配 / 方向判定 / jh gap）。
+    """
+    vocabulary = resume_svc.load_skill_vocabulary(settings)
+    assert resume_svc._match_any(text, vocabulary[canonical]), f"{text!r} 没命中 {canonical}"
+
+
+def test_adjacency_does_not_break_word_boundary(settings) -> None:
+    """放宽左边界之后，跨词误命中仍然要被拒（不能为了召回把精确性丢掉）。"""
+    vocabulary = resume_svc.load_skill_vocabulary(settings)
+    assert not resume_svc._match_any("熟悉JavaScript开发", vocabulary["Java"])
+    assert not resume_svc._match_any("用过Google分析", vocabulary["Go"])
+    assert not resume_svc._match_any("XJava开发", vocabulary["Java"])  # 前面还有 ASCII 字母
+    # 右边界只排除字母：中文跟在后面算命中（"研究Go语言两年"），数字版本号也算
+    assert resume_svc._match_any("研究Go语言两年", vocabulary["Go"])
+
+
 def test_cjk_alias_matches_with_chinese_context(settings) -> None:
     """★ 中文别名要在中文语境里命中。
 

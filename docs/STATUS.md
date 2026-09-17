@@ -8,9 +8,23 @@
 
 ## P3 —— 共享中间层 + 两级匹配 + `jh gap`
 
-**状态**：✅ 开发完成，**等待验证**
-**提交**：`084cf88`（主体）、`4b3a934`（阶段标记与清理）
-**测试**：`pytest` 327 passed｜`ruff check` / `format --check` 干净｜`uv lock --check` 通过
+**状态**：✅ 开发完成 → 🔧 **一轮验证修复完成（3 个 🔴 已关闭）**，**等待复验**
+**提交**：`084cf88`（主体）、`4b3a934`（阶段标记与清理）、本轮修复见 `git log`
+**测试**：`pytest` **439 passed, 15 xfailed, 1 xpassed, 0 failed**｜ruff check / format 干净
+
+### 0. 本轮验证修复（对应 `docs/REVIEW-P3.md` / `docs/ISSUES.md`）
+
+| ISSUE | 等级 | 修了什么 | 关键文件 |
+|---|---|---|---|
+| #1 | 🔴 | 技能匹配**左边界**从 `\b` 改为 `(?<![A-Za-z0-9_])`（`\b` 是 Unicode 语义，汉字属 `\w` → 中文紧邻英文技能整词漏抽） | `services/resume_svc.py::_alias_pattern` |
+| #2 | 🔴 | JD/简历文本里的 `<jd>`/`</jd>` 等分隔标签**失效化**（尖括号换全角）；表头五字段**移进** `<jd>` 标签内 | `services/match_llm_svc.py::_neutralize_delimiters` / `build_payload` |
+| #3 | 🔴 | LLM 每完成一条**真的 commit**（原先只 flush → 中断即丢掉花过钱的结果） | `services/match_llm_svc.py::_apply` |
+
+🟡 #8（表头字段在标签外）已随 #2 **顺手修掉**，其验证用例由 XFAIL 变为 XPASS；
+`rule_hint` 仍在标签外（我们自己生成的内容，不含用户输入），是否收进标签内待确认。
+其余 🟡/🟢 **按指示未改动**。
+
+> 详细处理记录（改法、理由、守住它的测试、对既有数据的影响）见 `docs/ISSUES.md` 的"已关闭"一节。
 
 ### 1. 本阶段做了什么
 
@@ -79,28 +93,22 @@ jh gap [-n N] [--min-ratio R] [--resume N] [--scored]
 
 ### 3. 已知问题 / 未覆盖的地方（**这些我知道，不要当成"没发现"**）
 
-1. 🔴 **LLM 真实调用路径没有验收过**：本机 `.env` 里 `DEEPSEEK_API_KEY` 是空的，
-   所以只验证到"没配 key → 跳过 + 保留规则分"这条降级路径。真实的 HTTP 请求/响应解析
-   （`deepseek.py::_parse_response`）**只有 `httpx.MockTransport` 级别的自测**，没有真实流量验证。
-2. **缓存没有清理入口**：没有 `jh cache clear` 之类的命令，也没有 TTL。
-   想强制重算目前只能改 `prompt_version` / 换模型 / 动简历。
-3. **规则分的绝对水平没有校准**：三个权重与各档 ratio（0.2/0.35/0.55/0.6…）是按经验定的，
-   只在 20 条虚构 JD 上看过排序是否合理，**没有拿真实投递结果回测过**。
-4. **方向判定完全依赖 `direction_profiles.yaml` 的词表**：词表没覆盖的岗位会被判成"其他"
-   （给中性 0.6）；跨方向岗位（如"AI 前端"）会按命中词数取多数，可能判偏。
-5. **`jh match run` 对所有岗位打分**，包括已 `applied` / `skipped` 的
-   （只会更新分数，不会改状态）。是否有必要跳过它们，我没做判断。
-6. **`jh gap` 的"我有没有"只看 `skills` + 项目/实习里抽出的技能**，
-   不读 `raw_text`（有意的：避免把"我在学 X"算成"我会 X"）。代价是真的写在正文里、
-   但没被结构化到技能字段的技能会被误报成缺口。
-7. **并发写库依赖单线程事件循环**：`run_llm_layer` 里多个任务共用一个 `Session`，
-   在 asyncio 单线程下安全；**不要在多线程里复用同一个 Session**（没做锁）。
-8. **`PROMPT_VERSION` 靠人手动 +1**：改了提示词忘记改版本号 → 旧缓存继续命中。
-   没有自动校验机制。
-9. `jh match set --verdict` 只接受 `skip` / `queue`；想改回 `new` 或直接标 `applied` 要等 P4。
-10. `jh match explain` 对旧格式的 `rule_detail_json` 只提示"重新跑 match"，不尝试兼容渲染。
-11. **未验证的边界**：超长 JD（>4000 字会被截断进提示词）、多份简历时的
-    `match_best_candidate` 平局、`llm_concurrency` 调高后的限流表现。
+> 本节在验证后更新：🔴 三条已修（见 §0）；下列条目按 `docs/ISSUES.md` 的编号对齐。
+
+1. 🔴→✅ **原"LLM 真实调用路径没有验收过"**：本机 `.env` 里 `DEEPSEEK_API_KEY` 仍为空
+   （用户侧事项，不影响规则层），真实的 HTTP 请求/响应解析依旧只有 `httpx.MockTransport`
+   级别的覆盖。**仍未验收，等 key**。
+2. **缓存没有清理入口**（= ISSUES #25）：没有 `jh cache clear`，也没有 TTL。
+3. **规则分绝对水平未校准**：权重与各档 ratio 是按经验定的，只在 20 条虚构 JD 上看过排序。
+4. **方向判定完全依赖 `direction_profiles.yaml` 词表**（词表未覆盖 → 判成"其他"，给中性 0.6）。
+5. **`jh match run` 对所有岗位打分**，含已 `applied`/`skipped`（= ISSUES #27）。
+6. **`jh gap` 的"我有没有"只读结构化技能字段**，不读 `raw_text`（有意；代价见 #6 说明）。
+7. **并发写库依赖单线程事件循环**；`_apply()` 现在每条 commit，不要再往里面塞 `await`。
+8. **`PROMPT_VERSION` 靠人手动 +1**（= ISSUES #24 同源问题：权重与表头字段不在 key 里）。
+9. `jh match set --verdict` 只接受 `skip` / `queue`。
+10. `jh match explain` 对旧格式 `rule_detail_json` 只提示重跑，不兼容渲染。
+11. **未验证的边界**：超长 JD（>4000 字截断进提示词）、多份简历平局、
+    `llm_concurrency` 调高后的限流表现。
 
 ### 4. 建议重点验证的地方
 
