@@ -6,7 +6,8 @@
    所以占位命令一律：
         · 明确打印"该功能在 PX 阶段实现"；
         · 以**非 0 退出码**结束（2 = 用法/未实现，区别于业务失败）；
-        · 指出当前已实现的是什么（`jh init` / `jh resume` / `jh job`），给出下一步动作。
+        · 指出当前已实现的是什么（`jh init` / `jh resume` / `jh job` / `jh match` / `jh gap` /
+      `jh today` / `jh apply`），给出下一步动作。
 """
 
 from __future__ import annotations
@@ -82,6 +83,8 @@ def not_implemented(feature: str, phase: str) -> NoReturn:
             f"　　　　　　　[green]jh job add | list | show | skip[/green]（岗位录入）\n"
             f"　　　　　　　[green]jh match run | explain | set[/green]"
             f"　[green]jh gap[/green]（两级匹配 + 技能缺口）\n"
+            f"　　　　　　　[green]jh today[/green]（待投清单 + 开场白）\n"
+            f"　　　　　　　[green]jh apply <序号> --status applied[/green]（投完打标）\n"
             f"查看全部命令：[green]jh --help[/green]\n"
             f"实现计划：[green]docs/roadmap.md[/green]",
             title="🚧 未实现",

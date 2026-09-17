@@ -383,39 +383,29 @@ def detect_direction(
 # ③ 简历侧：技能全集、学历、毕业年份
 # ===========================================================================
 def resume_skill_pool(content: ResumeContent) -> tuple[set[str], set[str]]:
-    """取出简历的技能全集。
+    """取出简历的技能全集（**实现已搬到 `resume_svc`**，这里只做转发）。
 
-    Returns:
-        (pool, explicit)
-        pool     —— 出现在任何地方（技能栏 / 项目描述 / 实习描述）的技能
-        explicit —— 只在"专业技能"栏主动列出的技能
-
-    ★ 为什么**不**把 `raw_text` 也算进来：
-      `raw_text` 是整份简历的原文兜底，包含"我在学 LangChain"这种句子。
-      把它算进技能池，等于**声称自己会**一个还在学的技能 ——
-      匹配分虚高，而这恰恰是这个工具最不该犯的错（骗自己）。
-      结构化字段（skills / projects[].skills）是 P1 解析出来的"我确实写过"的部分。
-
-    ★ 为什么 `pool` 要包含 `explicit`：
-      P1 的解析会把"项目描述里提到的技能"填进 `project.skills`，
-      但技能栏里写了、项目里没用的技能只出现在 `content.skills`。
-      两者取并集才是"我会什么"的完整答案。
+    ★ 为什么搬家：`fidelity`（防编造校验）也要用它，而防编造不该依赖"匹配"这一层。
+      保留这个同名转发是为了不破坏既有调用点与测试；
+      新代码请直接用 `resume_svc.resume_skill_pool()`。
     """
-    explicit = set(content.skills)
-    pool = set(explicit)
-    for item in content.projects:
-        pool.update(item.skills)
-    for item in content.internships:
-        pool.update(item.skills)
-    return pool, explicit
+    return resume_svc.resume_skill_pool(content)
 
 
 def _highest_degree(content: ResumeContent) -> str:
-    """简历里的最高学历（取学历等级最高的那一段）。判不出来返回空串。"""
+    """简历里的最高学历（取学历等级最高的那一段）。判不出来返回空串。
+
+    ★ 为什么只在 `item.degree` 与"学校+专业"里找，不碰 `raw_line`：
+      `EducationItem` **没有** `raw_line` 字段（P1 的模型只有
+      school/major/degree/period）。原先这里写了 `item.raw_line or ""`，
+      因为 `item.degree` 通常非空而短路、一直没炸 —— 一旦遇到
+      "没解析出学历"的那条教育经历就会 AttributeError。
+      这是个只在真实边界数据上才出现的崩溃，现在按字段实际形状写死。
+    """
     best = ""
     best_rank = 0
     for item in content.education:
-        degree = item.degree or _extract_degree_from_text(item.raw_line or "")
+        degree = item.degree or _extract_degree_from_text(f"{item.school}{item.major}")
         rank = _DEGREE_RANK.get(degree, 0)
         if rank > best_rank:
             best, best_rank = degree, rank

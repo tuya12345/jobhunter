@@ -73,6 +73,7 @@ def compute_cache_key(
     model: str,
     jd_hash: str | None,
     resume_content_hash: str | None,
+    task: str | None = None,
 ) -> str | None:
     """算出缓存 key；**任一成分缺失就返回 None（表示"这次不许用缓存"）**。
 
@@ -82,6 +83,12 @@ def compute_cache_key(
         于是 A 简历算出来的分数会被 B 简历读到 —— 分数错得毫无痕迹。
         宁可退回"每次都重新算"（花几分钱），也不要给出一个错的分数。
 
+    ★ `task` 参数（P4 加）：不同的任务必须有不同的 key。
+      `match` 与 `greeting` 的四个成分（prompt_version/model/jd_hash/resume_hash）
+      完全可能相同（同一岗位、同一简历、同一模型、两个 prompt 都从 1 开始编号），
+      不加 task 就会**撞成同一条缓存** —— 开场白读到匹配的 JSON。
+      为了不破坏已有调用点，它是可选参数：不传时行为与之前完全一致。
+
     分隔符用 `|` 而不是直接拼接：直接拼接时
     `("1", "23")` 和 `("12", "3")` 会撞成同一个 key（真实的哈希碰撞来源）。
     """
@@ -89,7 +96,7 @@ def compute_cache_key(
         return None
     if not model:
         return None
-    raw = f"{prompt_version}|{model}|{jd_hash}|{resume_content_hash}"
+    raw = f"{task or ''}|{prompt_version}|{model}|{jd_hash}|{resume_content_hash}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

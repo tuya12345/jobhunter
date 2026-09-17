@@ -449,6 +449,8 @@ async def _evaluate_job(
         model=provider.model,
         jd_hash=job.jd_hash,
         resume_content_hash=candidate.content_hash,
+        # ★ task 参与 key：否则同一岗位的 match 与 greeting 可能撞成同一条缓存
+        task="match",
     )
 
     if cache_key:

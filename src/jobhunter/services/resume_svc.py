@@ -84,6 +84,7 @@ __all__ = [
     "load_skill_vocabulary",
     "parse_resume_file",
     "parse_resume_text",
+    "resume_skill_pool",
     "split_resume",
     "strip_volatile_content",
 ]
@@ -422,6 +423,32 @@ def _alias_pattern(alias: str) -> re.Pattern[str] | None:
     right = r"(?![A-Za-z_])" if is_word_tail else ""
 
     return re.compile(left + escaped + right, re.IGNORECASE)
+
+
+def resume_skill_pool(content: ResumeContent) -> tuple[set[str], set[str]]:
+    """取出简历的技能全集。
+
+    Returns:
+        (pool, explicit)
+        pool     —— 出现在任何地方（技能栏 / 项目描述 / 实习描述）的技能
+        explicit —— 只在"专业技能"栏主动列出的技能
+
+    ★ 为什么**不**把 `raw_text` 也算进来：
+      `raw_text` 是整份简历的原文兜底，包含"我在学 LangChain"这种句子。
+      把它算进技能池，等于**声称自己会**一个还在学的技能 ——
+      匹配分虚高，而这恰恰是这个工具最不该犯的错（骗自己）。
+
+    ★ 为什么放在 resume_svc（P4 从 match_svc 搬过来）：
+      匹配要用它、`jh gap` 要用它、**防编造校验（fidelity）也要用它** ——
+      而后者不该依赖"匹配"那一层。放在这里，三方都只依赖简历模型本身。
+    """
+    explicit = set(content.skills)
+    pool = set(explicit)
+    for item in content.projects:
+        pool.update(item.skills)
+    for item in content.internships:
+        pool.update(item.skills)
+    return pool, explicit
 
 
 def extract_skills(

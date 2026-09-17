@@ -74,17 +74,20 @@ EXPECTED_COMMANDS = (
 #     · `resume` 三个子命令（P1）
 #     · `job` 四个子命令（P2）
 #     · `match` 三个子命令 + `gap`（P3）
+#     · `today`（P4）与 `apply 序号/--job --status …`（P4）
 #   它们在没有数据库时会报"请先运行 jh init"（exit 1）—— 那是**正确的**行为，
 #   由 `test_*_commands_are_implemented` 那几条用例单独覆盖。
+#
+# ★ P4 仍然留在名单里的 `apply` 语法（它们是 P4.5 的活，现在会明确说"P4.5 实现"）：
+#     `3=applied` 批量打标、`--pending` 待处理列表、`--timeline` 时间轴（P6）、
+#     按关键词模糊匹配。
 PLACEHOLDER_INVOCATIONS: list[list[str]] = [
-    ["today"],
     ["weak"],
     ["stats"],
     ["report"],
     ["demo"],
     ["followup", "1"],
     ["apply", "3=applied", "7=replied"],
-    ["apply", "1", "--status", "applied"],
     ["apply", "--pending"],
     ["apply", "--timeline", "1"],
     ["interview", "list"],

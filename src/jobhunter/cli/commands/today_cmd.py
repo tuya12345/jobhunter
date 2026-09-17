@@ -1,19 +1,16 @@
-"""`jh today` —— 待投清单（P4 实现，本阶段为占位）。
+"""`jh today` —— 今日待投清单（P4）。
 
-P4 的最终形状：
+    jh today [--limit 20] [--min-score 60]     出清单 + 生成开场白 + 写 pending 投递
+    jh today --copy 3                          把第 3 条的开场白复制到剪贴板
+    jh today --check                           今天已投 X / 上限 N
+    jh today --export md|csv                   导出到 output/（**只写新文件**）
 
-    jh today --limit 20 [--min-score 60]
-        按 match_score 降序 → 排除已投递 → **同公司同天不推多条**
-        → 为每条生成开场白 → 写 applications(status=pending)
-        → rich 表格：| 序 | 公司 | 职位 | 分数 | 用哪份简历 | 链接 | 开场白 |
-    jh today --copy 3
-        ★ 一键复制第 3 条开场白（省掉每天 20 次划选）。这个"序号"就是
-          `jh apply 3=applied` 里用的序号 —— 两处序号必须一致，否则会打错标。
-    jh today --check
-        今天已投 X / 上限 N（**从 applications.applied_at 实时聚合**，不建计数表）
+★ 序号在 `jh today` / `jh today --copy N` / `jh apply N --status …` 三处**必须一致**，
+  否则会出现"我以为标的是第 3 条，实际改的是别的岗位"。三者共用
+  `today_svc.select_candidates()`，不各写一套筛选。
 
-★ 开场白必须基于共享层的 JD 关键词 + 简历真实亮点：
-    完整版 80-150 字 + 精简版 ≤60 字（BOSS 有字数限制）+ 禁用词表过滤套话。
+★ 生成开场白会调 LLM（有 key 时）。没有 key / 调用失败 → **降级到确定性模板**，
+  并把原因显示在清单下面 —— 清单本身永远出得来，这是"能不能用"的底线。
 """
 
 from __future__ import annotations
@@ -21,8 +18,15 @@ from __future__ import annotations
 from typing import Annotated
 
 import typer
+from rich.panel import Panel
+from rich.table import Table
+from sqlalchemy.orm import Session
 
-from jobhunter.cli.common import not_implemented
+from jobhunter.cli.common import console, err_console, require_db, success, warn
+from jobhunter.config.settings import AppSettings, get_settings
+from jobhunter.llm.factory import get_provider
+from jobhunter.services import apply_svc, export_svc, today_svc
+from jobhunter.utils.clipboard import copy_to_clipboard
 
 app = typer.Typer(
     help="今日待投清单：打分排序 / 一键复制开场白 / 额度检查（P4）",
@@ -47,10 +51,219 @@ def today(
     export: Annotated[
         str | None, typer.Option("--export", help="导出格式：md / csv（写到 output/，只写新文件）")
     ] = None,
+    variant: Annotated[
+        str | None,
+        typer.Option("--variant", help="强制开场白变体：with_project / without_project"),
+    ] = None,
+    short: Annotated[bool, typer.Option("--short", help="--copy 时复制精简版（≤60 字）")] = False,
 ) -> None:
     """输出今日待投清单（P4）。"""
-    not_implemented(
-        f"jh today（limit={limit}, min_score={min_score}, copy={copy}, "
-        f"check={check}, export={export}）",
-        "P4",
+    settings = get_settings()
+    if variant is not None and variant not in ("with_project", "without_project"):
+        err_console.print("[red]--variant 只能是 with_project 或 without_project[/red]")
+        raise typer.Exit(code=2)
+    if export is not None and export not in ("md", "csv"):
+        err_console.print("[red]--export 只支持 md 或 csv[/red]")
+        raise typer.Exit(code=2)
+
+    engine, factory = require_db()
+    try:
+        with factory() as session:
+            # ---- --check：只报额度，不生成任何东西 ------------------------
+            if check:
+                applied = apply_svc.count_applied_today(session)
+                _print_quota(applied, settings.daily_limit)
+                return
+
+            # ---- --copy N：取第 N 条并复制 ---------------------------------
+            if copy is not None:
+                _copy_nth(
+                    session,
+                    copy,
+                    settings=settings,
+                    min_score=min_score,
+                    short=short,
+                    variant=variant,
+                )
+                return
+
+            # ---- 默认：出清单 ---------------------------------------------
+            provider = get_provider(settings)
+            result = today_svc.build_today_list(
+                session,
+                min_score=min_score,
+                limit=limit,
+                settings=settings,
+                provider=provider,
+                variant=variant,
+            )
+            session.commit()
+
+            if not result.items:
+                _print_empty(session, settings=settings, min_score=min_score)
+                return
+
+            _print_items(result, settings=settings)
+            if export:
+                output_dir = settings.paths.output_dir
+                path = (
+                    export_svc.export_markdown(result.items, output_dir=output_dir)
+                    if export == "md"
+                    else export_svc.export_csv(result.items, output_dir=output_dir)
+                )
+                success(f"已导出：{path}")
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 渲染
+# ---------------------------------------------------------------------------
+def _print_quota(applied: int, daily_limit: int) -> None:
+    remaining = max(0, daily_limit - applied)
+    console.print(
+        Panel(
+            f"今天已投：[bold]{applied}[/bold] / 上限 [bold]{daily_limit}[/bold]"
+            f"　还剩 [bold]{remaining}[/bold] 条",
+            title="📅 今日额度",
+            border_style="cyan",
+        )
     )
+    if remaining == 0:
+        warn("今天的额度用完了 —— 海投的转化率反而更低，明天再继续。")
+    else:
+        console.print(
+            "  [dim]额度从 applications.applied_at 实时聚合，不是计数器（不会对不上）。[/dim]"
+        )
+
+
+def _print_empty(session: Session, *, settings: AppSettings, min_score: int | None) -> None:
+    """空清单要区分原因：没岗位 / 没打分 / 分数不够 / 都被投完了。"""
+    from jobhunter.services import job_svc
+
+    jobs = job_svc.list_jobs(session)
+    if not jobs:
+        console.print("[yellow]库里还没有岗位。[/yellow]先录一个：")
+        console.print("  [green]jh job add <岗位链接>[/green]")
+        return
+    console.print(
+        Panel(
+            "没有达到分数线的岗位。可能的原因：\n\n"
+            "  [bold]1[/bold] 还没跑过匹配打分 → [green]jh match run[/green]\n"
+            "  [bold]2[/bold] 分数线太高 → [green]jh today --min-score 50[/green]\n"
+            "  [bold]3[/bold] 够分的都投过了 → [green]jh match run[/green] 之后再录新岗位\n\n"
+            "[dim]`jh match explain <id>` 可以看某个岗位为什么分低。[/dim]",
+            title="清单是空的",
+            border_style="yellow",
+        )
+    )
+
+
+def _print_items(result: today_svc.TodayList, *, settings: AppSettings) -> None:
+    """打印清单表 + 开场白 + 降级说明。"""
+    console.print()
+    table = Table(title=f"今日待投（{len(result.items)} 条）", header_style="bold cyan")
+    table.add_column("#", justify="right")
+    table.add_column("分", justify="right")
+    table.add_column("公司", overflow="fold")
+    table.add_column("职位", overflow="fold")
+    table.add_column("城市")
+    table.add_column("用哪份简历", overflow="fold")
+    table.add_column("变体")
+    table.add_column("链接", overflow="fold")
+    for item in result.items:
+        table.add_row(
+            str(item.index),
+            str(item.score),
+            item.company,
+            item.title,
+            item.job.city or "—",
+            item.resume_name or "—",
+            item.greeting_variant or "—",
+            item.url or "—",
+        )
+    console.print(table)
+
+    console.print()
+    for item in result.items:
+        if not item.greeting_full:
+            continue
+        tag = "" if item.greeting_source == "llm" else " [yellow]（模板兜底）[/yellow]"
+        console.print(
+            f"[bold]{item.index}. {item.company} · {item.title}[/bold]{tag}"
+            f"　[dim]{len(item.greeting_full)} 字[/dim]"
+        )
+        console.print(f"   {item.greeting_full}")
+        if item.greeting_short:
+            console.print(
+                f"   [dim]精简版（{len(item.greeting_short)} 字）：{item.greeting_short}[/dim]"
+            )
+        console.print()
+
+    # ★ 降级原因必须显示：静默降级会让人以为"模型就这水平"，其实是被闸门拦了
+    degraded = [item for item in result.items if item.greeting_issues]
+    if degraded:
+        console.print("[yellow]⚠️ 有开场白降级到模板（模型输出没过闸门）：[/yellow]")
+        for item in degraded[:5]:
+            console.print(f"  [dim]· #{item.index} {'；'.join(item.greeting_issues[:2])}[/dim]")
+
+    console.print(
+        f"  [dim]过滤前达线 {result.candidates} 条"
+        + (
+            f"，同公司去重挤掉 {result.dropped_same_company} 条"
+            if result.dropped_same_company
+            else ""
+        )
+        + f"；今天已投 {result.applied_today}/{result.daily_limit}[/dim]"
+    )
+    console.print()
+    console.print(
+        "下一步：[green]jh today --copy 1[/green] 复制第 1 条开场白"
+        "　｜　投完 [green]jh apply 1 --status applied[/green]"
+        "　｜　[green]jh today --export md[/green] 导出"
+    )
+
+
+def _copy_nth(
+    session: Session,
+    index: int,
+    *,
+    settings: AppSettings,
+    min_score: int | None,
+    short: bool,
+    variant: str | None,
+) -> None:
+    """复制第 N 条开场白（序号与 `jh today` 打出来的完全一致）。
+
+    ★ 只给这一条生成开场白（不是整张清单）：有 key 时每次调用都要花钱。
+    ★ 序号优先按**今天的快照**解析 —— 投完第 1 条之后，"第 3 条"仍然是你
+      刚才看到的第 3 条（见 `today_svc.resolve_index` 的说明）。
+    """
+    job, from_snapshot = today_svc.resolve_index(session, index, settings=settings)
+    if job is None:
+        err_console.print(
+            f"[red]清单里没有第 {index} 条[/red]。先跑 [green]jh today[/green] 看序号。"
+        )
+        raise typer.Exit(code=1)
+
+    provider = get_provider(settings)
+    item = today_svc.ensure_item(
+        session, job, index, settings=settings, provider=provider, variant=variant
+    )
+    session.commit()
+
+    text = item.greeting_short if short else item.greeting_full
+    if not text:
+        err_console.print(f"[red]第 {index} 条还没有开场白[/red]（{item.company} · {item.title}）")
+        raise typer.Exit(code=1)
+
+    if copy_to_clipboard(text):
+        success(
+            f"已复制第 {index} 条（{item.company} · {item.title}）"
+            f"的{'精简版' if short else '完整版'}开场白（{len(text)} 字）"
+        )
+        console.print("  [dim]直接去招聘 App 里粘贴即可。[/dim]")
+    else:
+        # 剪贴板不可用也不能让用户白跑一趟 —— 直接把文本打出来让他手动选
+        warn("复制到剪贴板失败（这个系统上可能没有 clip/pbcopy/xclip），下面是原文：")
+        console.print(text)
