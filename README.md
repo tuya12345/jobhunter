@@ -241,7 +241,9 @@ src/jobhunter/
 
 详细分层职责、每一项技术决定的取舍，见 [`docs/architecture.md`](docs/architecture.md)；
 11 张表的设计与索引理由见 [`docs/data_model.md`](docs/data_model.md)；
-各阶段实现计划与实测记录（含踩坑清单）见 [`docs/roadmap.md`](docs/roadmap.md)。
+各阶段实现计划与实测记录（含踩坑清单）见 [`docs/roadmap.md`](docs/roadmap.md)；
+**当前阶段交付说明（做了什么 / 已知问题 / 建议重点验证什么）见 [`docs/STATUS.md`](docs/STATUS.md)**；
+验证问题的处理台账见 [`docs/ISSUES.md`](docs/ISSUES.md)。
 
 ---
 
