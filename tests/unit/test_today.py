@@ -345,8 +345,9 @@ def test_cli_apply_by_job_id(cli_ready):
 
 
 def test_cli_apply_rejects_unknown_status(cli_ready):
+    """非法状态 → 退出码 2（用法错误），且在碰数据库之前就报出来。"""
     result = runner.invoke(app, ["--no-remind", "apply", "1", "--status", "已投"])
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "不认识" in result.output
 
 
@@ -356,11 +357,19 @@ def test_cli_apply_needs_status(cli_ready):
     assert "--status" in result.output
 
 
-def test_cli_apply_batch_syntax_is_deferred(cli_ready):
-    """`3=applied` 是 P4.5 的语法 —— 现在必须**诚实地说没做**，而不是假装不认识。"""
+def test_cli_apply_batch_syntax(cli_ready, monkeypatch):
+    """`3=applied` 批量语法（P4.5 已实现）→ 详见 test_followup.py 的批量用例。
+
+    这里只确认"它不再是占位"：不带数据库时也该给出**与批量语法相符**的提示，
+    而不是"该功能在 P4.5 阶段实现"。
+    """
+    monkeypatch.setenv("JH_LLM_PROVIDER", "mock")
+    from jobhunter.config.settings import reset_settings
+
+    reset_settings()
     result = runner.invoke(app, ["--no-remind", "apply", "3=applied"])
-    assert result.exit_code == 2
-    assert "P4.5" in result.output
+    assert "P4.5 阶段实现" not in result.output
+    assert result.exit_code in (0, 2), result.output
 
 
 def test_cli_apply_out_of_range_index(cli_ready):

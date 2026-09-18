@@ -27,16 +27,18 @@ from jobhunter.models import Application, ApplicationEvent, Job
 from jobhunter.models.constants import APPLICATION_STATUSES
 from jobhunter.utils.io import to_json
 from jobhunter.utils.logging import get_logger
-from jobhunter.utils.time import now_utc, to_local
+from jobhunter.utils.time import days_since, now_utc, to_local
 
 logger = get_logger(__name__)
 
 __all__ = [
     "ApplicationError",
     "ApplyResult",
+    "PendingRow",
     "count_applied_today",
     "ensure_pending_application",
     "get_latest_application",
+    "list_actionable",
     "set_status",
 ]
 
@@ -229,3 +231,71 @@ def count_applied_today(session: Session, *, now: datetime | None = None) -> int
         )
     )
     return int(total or 0)
+
+
+# ===========================================================================
+# 待处理清单（`jh apply --pending`）
+# ===========================================================================
+@dataclass
+class PendingRow:
+    """一条"需要我动手"的投递。"""
+
+    job_id: int
+    application_id: int | None
+    company: str
+    title: str
+    status: str
+    #: 投出去几天了（没投则为 None）
+    days: int | None
+    #: 为什么它出现在这里（人话）
+    reason: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.company or '—'} · {self.title or '（未写职位）'}"
+
+
+def list_actionable(session: Session, *, now: datetime | None = None) -> list[PendingRow]:
+    """列出"需要我动手"的投递：还没投的 + 投了 3 天以上没动静的。
+
+    ★ 为什么把"还没投的"也算进来：`jh today` 生成了开场白就写了一条 `pending`，
+      它代表"简历已经准备好、就差我点投递"。这正是最该被提醒的一类。
+
+    ★ 排序：先按"紧急程度"（超过 14 天 > 7 天 > 3 天 > 还没投），
+      再按投出时间从早到晚 —— 最该处理的排最前面，因为这是**行动清单**。
+    """
+    moment = now or now_utc()
+    rows = session.execute(
+        select(Application, Job)
+        .join(Job, Application.job_id == Job.id)
+        .where(Application.status.not_in(("offer", "rejected")))
+        .order_by(Application.applied_at.is_(None).desc(), Application.applied_at)
+    ).all()
+
+    out: list[PendingRow] = []
+    for application, job in rows:
+        days = days_since(application.applied_at, now=moment) if application.applied_at else None
+        if days is None:
+            reason = "还没投（开场白已生成）"
+        elif days >= 14:
+            reason = f"投后 {days} 天没动静，建议放弃或换个渠道"
+        elif days >= 7:
+            reason = f"投后 {days} 天没动静"
+        elif days >= 3:
+            reason = f"投后 {days} 天，该跟进一下了"
+        else:
+            reason = f"投后 {days} 天"
+        out.append(
+            PendingRow(
+                job_id=job.id,
+                application_id=application.id,
+                company=job.company or "",
+                title=job.title or "",
+                status=application.status,
+                days=days,
+                reason=reason,
+            )
+        )
+    # 紧急度排序：None（没投）排最后，其余按天数降序
+    out.sort(key=lambda row: (row.days is None, -(row.days or 0), row.job_id))
+    return out

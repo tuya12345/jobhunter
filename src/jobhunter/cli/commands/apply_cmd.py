@@ -52,9 +52,11 @@ from __future__ import annotations
 from typing import Annotated
 
 import typer
+from rich.table import Table
 
 from jobhunter.cli.common import console, err_console, not_implemented, require_db, success, warn
 from jobhunter.config.settings import get_settings
+from jobhunter.models import Job
 from jobhunter.models.constants import APPLICATION_STATUSES
 from jobhunter.services import apply_svc, today_svc
 
@@ -96,19 +98,30 @@ def apply_root(
         bool, typer.Option("--yes", "-y", help="模糊匹配到多条时不询问，全部应用")
     ] = False,
 ) -> None:
-    """零手打跟进入口（P4 单条 / P4.5 批量与模糊匹配）。"""
+    """零手打跟进入口（P4.5：批量 / 模糊匹配 / 待处理清单）。"""
     if timeline is not None:
         not_implemented(f"jh apply --timeline {timeline}（投递时间轴）", "P6")
 
+    tokens, status, yes = _pull_options_out_of_tokens(list(tokens or []), status, yes)
+
     if pending:
-        not_implemented("jh apply --pending（待处理投递列表）", "P4.5")
+        _print_pending()
+        return
 
-    tokens, status = _pull_status_out_of_tokens(list(tokens or []), status)
+    # ★ 状态值先校验：拼错一个状态是**最常见**的手误，应该在碰数据库之前
+    #   就明确报出来。等走到 set_status 才报，用户可能先看到"没有匹配的岗位"
+    #   这种与真正错误无关的提示（实测踩到）。
+    if status is not None and status not in APPLICATION_STATUSES:
+        err_console.print(
+            f"[red]状态 {status!r} 不认识[/red]。可用：{'、'.join(APPLICATION_STATUSES)}"
+        )
+        raise typer.Exit(code=2)
 
-    # ---- 批量语法 `3=applied`：P4.5 的活，这里明确说清楚而不是假装不认识 ----
+    # ---- 批量语法 `3=applied 7=replied`（★ P4.5 的核心：一条命令处理一整轮）----
     pairs = [token for token in tokens if "=" in token]
     if pairs:
-        not_implemented(f"jh apply {' '.join(pairs)}（批量打标）", "P4.5")
+        _mark_batch(pairs)
+        return
 
     if job is not None:
         if status is None:
@@ -133,42 +146,263 @@ def apply_root(
         _mark_by_index(int(tokens[0]), status)
         return
 
-    keyword = " ".join(tokens)
-    not_implemented(f"jh apply {keyword!r} --status {status}（按关键词模糊匹配）", "P4.5")
+    # ---- 模糊匹配（★ P4.5）：按公司名/职位名找，命中多条**列出来让我选** ------
+    _mark_by_keyword(" ".join(tokens), status, yes=yes)
 
 
-def _pull_status_out_of_tokens(
-    tokens: list[str], status: str | None
-) -> tuple[list[str], str | None]:
-    """把被可变位置参数**吞掉**的 `--status` 捞回来（Click 的解析行为，P4 手敲时踩到）。
+# ===========================================================================
+# P4.5：待处理清单 / 批量打标 / 模糊匹配
+# ===========================================================================
+def _print_pending() -> None:
+    """`jh apply --pending`：列出需要我动手的投递（含 job_id，供批量打标引用）。"""
+    engine, factory = require_db()
+    try:
+        with factory() as session:
+            rows = apply_svc.list_actionable(session)
+    finally:
+        engine.dispose()
+
+    if not rows:
+        success("没有待处理的投递 —— 要么都处理完了，要么还没开始投。")
+        console.print("  [dim]先出清单：[green]jh today[/green][/dim]")
+        return
+
+    console.print()
+    table = Table(title=f"待处理（{len(rows)} 条）", header_style="bold cyan")
+    table.add_column("job_id", justify="right")
+    table.add_column("状态")
+    table.add_column("投后", justify="right")
+    table.add_column("公司", overflow="fold")
+    table.add_column("职位", overflow="fold")
+    table.add_column("为什么在这里", overflow="fold")
+    for row in rows:
+        table.add_row(
+            str(row.job_id),
+            row.status,
+            "—" if row.days is None else f"{row.days} 天",
+            row.company or "—",
+            row.title or "—",
+            row.reason,
+        )
+    console.print(table)
+    console.print()
+    console.print("下一步（三种写法都行）：")
+    console.print(
+        "  [green]jh apply 3=applied 7=replied[/green]      按 [bold]jh today[/bold] 的序号批量打标"
+    )
+    console.print(
+        "  [green]jh apply #12=replied[/green]        "
+        "按上面的 [bold]job_id[/bold] 打标（最不会认错）"
+    )
+    console.print('  [green]jh apply "字节" --status viewed[/green]   按公司/职位名模糊匹配')
+
+
+def _parse_pairs(pairs: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """把 `3=applied` / `#12=replied` 拆成 (定位符, 目标状态)。
+
+    Returns:
+        (parsed, errors) —— 只要有错就**整批不执行**（见 `_mark_batch` 的说明）。
+    """
+    parsed: list[tuple[str, str]] = []
+    errors: list[str] = []
+    for token in pairs:
+        target, _, status = token.partition("=")
+        target = target.strip()
+        status = status.strip()
+        if not target or not status:
+            errors.append(f"`{token}` 格式不对，应写成 `3=applied` 或 `#12=replied`")
+            continue
+        if status not in APPLICATION_STATUSES:
+            errors.append(
+                f"`{token}` 里的状态 `{status}` 不认识（可用：{'、'.join(APPLICATION_STATUSES)}）"
+            )
+            continue
+        parsed.append((target, status))
+    return parsed, errors
+
+
+def _resolve_target(session: object, target: str, settings: object) -> Job | None:
+    """把定位符解析成岗位：`#12` = job_id；`3` = `jh today` 清单里的序号。"""
+    if target.startswith("#"):
+        raw = target[1:]
+        if not raw.isdigit():
+            return None
+        return session.get(Job, int(raw))  # type: ignore[attr-defined]
+    if target.isdigit():
+        job, _from_snapshot = today_svc.resolve_index(session, int(target), settings=settings)  # type: ignore[arg-type]
+        return job
+    return None
+
+
+def _mark_batch(pairs: list[str]) -> None:
+    """批量打标：**先全部校验，再全部执行**。
+
+    ★ 为什么不是"能改的先改、错的报错"：
+      批量的意义是"一条命令处理一整轮"。如果一半成功一半失败，用户既不知道
+      最终状态是什么，也不知道该不该重跑（重跑会不会把已改的又改一遍）。
+      **全对才执行、有错就一条都不动**，是唯一让人放心的语义。
+    """
+    engine, factory = require_db()
+    settings = get_settings()
+    parsed, errors = _parse_pairs(pairs)
+
+    try:
+        with factory() as session:
+            resolved: list[tuple[Job, str]] = []
+            for target, target_status in parsed:
+                job = _resolve_target(session, target, settings)
+                if job is None:
+                    errors.append(
+                        f"找不到 `{target}` 对应的岗位"
+                        "（序号看 `jh today`，job_id 看 `jh apply --pending`）"
+                    )
+                    continue
+                resolved.append((job, target_status))
+
+            if errors:
+                err_console.print("[red]这批打标没有执行（有错就整批不动）：[/red]")
+                for item in errors:
+                    err_console.print(f"  [red]·[/red] {item}")
+                raise typer.Exit(code=2)
+
+            results = []
+            for job, target_status in resolved:
+                results.append(
+                    (
+                        job,
+                        apply_svc.set_status(
+                            session,
+                            job.id,
+                            target_status,
+                            source=f"jh apply {job.id}={target_status}",
+                        ),
+                    )
+                )
+            session.commit()
+    finally:
+        engine.dispose()
+
+    console.print()
+    for job, result in results:
+        mark = "✓" if result.changed else "="
+        arrow = (
+            f"{result.from_status} → {result.to_status}"
+            if result.changed
+            else f"已经是 {result.to_status}"
+        )
+        console.print(
+            f"  [{('green' if result.changed else 'dim')}]{mark}[/] "
+            f"[bold]{job.company or '—'} · {job.title or '（未写职位）'}[/bold]"
+            f"（#{job.id}）　{arrow}"
+        )
+    changed = sum(1 for _job, result in results if result.changed)
+    success(f"批量打标完成：{len(results)} 条，其中 {changed} 条有变化（每条都写了事件）")
+
+
+def _mark_by_keyword(keyword: str, status: str, *, yes: bool) -> None:
+    """模糊匹配公司名/职位名，然后打标。
+
+    ★ 命中多条时**绝不猜**：列出来让用户用 job_id 或序号重跑。
+      这是"我不信任模糊匹配"的体现 —— 打错状态的代价（以为投了某家、其实标的是另一家）
+      远大于再敲一次命令。
+    """
+    engine, factory = require_db()
+    try:
+        with factory() as session:
+            rows = apply_svc.list_actionable(session)
+            matched = [
+                row
+                for row in rows
+                if keyword.lower() in (row.company or "").lower()
+                or keyword.lower() in (row.title or "").lower()
+            ]
+            if not matched:
+                err_console.print(
+                    f"[red]没有匹配「{keyword}」的待处理投递。[/red]\n"
+                    "  [dim]看全部待处理：[green]jh apply --pending[/green][/dim]"
+                )
+                raise typer.Exit(code=1)
+            if len(matched) > 1 and not yes:
+                err_console.print(
+                    f"[yellow]「{keyword}」匹配到 {len(matched)} 条 —— 没有替你猜。[/yellow]"
+                )
+                table = Table(header_style="bold cyan")
+                table.add_column("job_id", justify="right")
+                table.add_column("状态")
+                table.add_column("公司", overflow="fold")
+                table.add_column("职位", overflow="fold")
+                for row in matched:
+                    table.add_row(str(row.job_id), row.status, row.company or "—", row.title or "—")
+                console.print(table)
+                console.print(
+                    "  [dim]确认要改哪一条："
+                    "[green]jh apply #<job_id>[/green] --status "
+                    f"{status}　｜　全改：[green]--yes[/green][/dim]"
+                )
+                raise typer.Exit(code=1)
+
+            results = []
+            for row in matched:
+                try:
+                    result = apply_svc.set_status(
+                        session, row.job_id, status, source=f"jh apply {keyword!r}"
+                    )
+                except apply_svc.ApplicationError as exc:
+                    # 状态非法之类的错误要给一句人话，而不是让 Python 堆栈冲出来
+                    err_console.print(f"[red]{exc}[/red]")
+                    raise typer.Exit(code=1) from exc
+                results.append((row, result))
+            session.commit()
+    finally:
+        engine.dispose()
+
+    for row, result in results:
+        console.print(
+            f"  [bold]{row.label}[/bold]（#{row.job_id}）　"
+            f"{result.from_status} → {result.to_status}"
+        )
+    success(f"已按「{keyword}」打标 {len(results)} 条")
+
+
+def _pull_options_out_of_tokens(
+    tokens: list[str], status: str | None, yes: bool
+) -> tuple[list[str], str | None, bool]:
+    """把被可变位置参数**吞掉**的选项捞回来（Click 的解析行为，手敲时踩到两次）。
 
     ★ 现象：
-        `jh apply 1 --status applied` → `status` 竟然是 **None**；
-        而 `jh apply --status applied 1` 正常。
+        `jh apply 1 --status applied`   → `status` 竟然是 **None**；
+        `jh apply "公司" --status applied --yes` → 关键词变成 **"公司 --yes"**；
+        而把选项写在位置参数**前面**就正常。
       原因：`tokens` 是 `nargs=-1` 的可变位置参数，Click 一旦开始吃位置参数，
-      **后面的选项也一起当位置参数吃掉** —— 于是文档里写的最自然语序直接失效，
-      而且不报错（选项"消失了"），最难查。
+      **后面的选项也一起当位置参数吃掉** —— 于是最自然的语序直接失效，
+      而且不报错（选项"消失"进关键词里），最难查。
 
-    这里做**最小修补**：允许把 `--status X` / `-s X` / `--status=X` 写在任意位置。
+    这里做**最小修补**：`--status X` / `-s X` / `--status=X` / `--yes` / `-y`
+    写在任意位置都认。
     """
-    if status is not None:
-        return tokens, status
     cleaned: list[str] = []
-    found: str | None = None
+    found_status = status
+    found_yes = yes
     index = 0
     while index < len(tokens):
         token = tokens[index]
         if token in ("--status", "-s") and index + 1 < len(tokens):
-            found = tokens[index + 1]
+            if found_status is None:
+                found_status = tokens[index + 1]
             index += 2
             continue
         if token.startswith("--status="):
-            found = token.split("=", 1)[1]
+            if found_status is None:
+                found_status = token.split("=", 1)[1]
+            index += 1
+            continue
+        if token in ("--yes", "-y"):
+            found_yes = True
             index += 1
             continue
         cleaned.append(token)
         index += 1
-    return cleaned, found
+    return cleaned, found_status, found_yes
 
 
 def _mark_by_job_id(job_id: int, status: str) -> None:

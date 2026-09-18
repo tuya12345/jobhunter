@@ -31,16 +31,19 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
 
 from jobhunter import CURRENT_PHASE, __version__
 from jobhunter.cli.commands import COMMANDS
+
+# ★ 用 `cli/common.py` 里那个 console（固定 width=200），不要在这里新建一个：
+#   `Console()` 默认按终端宽度折行，而顶部提醒那一行本来就长
+#   （"投后 3 天未跟进 3 条 ｜ 投后 7 天无动静 2 条 ｜ 投后 14 天建议放弃 1 条"），
+#   在窄终端上会被折成两行、读起来像两条不同的事项（P4.5 手敲时实测到）。
+from jobhunter.cli.common import console
 from jobhunter.services.reminder_svc import format_reminders, get_reminders
 from jobhunter.utils.logging import setup_logging
 
 __all__ = ["app", "main"]
-
-console = Console()
 
 app = typer.Typer(
     name="jh",

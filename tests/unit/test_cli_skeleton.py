@@ -81,14 +81,14 @@ EXPECTED_COMMANDS = (
 # ★ P4 仍然留在名单里的 `apply` 语法（它们是 P4.5 的活，现在会明确说"P4.5 实现"）：
 #     `3=applied` 批量打标、`--pending` 待处理列表、`--timeline` 时间轴（P6）、
 #     按关键词模糊匹配。
+# ★ P4.5 之后仍留在名单里的 `apply` 语法：只有 `--timeline`（P6）。
+#   批量打标 `3=applied` 与 `--pending` 已经是真功能了，由 test_followup.py 覆盖。
 PLACEHOLDER_INVOCATIONS: list[list[str]] = [
     ["weak"],
     ["stats"],
     ["report"],
     ["demo"],
     ["followup", "1"],
-    ["apply", "3=applied", "7=replied"],
-    ["apply", "--pending"],
     ["apply", "--timeline", "1"],
     ["interview", "list"],
     ["question", "predict", "1"],
@@ -247,16 +247,21 @@ def test_implemented_commands_are_not_placeholders(
 # ---------------------------------------------------------------------------
 # ③ 全局 callback
 # ---------------------------------------------------------------------------
-def test_reminder_shown_by_default() -> None:
-    """默认情况下，任何命令开头都显示待处理提醒（P0 是占位文案）。"""
+def test_reminder_is_silent_when_there_is_nothing_to_do() -> None:
+    """★ P4.5 后的正确行为：**没有待处理事项时一个字都不打印**。
+
+    每天都被"你没有被提醒"刷屏，第三天就会把整个提醒关掉 ——
+    然后连真有提醒时也看不见了。所以"空 → 静默"是刻意的。
+    （本用例环境里没有数据库，`get_reminders()` 退化成空汇总。）
+    """
     result = runner.invoke(app, ["today"])
-    assert "待处理" in result.output
+    assert "📌" not in result.output
 
 
 def test_no_remind_flag_suppresses_reminder() -> None:
     """`--no-remind` 必须能关掉提醒（不能关的话，脚本里用它就很难受）。"""
     result = runner.invoke(app, ["--no-remind", "today"])
-    assert "待处理" not in result.output
+    assert "📌" not in result.output
 
 
 def test_version_flag() -> None:

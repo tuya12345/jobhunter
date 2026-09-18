@@ -161,8 +161,30 @@ jh today --limit 5              # 只看前 5 条
 jh today --copy 1               # ★ 把第 1 条的开场白复制到剪贴板（--short 复制精简版）
 jh today --check                # 今天已投 X / 上限 N
 jh today --export md            # 导出到 output/（md 或 csv，只写新文件）
-jh apply 1 --status applied     # 投完打标（序号与 jh today 一致；也可 --job <id>）
+
+# ⑦ 零手打跟进（P4.5）—— 一条命令处理一整轮，不用敲 20 次
+jh apply 1 --status applied     # 投完打标（序号与 jh today 一致）
+jh apply 3=applied 7=replied    # ★ 批量打标：一次搞定一整轮
+jh apply "#12=replied"          # 按 job_id 打标（最不会认错，id 见 --pending）
+jh apply "字节" --status viewed  # ★ 模糊匹配公司/职位名；命中多条会列出来让你选
+jh apply --pending              # 看待处理清单：还没投的 + 投后 3/7/14 天没动静的
 ```
+
+**MVP 到此完成** —— 从零到能用的完整流程就是上面①~⑦：
+
+```
+jh init → jh resume add → jh job add <链接> → jh match run → jh gap
+       → jh today → jh today --copy N → 去招聘 App 粘贴投递 → jh apply N=applied
+       → 之后每天随便敲任何一条 jh 命令，顶部都会告诉你"有几条该跟进了"
+```
+
+> **顶部提醒**（P4.5）挂在 Typer 全局 callback 上，所以**任何** `jh` 命令开头都会显示：
+> ```
+> 📌 待处理：投后 3 天未跟进 3 条 ｜ 投后 7 天无动静 2 条 ｜ 投后 14 天建议放弃 1 条
+> （jh apply --pending 看待处理清单并批量打标）
+> ```
+> 没有待处理事项时**一个字都不打印**（否则第三天你就会把它关掉，然后连真有提醒时也看不见）。
+> `--no-remind` 或 `config.yaml` 的 `show_reminders: false` 可以关掉。
 
 打分口径（权重都在 `config.yaml` 的 `match_weights` 里，可调）：
 
@@ -177,7 +199,7 @@ jh apply 1 --status applied     # 投完打标（序号与 jh today 一致；也
 > ★ 判不出来的维度（比如 JD 太短、一个技能词都没抽到）会把权重**让给**其余维度，
 > 而不是给 0 分；`jh match explain` 里会写明 `redistributed`。
 
-> 当前进度：**P0 / P1 / P2 / P3 / P4 已完成**，其余命令仍是**占位**，
+> 当前进度：**P0–P4.5 已完成（★ MVP 完成）**，其余命令仍是**占位**，
 > 执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
 
 ### 开场白为什么"沾边且不编造"
@@ -213,7 +235,8 @@ jh apply 1 --status applied     # 投完打标（序号与 jh today 一致；也
 | **P2** | ⭐ `jh job add <url｜--file｜--manual>` 主路径 + 三层去重 | ✅ |
 | **P3** | ⭐ 共享层 + 两级匹配 + `jh match explain` + `jh gap` 反向缺口分析 | ✅ |
 | **P4** | ⭐ 待投清单 + 额度 + 开场白（完整/精简 + 防编造）+ 导出 + 投递打标 | ✅ |
-| **P4.5** | ⭐ 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | ⬜ 下一步 |
+| **P4.5** | ⭐ 零手打跟进（批量打标 + 模糊匹配 + 顶部固定提醒）→ **★ MVP 完成** | ✅ |
+| P5 | AI 定制简历（先 `tailor brief`，再完整版 + **FidelityGuard**） | ⬜ 下一步 |
 | P5 | AI 定制简历（先 `tailor brief`，再完整版 + **FidelityGuard**） | ⬜ |
 | P6 | 看板 + 面试 + 问题记录 + 笔试/Offer + 统计 + 报告 + `.ics` | ⬜ |
 | P7 | App 线索（降级为技术验证：1 平台 + `probe` + 手动抓屏） | ⬜ |
@@ -249,6 +272,7 @@ src/jobhunter/
 │                 greeting_svc（开场白：提示词 + 四道闸门 + 模板兜底）
 │                 fidelity（防编造校验，P5 的 FidelityGuard 复用）
 │                 today_svc / apply_svc / export_svc（待投清单 / 投递打标 / 导出）
+│                 reminder_svc（顶部待处理提醒，挂在全局 callback 上）
 ├── adapters/     外部世界：manual.py（人给 URL 抓详情，主路径）
 │                 + parse_html.py / parse_text.py（抓取与解析分开，见下）
 ├── llm/          base（Provider 契约）/ deepseek（DeepSeek 实现）/ mock（测试用）
