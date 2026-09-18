@@ -46,8 +46,14 @@ jobs:
         # 如果有人改了依赖却忘了提交 uv.lock，这里会红 —— 防止"我这儿能跑"
         run: uv lock --check
 
-      - name: 安装依赖（含 dev 组）
-        run: uv sync --locked --python ${{ matrix.python-version }}
+      - name: 安装依赖（含 dev 组与 docx extra）
+        # ★ `--extra docx` 不能省（ISSUES #16，实测踩到）：
+        #   `tests/unit/test_docx_reader.py`、`test_resume_svc.py`、`test_resume_cli.py`
+        #   顶部都是 `pytest.importorskip("docx")` —— 不装这个 extra 时
+        #   **73 条简历解析测试会被整体静默跳过**，而 CI 依然显示绿。
+        #   那等于"CI 在 Windows 上真验证简历解析"这件事从来没有发生过。
+        #   （其余 extra 不用装：browser/emulator 的测试带 marker，默认排除。）
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra docx
 
       - name: ruff 检查（含 PLW1514：强制显式 encoding）
         run: uv run ruff check .

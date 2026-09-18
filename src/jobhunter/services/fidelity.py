@@ -189,6 +189,14 @@ def check_text(
         #   只豁免第一道是不够的 —— 第二道会接着报"JD 没要求"，照样误报。
         if skill in extra_evidence:
             continue
+        # ★★ 动作/通用词（`部署`/`性能优化`/`单元测试`…）不按"技能声称"判（ISSUES #30）：
+        #   简历的技能栏永远不会写这些动词，但"我用 Docker 部署过项目"是**完全自然的真话**。
+        #   按技能判它 → 真话被标成谎话 → 整条开场白降级成模板
+        #   （实测发生过；用户视角是"我明明部署过，工具却说我编造"）。
+        #   ⚠️ 豁免**只限这一类动词/通用实践**：技术栈名字仍然严格
+        #   （Kubernetes 没写在简历里就是编造），数字与学历也照旧。
+        if skill in resume_svc.CAPABILITY_TERMS:
+            continue
         if skill not in pool:
             if skill in learning_whitelist and annotated:
                 continue  # 白名单 + 有"在学习"标注 → 允许

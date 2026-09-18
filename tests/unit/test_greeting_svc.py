@@ -139,6 +139,49 @@ def test_degree_claim_is_caught():
     assert fidelity.check_text("我是本科学历。", resume=make_content()).passed
 
 
+# ---------------------------------------------------------------------------
+# #30：动作/通用词不该被判成"编造"（真话被拦 = 用户会关掉这个检查）
+# ---------------------------------------------------------------------------
+def test_capability_terms_are_not_fabrication():
+    """★ "我用 Docker 部署过项目"是完全自然的真话，不该判成编造。
+
+    简历的技能栏永远不会写"部署""性能优化"这种动词，但它们确实在技能词表里
+    （JD 那边需要它们当需求信号）—— 于是防编造判定必须把这一类词排除在外，
+    否则真话被标成谎话，整条开场白会被降级成模板（实测发生过，ISSUES #30）。
+    """
+    resume = make_content(skills=["Python", "LangChain", "RAG", "Docker"])
+    report = fidelity.check_text(
+        "我用 Docker 部署过项目，也做过一些性能优化和单元测试。", resume=resume
+    )
+    fabricated = [item for item in report.violations if item.kind == "skill_not_in_resume"]
+    assert not fabricated, f"动作词被判成编造：{fabricated}"
+
+
+def test_capability_exemption_does_not_cover_technologies_around_them():
+    """★ 同一句话里，"部署"（动作词，豁免）与 Docker（技术栈，要证据）命运不同。
+
+    这条守的是"豁免的边界"：豁免动作词不等于放行它旁边的技术栈。
+    简历里没有 Docker 时，"我用 Docker 部署过"仍然要判编造。
+    """
+    report = fidelity.check_text("我用 Docker 部署过项目。", resume=make_content())
+    assert not report.passed
+    assert {item.token for item in report.violations} == {"Docker"}
+
+
+def test_technology_claims_are_still_strict():
+    """★ 豁免**只限**动作/通用词：技术栈名字仍然严格（这是防编造的核心价值）。"""
+    report = fidelity.check_text("我熟悉 Kubernetes 与 Milvus。", resume=make_content())
+    assert not report.passed
+    assert {item.token for item in report.violations} == {"Kubernetes", "Milvus"}
+
+
+def test_capability_terms_are_all_real_vocabulary_entries():
+    """`CAPABILITY_TERMS` 里的每个词都必须在技能词表里 —— 否则是死条目（写错了没人发现）。"""
+    vocabulary = resume_svc.load_skill_vocabulary()
+    missing = sorted(term for term in resume_svc.CAPABILITY_TERMS if term not in vocabulary)
+    assert not missing, f"这些豁免词不在技能词表里（拼错或已被删）：{missing}"
+
+
 def test_education_without_degree_does_not_crash():
     """★ `EducationItem` 没有 `raw_line` 字段 —— 曾经在 match_svc 里写过它。
 
