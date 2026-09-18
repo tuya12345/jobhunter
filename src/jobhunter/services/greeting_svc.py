@@ -598,7 +598,11 @@ def _settle_versions(
     final = {"full": parsed.full.strip(), "short": parsed.short.strip()}
     failures: dict[str, list[str]] = {}
 
-    def check(text: str, version: str) -> list[str]:
+    # ★ 这个内部函数**不要叫 `check`**：验证会话的合规红线测试会 AST 扫描所有 Call 节点，
+    #   而 `check` 是 Playwright 勾选框的写操作方法名（在禁用名单里）。
+    #   叫 `violations_of` 既准确（它返回"违反的约束"）又不会撞上那道守卫 ——
+    #   撞上时应当改自己的命名，而不是去放宽守卫（P4.5 实测踩到）。
+    def violations_of(text: str, version: str) -> list[str]:
         return _gate_reasons(
             text,
             version=version,
@@ -609,7 +613,7 @@ def _settle_versions(
         )
 
     for version in ("full", "short"):
-        reasons = check(final[version], version)
+        reasons = violations_of(final[version], version)
         if reasons:
             failures[version] = reasons
 
@@ -634,7 +638,7 @@ def _settle_versions(
                     fixed = (
                         repaired_parsed.full if version == "full" else repaired_parsed.short
                     ).strip()
-                    if fixed and not check(fixed, version):
+                    if fixed and not violations_of(fixed, version):
                         final[version] = fixed
                         repaired.append(version)
                         del failures[version]
