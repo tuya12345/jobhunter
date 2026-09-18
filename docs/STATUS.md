@@ -12,7 +12,19 @@
 **测试**：`pytest tests/unit` **412 passed**；`pytest tests/` = 574 passed / 0 failed（见 §4）
 **阶段标记**：`jh --version` = `phase P4.5`
 
-### 0. 本轮补记（真实 key 首次联调 + 按流程提交）
+### 0. 本轮补记（真实 key 首次联调 + 按流程提交 + 修掉两条 🟡）
+
+**⓪ 用户批准后修掉两条 🟡**（`153a3a3`）
+
+| ISSUE | 现象 | 改法 | 边界 |
+|---|---|---|---|
+| **#30** fidelity 误报 | 模型写"算法"，被判成"简历里没有这个技能" → **整条完整版降级成模板**。用户视角是"我明明做过，工具却说我编造" | `resume_svc.CAPABILITY_TERMS` 显式列出动作/通用词（部署、性能优化、单元测试、接口文档、并发、多线程、异步、需求分析、项目管理、敏捷开发、代码评审、响应式布局、前端工程化），`fidelity` 对这类词豁免 | 豁免**只限动词/通用实践**：**技术栈名字仍严格**（Kubernetes 没写进简历照样判编造）、**架构/模式类不豁免**（微服务/消息队列/设计模式/组件库）、数字与学历照旧。专有一条测试守这个边界 |
+| **#16** CI 静默跳过 | `uv sync --locked` 不带 `--extra` → 卸载 python-docx → 3 个文件的 `importorskip("docx")` 让 **73 条简历解析测试在 CI 上被整体跳过**，CI 却显示绿 | `ci.yml` 加 `--extra docx`，并把"为什么不能省"写进那一步的注释 | 只加 docx：全仓只有 docx 被 importorskip（playwright 没有任何测试用），browser/emulator 带 marker 默认排除 |
+
+**验证**：全量 **580 passed / 0 failed**；验证会话的三条对应用例（两条 #30 + 一条 #16）
+**由 XFAIL 转 XPASS**（xfail 标记归验证会话删，我没动那个文件）。
+⚠️ #16 我只能证明"本地等价步骤成立"（`uv sync --locked --extra docx --dry-run` 不再卸载 python-docx）——
+GitHub Actions 的实际结果我看不到（私密仓库 + 没装 gh）。
 
 **① 真实 LLM 路径终于跑通了，并立刻暴露一个 P4 的真缺陷**
 
