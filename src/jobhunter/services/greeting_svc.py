@@ -43,6 +43,7 @@ from jobhunter.config.settings import AppSettings, get_settings
 from jobhunter.llm import cache as llm_cache
 from jobhunter.llm.base import LLMMessage, LLMProvider, PromptPayload
 from jobhunter.llm.deepseek import DeepSeekError
+from jobhunter.llm.safety import wrap_delimited
 from jobhunter.models import Job
 from jobhunter.services import fidelity, match_svc, resume_svc
 from jobhunter.services.match_svc import ResumeCandidate
@@ -150,10 +151,17 @@ def build_payload(
     github = settings.greeting.github_url.strip()
     github_hint = f"\n我的 GitHub（可以附在结尾）：{github}" if github else ""
 
+    # ★ 用 `wrap_delimited()` 拼标签，**不要手拼 f"<jd>…</jd>"**：
+    #   `job.title` / `job.city` 是从招聘页面抓来的不可信文本，
+    #   里面写一个 `</jd>` 就能把标签提前闭合（ISSUES #29，与 #2 / #8 同一个洞）。
+    #   中和逻辑在 `wrap_delimited()` 内部完成，所以这里不可能忘。
+    jd_body = (
+        f"岗位：{job.title or '（未写职位）'} ｜ 城市：{job.city or '未写'}\n"
+        f"JD 要求的关键词：{'、'.join(keywords) or '（没抽到）'}"
+    )
     user_content = (
-        f"<jd>\n岗位：{job.title or '（未写职位）'} ｜ 城市：{job.city or '未写'}\n"
-        f"JD 要求的关键词：{'、'.join(keywords) or '（没抽到）'}\n</jd>\n\n"
-        f"<resume>\n{resume_text}\n</resume>\n\n"
+        f"{wrap_delimited('jd', jd_body)}\n\n"
+        f"{wrap_delimited('resume', resume_text)}\n\n"
         f"可用素材（只能从这里挑）：技能 {'、'.join(keywords) or '（无）'}\n"
         f"{project_hint}{github_hint}\n"
         f"请输出 json。"

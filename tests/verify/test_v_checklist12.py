@@ -255,8 +255,9 @@ def test_ci_does_not_install_optional_extras_but_tests_importorskip() -> None:
 @pytest.mark.parametrize(
     ("argv", "feature"),
     [
-        (["apply", "3=applied"], "投递打标"),
-        (["today"], "待投清单"),
+        (["apply", "3=applied"], "批量打标（P4.5）"),
+        (["apply", "--pending"], "待处理列表（P4.5）"),
+        (["apply", "--timeline", "1"], "投递时间轴（P6）"),
         (["tailor", "brief", "1"], "定制简历"),
         (["leads", "probe"], "App 线索探测"),
         (["leads", "capture"], "App 线索抓屏"),
@@ -274,6 +275,10 @@ def test_unimplemented_features_report_honestly(argv: list[str], feature: str) -
 
     这条同时是合规审计的一部分：**占位就是占位** ——
     只要这些命令还在 `not_implemented`，就不存在"自动投递"的可能性。
+
+    ★ 阶段推进时要同步维护这份清单（而不是删掉这条测试）：
+      P4 交付后 `jh today` 已是真功能，因此从"占位名单"里移出 ——
+      移出意味着它必须由**功能测试**来覆盖，不能两头都不管。
     """
     result = runner.invoke(app, argv)
     expected = EXIT_NOT_IMPLEMENTED

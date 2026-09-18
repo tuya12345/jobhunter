@@ -8,8 +8,23 @@
 
 ## P4 —— 待投清单 + 开场白 + 投递打标 + 导出
 
-**状态**：✅ 开发完成，**等待验证**
-**测试**：`pytest tests/unit` **386 passed**；`ruff check` / `format` 干净
+**状态**：✅ 开发完成 → 🔧 **一轮验证修复完成（3 个 🔴 已关闭）** + 一轮全项目复查，**等待复验**
+**测试**：`pytest` **550 passed, 21 xfailed, 0 failed, 0 xpassed**；`ruff check` / `format` 干净
+
+### 0. 本轮修复与复查（对应 `docs/REVIEW-P4.md` / `docs/ISSUES.md`）
+
+| ISSUE | 等级 | 修了什么 | 关键文件 |
+|---|---|---|---|
+| #29 | 🔴 | 开场白路径的 `<jd>` 可被标题里的 `</jd>` 逃逸 → **新增 `llm/safety.py`**：把"分隔标签约定 + 失效化"收成单点，并提供 `wrap_delimited(tag, body)` 作为**拼标签的唯一入口**（漏掉中和在结构上不再可能） | `llm/safety.py`（新）、`services/match_llm_svc.py`、`services/greeting_svc.py` |
+| #32 | 🔴 | `jh today` 生成 N 条开场白却只在最后 commit 一次 → 改**每完成一条就 commit**（与 `match_llm_svc._apply()` 同一条纪律） | `services/today_svc.py::ensure_item` |
+| #33 | 🔴 | 序号快照被本轮结果覆盖（`--limit` 缩短它、空结果清空它）→ 快照改存"**今天的完整达线清单**"（在 `limit` 之前取），且**空结果不写** | `services/today_svc.py` |
+| #44 | 🔴 隐私 | **开发会话自查发现**：`resume_svc.py` 注释里用了真实简历片段（真名 / 学校 / 打码手机号，共 6 处）→ 全部替换为虚构数据 | `services/resume_svc.py` |
+| — | — | 复查另一 AI 助手（WorkBuddy）的越界改动：**实质代码改动正确（已被更强的结构替代）、测试改动是收紧而非放宽、台账改动是纠正** → 全部保留、不回退；它的 `.workbuddy-ai/` 工作目录加入 `.gitignore` | `.gitignore` |
+
+> 详细记录见 `docs/ISSUES.md` 的"已关闭"一节（含 #29/#32/#33/#44 的改法与守住它们的测试，
+> 以及 WorkBuddy 越界改动的逐项复核结论）。
+> ⚠️ **#44 有一个需要用户拍板的遗留**：`git log` 的历史提交里仍含那些真实字符串 ——
+> 公开仓库前要么重写历史，要么接受痕迹。见 `docs/ISSUES.md` #44 的提醒。
 
 ### 1. 本阶段做了什么
 

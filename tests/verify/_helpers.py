@@ -276,8 +276,18 @@ def _docstring_constant_ids(tree: ast.AST) -> set[int]:
 
 
 def parse_module(path: Path) -> tuple[ast.Module, set[int]]:
-    """解析一个 .py，返回 (AST, 文档字符串节点 id 集合)。"""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    """解析一个 .py，返回 (AST, 文档字符串节点 id 集合)。
+
+    ★ 用 `utf-8-sig` 读：Windows 上很多工具（含 PowerShell 的 `Set-Content -Encoding UTF8`、
+      记事本"另存为 UTF-8"）会写 **BOM**；带 BOM 的源码交给 `ast.parse` 会直接 SyntaxError。
+      这一类"看不见的字符"正是本项目在简历解析里也踩过的坑（见 ISSUES #12/#15），
+      扫描器自己不该再踩一次。
+    """
+    source = path.read_text(encoding="utf-8-sig")
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:  # pragma: no cover - 源码语法错误时给出可定位的报错
+        raise AssertionError(f"无法解析 {path}：{exc}") from exc
     return tree, _docstring_constant_ids(tree)
 
 

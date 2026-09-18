@@ -172,6 +172,7 @@ def ensure_item(
 
     if candidate is None:
         application, _ = apply_svc.ensure_pending_application(session, job)
+        session.commit()  # 与下面同理：写了一条记录就落盘
         return TodayItem(
             index=index,
             job=job,
@@ -195,7 +196,12 @@ def ensure_item(
         greeting=greeting.full,
         greeting_variant=greeting.variant,
     )
-    session.flush()
+    # ★ 立刻 commit，而不是只 flush（ISSUES #32，P3 #3 的同类复发）：
+    #   这一条里可能有**真花了钱**的 LLM 调用（开场白）与缓存写入。
+    #   只 flush 的话事务一直开着，`jh today` 生成到第 7 条时 Ctrl+C，
+    #   前 6 条全部回滚 —— 钱花了、结果没了，重跑还要再花一次。
+    #   与 `match_llm_svc._apply()` 是同一条纪律：**每完成一条就落盘**。
+    session.commit()
     return TodayItem(
         index=index,
         job=job,
@@ -248,9 +254,23 @@ def build_today_list(
         result.items.append(
             ensure_item(session, job, index, settings=settings, provider=provider, variant=variant)
         )
-    session.flush()
-    # ★ 存快照：让"序号"在用户投完几条之后**仍然指向同一批岗位**
-    save_snapshot([item.job.id for item in result.items], settings)
+
+    # ★★ 快照 = 今天的**完整达线清单**（在 `limit` **之前**取），而且空结果不覆盖。
+    #    为什么不能在 `limit` 之后取（ISSUES #33，验证会话实测）：
+    #      `jh today --limit 3` 跑一次，快照就只剩 3 条 —— 序号 4/5 当天永久不可达，
+    #      而库里明明还有达线岗位；`jh apply 5` 会直接说"没有第 5 条"。
+    #      序号语义被一个**显示选项**悄悄改掉了。
+    #    为什么空结果不覆盖：
+    #      某次筛选为空（比如 `--min-score 999`）会把快照写成 `[]`；
+    #      而 `load_snapshot()` 对空列表返回 falsy → `resolve_index` 静默退回实时筛选，
+    #      此时序号指向的岗位与用户上次看到的清单**毫无关系** —— 正是最危险的情形。
+    #    语义一旦定成"今天的完整清单"，`--limit` 就只是"只看前 N 条"，
+    #    与 `resolve_index` docstring 的承诺（当天内始终指向同一批岗位）一致。
+    full_jobs, _total_all, _dropped_all = select_candidates(
+        session, min_score=min_score, limit=None, settings=settings
+    )
+    if full_jobs:
+        save_snapshot([job.id for job in full_jobs], settings)
     return result
 
 
@@ -265,8 +285,16 @@ def snapshot_path(settings: AppSettings) -> Path:
 
 def save_snapshot(
     job_ids: list[int], settings: AppSettings, *, now: datetime | None = None
-) -> Path:
-    """把本次清单的岗位顺序写进 state/（供 `--copy N` 与 `jh apply N` 复用）。"""
+) -> Path | None:
+    """把清单的岗位顺序写进 state/（供 `--copy N` 与 `jh apply N` 复用）。
+
+    ★ **空列表不写**（ISSUES #33）：一次筛选为空就把当天的序号基准擦掉，
+      会让 `load_snapshot` 返回 falsy 而静默退回实时筛选 —— 序号含义与用户
+      上次看到的清单完全不同，这比"没有快照"危险得多。
+      调用方本来就该传"今天的完整达线清单"，空的时候保持原快照不动。
+    """
+    if not job_ids:
+        return None
     path = snapshot_path(settings)
     payload = {
         "date": to_local(now or now_utc()).strftime("%Y-%m-%d"),
@@ -309,6 +337,11 @@ def resolve_index(
       说的"最致命的误操作"。
       存了快照之后，序号在**当天内**始终指向同一批岗位；
       快照不存在（没跑过 `jh today`）才退回实时筛选。
+
+    ★ 序号的定义（ISSUES #33 之后定死，别再含糊）：
+      快照存的是"**今天的完整达线清单**"（同公司去重之后、`--limit` 截断**之前**）。
+      所以 `jh today --limit 3` 只影响**显示和生成**的条数，
+      不影响序号含义 —— `jh apply 5` 照样能找到第 5 个达线岗位。
     """
     job_ids = load_snapshot(settings)
     if job_ids:

@@ -1,7 +1,7 @@
 # ISSUES —— 验证问题台账
 
 > **协作规则**
-> - 验证会话产出 `docs/REVIEW-P3.md`（完整报告），本文件是**问题清单 + 开发角色的处理台账**。
+> - 验证会话产出 `docs/REVIEW-P*.md`（完整报告），本文件是**问题清单 + 开发角色的处理台账**。
 > - 每条问题一行：来源、等级、状态、处理结论（**改了哪个文件、怎么改的、有没有测试守住**）。
 > - 🔴 直接修，修完在本文件关闭；🟡 / 🟢 先与用户确认再定。
 > - **测试由验证会话负责**：本台账里不出现"我改了测试让它过"这种处理方式。
@@ -10,39 +10,65 @@
 
 等级约定：🔴 阻断 / 必须修　🟡 建议修　🟢 观察项
 
+**当前进度**：P3 的 3 个 🔴 已修复并复验通过。
+P4 的 3 个 🔴（#29 / #32 / #33）**已修复** —— 见"已关闭"。
+全量测试：**550 passed, 21 xfailed, 0 failed, 0 xpassed**。
+剩余：🟡 22 条 / 🟢 13 条（等用户确认后逐条定）。
+
+> 📌 **P4 复查记录（2026-09-18，开发会话）**：本轮"重新检查整个项目"时确认
+> 另一个 AI 助手（WorkBuddy）曾越界改动过本项目 —— 详见 `notes/2026-09-18-工作区改动清单.md`。
+> 开发会话逐项复核了它的改动，结论记在"已关闭 · 复核查证"一节：
+> **实质代码改动是正确的（且已被更强的结构替代）、测试改动是收紧而非放宽、台账改动是纠正**，
+> 因此**全部保留不回退**。另外自查发现并修掉一条它没查到的隐私缺陷（#44）。
+
 ---
 
-## 未关闭
+## 未关闭 · P4 的 🟡 / 🟢（8 + 4）
 
 | 编号 | 来源 | 阶段 | 等级 | 问题 | 状态 |
 |---|---|---|---|---|---|
-| #4 | 验证 | P3 | 🟡 | `AI大模型` / `LLM大模型` 这类连写抽不到（中文分支左边界 `(?<![A-Za-z0-9_])` 被前一个 ASCII 字母否掉，`resume_svc.py:400`） | 待用户确认 |
-| #5 | 验证 | P3 | 🟡 | `大模型` 既是内置规范名（`resume_svc.py:260`）又是 `LLM` 的别名（`config.yaml:52`）→ 一句"大模型"抽成 `['LLM','大模型']` 两个关键词：技能分母被灌水 + **假缺口**（简历写了 LLM 却报"缺 大模型"） | 待用户确认 |
-| #6 | 验证 | P3 | 🟡 | 抽词前不做 NFKC → 全角 `Ｐｙｔｈｏｎ` 静默漏抽（`match_svc.py:330` 直接把原始 `jd_text` 交给 `_match_any`；`parse_text.normalize_text` 已有 NFKC 能力但没被用在这条路上） | 待用户确认 |
-| #7 | 验证 | P3 | 🟡 | `io.py:18` 声称的"第二层防护 ruff `PLW1514`"**没有生效**：该规则是 preview，`pyproject.toml` 无 `preview = true`、`ci.yml:53` 无 `--preview`；实测 ruff 输出 `warning: Selection 'PLW1514' has no effect because preview is not enabled.` | 待用户确认 |
-| #8 | 验证 | P3 | 🟡 | 表头五字段 `company/title/city/experience/education`（`match_llm_svc.py:195-198`）与 `rule_hint`（`:202`）**裸拼在 `<jd>` 标签之外** → 把指令写进公司名即可绕过标签防护 | **已随 #2 顺手修**（见下），等用户确认后关闭 |
-| #9 | 验证 | P3 | 🟡 | **无信息量的 JD 拿到 80 分**（分数线 60）：`title/company/jd_text` 全空时，技能维度判不出来（权重 40 被让掉）+ 方向 0.6 中性 + 硬条件 1.0 → 80 分。与已修的"JD 写得越少技能分越高"是同类问题的更大尺度复发（`match_svc.py:833-852`） | 待用户确认 |
-| #10 | 验证 | P3 | 🟡 | HTTP 200 但响应体不是 JSON（网关返回 HTML）时抛**裸 `JSONDecodeError: Expecting value: line 1 column 1`**，不告诉用户"响应不是 JSON"（`deepseek.py:208`） | 待用户确认 |
-| #11 | 验证 | P3 | 🟡 | pydantic 非严格模式：`{"score": true}` 被当成 **1 分**接受（`match_llm_svc.py:107` 无 `StrictInt`/`strict=True`）→ 与模块 docstring「分数越界即校验失败、**不做静默截断**、绝不猜」矛盾 | 待用户确认 |
-| #12 | 验证 | P1 | 🟡 | 非 UTF-8（GBK）简历与损坏 docx 只报**原始 Python 异常**（`UnicodeDecodeError` / `PackageNotFoundError`），没有中文可操作提示（`resume_cmd.py:117-120`）；对比"空文档"分支有详细中文说明，口径不一致 | 待用户确认 |
-| #13 | 验证 | P2 | 🟡 | `jh job add --file` 读取阶段**不去重**（`job_cmd.py:376-387`）→ 同一 URL 各抓一次，白白多一次对外请求 + 多等一个 2–5s 随机延时（与"频率克制"精神相悖） | 待用户确认 |
-| #14 | 验证 | P2 | 🟡 | `--file` **无 scheme 白名单、无条数上限**（`job_cmd.py:337-351`）→ `file:///C:/Windows/win.ini`、`http://127.0.0.1` 会原样进抓取队列；一次可喂 5000 行（每行 2–5s → 连续对外请求数小时） | 待用户确认 |
-| #15 | 验证 | P1 | 🟡 | 纯空白 `.txt` 被当成**"成功导入的空简历"**（`docx.py:103` 的 `splitlines()`+`rstrip` 让 `lines` 非空，`resume_svc.py:1980` 的 `if not result.lines` 判不到）→ 库里多一份 0 技能/无姓名的简历，而且**因"第一份自动成为默认"变成后续所有匹配的参照物** | 待用户确认 |
-| #16 | 验证 | P0 | 🟡 | CI 的 `uv sync --locked`（`ci.yml:50`）**不装 optional extras**（实测 dry-run 会 uninstall `python-docx==1.2.0`、`playwright==1.62.0`），而 3 个测试文件顶部用 `pytest.importorskip("docx")` → **73 条简历解析测试在 CI 上被静默跳过**。即"CI 在 windows 上真验证简历解析"没有发生 | 待用户确认（一行可修） |
-| #17 | 验证 | P3 | 🟡 | 改了简历重跑规则层后，上一次的 `llm_score` 仍被当成 `match_score`（`match_svc.py:1073` 的合成规则 `llm_score if not None else rule_score`）→ 用户看到"改了简历分数纹丝不动"，正是评审采纳项 #3 点名的症状（发生在库里的历史值而非缓存命中） | 待用户确认 |
-| #18 | 验证 | P0 | 🟢 | `rate_limit.max_pages`（默认 3，`config.yaml:120` 也写了）**全仓库无任何读取点**（只有定义 + `base.py:132` 形参）→ 配置像约束、实为装饰。当前无搜索功能故无暴露 | 待定 |
-| #19 | 验证 | P2 | 🟢 | 硬编码伪造桌面 Chrome UA（`manual.py:225-229` 写死 `Chrome/124.0.0.0`），客观上隐藏了默认 UA 里的 HeadlessChrome 标识。无 `navigator.webdriver` 抹除、无 stealth、无 Cookie 复用，**不构成风控规避**，但建议在 README/COMPLIANCE 里如实写明 | 待定 |
-| #20 | 验证 | P2 | 🟢 | 去重白名单里 `url` 会被**无条件覆盖**（`job_svc.py:91` + `:365`），而 `platform_job_id` 有"只在库内为空时补"的保护（`:350-357`）；`source_keyword` 也会被后续 upsert 改写 → 影响渠道复盘统计 | 待定 |
-| #21 | 验证 | P2 | 🟢 | 文档口径矛盾：`README.md:191,224` 写"**三**层去重"，`docs/roadmap.md:44,368` 与 `docs/architecture.md:368` 写"**两**层"（architecture 4.6 节又列了 ①②③+否决） | 待定 |
-| #22 | 验证 | P0 | 🟢 | 承诺"真实 LLM 抽样检查放 `@pytest.mark.live`、只在 nightly 跑"，但 `tests/` 内 **marker 零使用**（只有 `tests/__init__.py:6-7` 的注释），仓库也**没有 nightly workflow**（只有 `ci.yml`）。当前无风险（因为根本没有 live 测试），但承诺未落地 | 待定 |
-| #23 | 验证 | P3 | 🟢 | `reasoning_content` 从不读取（`deepseek.py:212-215` 只取 `message.content`）→ 若换成 `deepseek-reasoner` 且输出被截断只回了推理内容，会判空、白付 token 后降级 | 待定 |
-| #24 | 验证 | P3 | 🟢 | 缓存 key 只覆盖 `prompt_version/model/jd_hash/resume.content_hash`（`cache.py:70-93`），但 prompt 里还有 `rule_hint`（随 `match_weights`/`skill_aliases` 变）与表头字段 → **改了权重会静默复用旧分**（与"改 prompt 要 bump PROMPT_VERSION"的纪律同源，但权重不在版本号里） | 待定 |
-| #25 | 验证 | P3 | 🟢 | `llm_cache` 无 TTL、全仓库无清理/统计入口（`models/llm_cache.py`、`cache.py`）；`jh stats` 是 P6 占位 → 缓存会无限增长且成本无汇总出口 | 待定 |
-| #26 | 验证 | P3 | 🟢 | 缓存命中时把**历史** tokens/cost 累加进"本次"统计（`match_llm_svc.py:424-426`）→ 结尾打印的金额 ≠ 本次实际支出（口径问题，不是算错） | 待定 |
-| #27 | 验证 | P3 | 🟢 | `jh match run` 对所有岗位打分，**包含已 `applied`/`skipped` 的**（`STATUS.md` §3.5 已自述）→ 已投递岗位的分数会随简历变化而变动，可能干扰"投递时的分数"回溯 | 待定 |
-| #28 | 验证 | P0 | 🟢 | `.env` 里含**真实姓名与简历路径**（`JH_DEFAULT_RESUME_PATH`）。已被 `.gitignore` 覆盖且 `git ls-files --error-unmatch .env` 失败（确认未跟踪）→ 不构成泄露，仅提醒：`.env` 不要分享/贴图；日志脱敏也不覆盖姓名与**文件名**（`resume_svc.py:1065`、`docx.py:212`） | 待定 |
+| #30 | 验证 | P4 | 🟡 | **真话被判成编造（误报）**：`部署`/`性能优化`/`单元测试`/`需求分析` 等**动作词在技能词表里**，而 `resume_skill_pool` 只读 `skills`/`project.skills`/`internship.skills` 三个结构化字段（`resume_svc.py:445-450`）→ 「用 Docker 部署过项目」被判 `skill_not_in_resume`，**整条完整版被降级成模板**。开发会话自己在 STATUS §6 就担心"误报多了这个检查会被关掉" | 待用户确认 |
+| #31 | 验证 | P4 | 🟡 | **闸门 ③ 只兑现一半**：`_gate_reasons` 传 `allowed_skills=set(keywords) | set(candidate.pool)`（`greeting_svc.py:252`），而 `pool ⊇ keywords` → `fidelity` 里 `skill not in allowed_skills and skill in pool` **永远为假**，`skill_not_in_jd` 成**死代码**。docstring 承诺"只提 JD 关键词 ∩ 简历技能"，实际只保证"不许提简历外的技能 + 至少提一个关键词" | 待用户确认 |
+| #34 | 验证 | P4 | 🟡 | **`--copy N` 静默忽略 `--min-score` / `--limit`**：`_copy_nth` 收了 `min_score` 形参却从不使用 → `today --copy 2 --min-score 999` 照常复制第 2 条。静默忽略选项比报错更糟（用户以为筛选生效了） | 待用户确认 |
+| #35 | 验证 | P4 | 🟡 | **`candidates` 计数名实不符**：`total` 在"排掉已有非 pending 投递"**之后**才统计（`today_svc.py:133-134`），而它是 UI 上「过滤前达线 N 条」的来源（docstring `:90`）→ 用户误判"今天还有多少机会" | 待用户确认 |
+| #37 | 验证 | P4 | 🟡 | **`greeting_sent` / `greeting_edited` 两列恒为 0**：`set_status` 的这两个形参无任何调用方传参（全仓确认）→ 闭环信息只落在事件流；任何直接读列的统计会得出"从未用过话术"。另：先 `jh apply N --status applied` 再生成开场白时，**不会补写 `greeting_sent` 事件**（`apply_svc.py:184` 要求 `changed`） | 待用户确认 |
+| #38 | 验证 | P4 | 🟡 | **导出"绝不覆盖"不是硬保证**：`unique_path` 是"时间戳 + `exists()` 检查"的概率性命名（`export_svc.py:44-52`），而 `utils/io.write_text` 内部是 `os.replace` **无条件覆盖**、无 `O_EXCL`（`io.py:154-169`）→ 同进程 TOCTOU、跨进程更明显 | 待用户确认 |
+| #39 | 验证 | P4 | 🟡 | `TodayItem` 在"库里没有简历"分支构造时**漏传 `job`**（`today_svc.py:173-181`），而渲染读 `item.job.city`（`today_cmd.py:180`）→ 该路径一旦被触达即 `AttributeError`。当前不可达（无简历时走另一分支），属潜在崩溃点 | 待用户确认 |
+| #40 | 验证 | P4 | 🟢 | 导出物**没有 job_id**（只能靠序号对应），批量打标/复盘时不便；且含**简历名称**（隐私面比预期略宽） | 待定 |
+| #41 | 验证 | P4 | 🟢 | `--copy N` 每次都**重新调 LLM 生成**（即使库里已有开场白），且新生成的文本**不覆盖库里旧值** → 屏幕显示与库内内容可能不一致 | 待定 |
+| #42 | 验证 | P4 | 🟢 | `EVENT_TYPES` 的 8 个取值里生产代码只写 2 个（`status_change` / `greeting_sent`），其余 6 个属 P5/P6；`event_type` 列无 CHECK 约束（`models/constants.py:10-11` 说留到 P6）→ 拼错的事件类型会静默入库 | 待定 |
+| #43 | 验证 | P4 | 🟢 | `learning_whitelist` 无任何校验（`settings.py:192`）；`greeting_banned_words` 只去空不校验内容。配置写错不会有提示 | 待定 |
 
-> 🟡 条目共 14 条（#4–#17），按用户指示**先不动**，等确认后再逐条定。
+## 未关闭 · P3 阶段遗留的 🟡 / 🟢（按用户指示暂不动）
+
+| 编号 | 阶段 | 等级 | 问题 | 状态 |
+|---|---|---|---|---|
+| #4 | P3 | 🟡 | `AI大模型` / `LLM大模型` 这类连写抽不到（中文分支左边界被前一个 ASCII 字母否掉，`resume_svc.py:400`） | 待用户确认 |
+| #5 | P3 | 🟡 | `大模型` 既是内置规范名又是 `LLM` 的别名 → 一句"大模型"抽成两个关键词：分母灌水 + **假缺口** | 待用户确认 |
+| #6 | P3 | 🟡 | 抽词前不做 NFKC → 全角 `Ｐｙｔｈｏｎ` 静默漏抽 | 待用户确认 |
+| #7 | P3 | 🟡 | `io.py:18` 声称的"第二层防护 ruff `PLW1514`"**没有生效**（preview 规则，未开 `preview = true`；`ci.yml:53` 也无 `--preview`） | 待用户确认 |
+| #9 | P3 | 🟡 | **无信息量的 JD 拿到 80 分**（分数线 60）→ 会出现在待投清单里 | 待用户确认 |
+| #10 | P3 | 🟡 | HTTP 200 + 非 JSON 响应体抛**裸 `JSONDecodeError`** | 待用户确认 |
+| #11 | P3 | 🟡 | pydantic 非严格模式：`{"score": true}` 被当成 **1 分**接受 | 待用户确认 |
+| #12 | P1 | 🟡 | 非 UTF-8（GBK）简历与损坏 docx 只报原始 Python 异常，无中文可操作提示 | 待用户确认 |
+| #13 | P2 | 🟡 | `jh job add --file` 读取阶段不去重 | 待用户确认 |
+| #14 | P2 | 🟡 | `--file` 无 scheme 白名单、无条数上限 | 待用户确认 |
+| #15 | P1 | 🟡 | 纯空白 `.txt` 被当成"成功导入的空简历"并自动成为默认简历 | 待用户确认 |
+| #16 | P0 | 🟡 | CI 的 `uv sync --locked` 不装 optional extras → **73 条简历解析测试在 CI 上被静默跳过**（一行可修） | 待用户确认 |
+| #17 | P3 | 🟡 | 改了简历重跑规则层后，上一次的 `llm_score` 仍被当成 `match_score` | 待用户确认 |
+| #18 | P0 | 🟢 | `rate_limit.max_pages` 无任何读取点 | 待定 |
+| #19 | P2 | 🟢 | 硬编码伪造桌面 Chrome UA（轻度指纹隐藏） | 待定 |
+| #20 | P2 | 🟢 | 去重白名单里 `url` / `source_keyword` 会被覆盖 | 待定 |
+| #21 | P2 | 🟢 | 文档口径矛盾：README"三层去重" vs roadmap/architecture"两层" | 待定 |
+| #22 | P0 | 🟢 | `live`/`emulator` marker 注册但**零使用**，且无 nightly workflow | 待定 |
+| #23 | P3 | 🟢 | `reasoning_content` 从不读取 | 待定 |
+| #24 | P3 | 🟢 | 缓存 key 不覆盖 `rule_hint`/表头字段（改权重会静默复用旧分） | 待定 |
+| #25 | P3 | 🟢 | `llm_cache` 无 TTL、无清理入口 | 待定 |
+| #26 | P3 | 🟢 | 缓存命中时把历史 tokens/cost 累加进"本次"统计 | 待定 |
+| #27 | P3 | 🟢 | `jh match run` 对所有岗位打分（含已 `applied`/`skipped`） | 待定 |
+| #28 | P0 | 🟢 | `.env` 含真实姓名与简历路径（已 gitignore，仅提醒） | 待定 |
+
+> 🟡 合计 22 条、🟢 合计 13 条。
 > 其中 **#16 是一行的事**（`ci.yml` 加 `--extra docx`），且它让"CI 在 Windows 上真验证简历解析"
 > 从"没有发生"变成"发生" —— 已就绪，等一句话即可改。
 
@@ -52,97 +78,178 @@
 
 | 编号 | 来源 | 阶段 | 等级 | 摘要 | 处理 |
 |---|---|---|---|---|---|
-| #1 | 验证 | P3 | 🔴 | 中文紧邻英文技能整词漏抽（`\b` 是 Unicode 语义） | ✅ 见下 |
-| #2 | 验证 | P3 | 🔴 | JD 自带 `</jd>` 可提前闭合标签 | ✅ 见下 |
-| #3 | 验证 | P3 | 🔴 | LLM 层只 flush 不 commit → 花了钱的结果会丢 | ✅ 见下 |
+| #1 | 验证 | P3 | 🔴 | 中文紧邻英文技能整词漏抽（`\b` 是 Unicode 语义） | ✅ 复验通过 |
+| #2 | 验证 | P3 | 🔴 | JD 自带 `</jd>` 可提前闭合标签 | ✅ 复验通过 |
+| #3 | 验证 | P3 | 🔴 | LLM 层只 flush 不 commit → 花了钱的结果会丢 | ✅ 复验通过（**但 P4 的 `jh today` 路径复发了同类问题 → #32**） |
+| #8 | 验证 | P3 | 🟡 | 表头五字段裸拼在 `<jd>` 标签之外 | ✅ **已修完并复验** —— 注意 `4a120f8` 的第一版**只修了一半**（见下） |
+| #29 | 验证 | P4 | 🔴 | 开场白的 `<jd>` 标签仍可被逃逸（`greeting_svc` 未中和） | ✅ 已修（见下） |
+| #32 | 验证 | P4 | 🔴 | `jh today` 花钱生成 N 条开场白却只在最后 commit 一次 | ✅ 已修（见下） |
+| #33 | 验证 | P4 | 🔴 | 序号快照被本轮结果覆盖：`--limit` 缩短它、空结果清空它 | ✅ 已修（见下） |
+| #44 | **开发自查** | P1→P4 | 🔴（隐私） | `resume_svc.py` 注释里用了**真实简历片段**：真名"黄欢"（5 处）、学校"桂林航天工业学院"、打码手机号"150\*\*\*\*8211" | ✅ 已修（见下） |
 
-### #1 中文紧邻英文技能整词漏抽 —— 已修
+### #29 / #32 / #33 —— P4 的 3 个 🔴 修复记录（2026-09-18）
 
-**改了什么**：`src/jobhunter/services/resume_svc.py::_alias_pattern()`
-ASCII 分支的**左边界**从 `\b` 改为 `(?<![A-Za-z0-9_])`，与右边界 `(?![A-Za-z_])` 对称。
-同时把"两侧都不能用 `\b`"的成因写进注释与函数 docstring（原先的注释还在教人用 `\b`，属于过期说明）。
-
-**为什么是这个改法**：`\b` 的边界基于 `\w`，而 Python 的 `\w` **包含汉字** →
-"悉"与"J"之间没有词边界。只看 ASCII 字母数字下划线做边界，汉字就成了合法边界，
-而 `XJava`（前面是 ASCII 字母）仍被正确拒绝。右边界**保留不含数字**的写法，
-这样 `Vue3` / `TypeScript5` 仍能命中。
-
-**实测效果**（原来整句只抽到 0~2 个词）：
-```
-JD: 熟悉Java开发，用Go写过高并发服务，熟练Python编程，使用Docker部署，了解MySQL与Redis
-抽出: Python、Java、Go、MySQL、Redis、并发、Docker
-```
-
-**守住它的测试**：
-- `tests/unit/test_resume_svc.py::test_ascii_skill_adjacent_to_chinese_is_matched`
-  （5 条参数化：`熟悉Java开发` / `用Go写后端服务` / `熟练Python编程` / `使用Docker部署服务` / `掌握Vue3组件开发`）
-- `tests/unit/test_resume_svc.py::test_adjacency_does_not_break_word_boundary`
-  （反向断言：`熟悉JavaScript开发` 不命中 Java、`用过Google分析` 不命中 Go、`XJava开发` 被拒）
-- 验证会话的 `tests/verify/test_v_boundary.py` 那 7 条 red 全部转绿。
-
-**对既有数据的影响**：真实简历重新解析后技能数与 `content_hash` **完全不变**
-（它的技能栏本来就用 `、` 分隔，没踩到这个坑）→ 不需要重导、缓存不会失效。
-
-### #2 JD 自带 `</jd>` 可提前闭合标签 —— 已修
-
-**改了什么**：`src/jobhunter/services/match_llm_svc.py`
-1. 新增 `_neutralize_delimiters()`：把文本里形如 `</jd>` / `<jd>` / `</resume>` / `</ jd >`
-   的片段（大小写不敏感、容忍标签内空白）的尖括号换成全角 `＜＞`。
-   JD 正文与简历摘要**都过一遍**。
-2. 表头五字段（公司/职位/城市/经验/学历）从标签外**移进 `<jd>` 标签内**
-   （它们来自页面抓取，同样是用户可控文本）。
-3. 提示词结构改为先给标签再给正文，`rule_hint`（我们自己生成的锚点）留在标签外。
-
-**为什么"换成全角尖括号"而不是删掉**：删掉会让 JD 与原文不一致，而排障时希望任何改动都看得见；
-全角版本人还能看出这里原本写过 `<jd>`，但语义上不再是标签。**故意不用零宽字符**
-（不可见字符会让日志和排错变得难以理解）。
-
-**守住它的测试**：
-- `tests/unit/test_match_llm.py::test_jd_cannot_close_its_own_delimiter`（新增）
-- `tests/unit/test_match_llm.py::test_prompt_satisfies_json_mode_requirements`（**按指示收紧**）：
-  从「标签存在」改为「`<jd>` 与 `</jd>` 各恰好 1 个 + JD 正文/公司名/职位名都落在闭合标签之前」
-- 验证会话的 `tests/verify/test_v_adversarial.py::test_jd_cannot_close_its_own_delimiter` 转绿。
-
-### #3 LLM 层只 flush 不 commit —— 已修
-
-**改了什么**：`src/jobhunter/services/match_llm_svc.py::_apply()` 的收尾从 `session.flush()`
-改为 `session.commit()`；模块 docstring 与函数 docstring 同步改为"立刻 commit 落盘"。
-
-**为什么 commit 放在 `_apply()` 而不是调用方**：缓存行（`llm_cache`）与岗位分（`jobs.llm_score`）
-是**同一条结果**，必须在同一事务里提交，否则可能出现"缓存里有、岗位上没有"
-（下次命中缓存却仍显示没分）。这一次 commit 同时覆盖 `put_cached()` 的写入与字段更新。
-
-**并发安全性**：每个任务的 DB 段是同步的（唯一的 `await` 在调 Provider 处），
-不存在"A 提交到一半被 B 插进来"；`sessionmaker` 设了 `expire_on_commit=False`，
-提交后对象不过期，后续任务继续复用同一 Session。已写进 `_apply()` 的 docstring。
-
-**守住它的测试**：验证会话的
-`tests/verify/test_v_failure.py::test_llm_results_are_durable_without_the_cli_commit`
-（跑完 LLM 层**不调用 CLI 的 commit**，用新连接必须能看到 `llm_cache` 行与 `jobs.llm_score`）→ 转绿。
-
----
-
-## 附：验证会话的 xfail 标记处理
-
-修完 3 个 🔴 后复跑 `pytest tests/verify -q -ra`：**105 passed, 15 xfailed, 1 xpassed, 0 failed**。
-
-**新增 1 条 XPASS（请删除它的 `xfail` 标记）**：
-
-| 用例 | 对应 ISSUE | 为什么会 XPASS |
+| ISSUE | 根因 | 改了什么 |
 |---|---|---|
-| `tests/verify/test_v_adversarial.py::test_untrusted_job_header_fields_are_inside_a_delimiter` | **#8（🟡）** | 按 #2 的指示"顺手把表头五字段也放进标签内"，这条的断言已经成立 → 从 xfail 变成 XPASS |
+| **#29** | `_neutralize_delimiters` 是 `match_llm_svc` 的**私有函数**，`greeting_svc` 是另一份 `build_payload`，整条路径没中和 → 标题里写 `</jd>` 即可逃逸 | **新增 `src/jobhunter/llm/safety.py`**：把"分隔标签约定 + 失效化"收成一个单点，并提供 `wrap_delimited(tag, body)` —— **拼标签的唯一入口**，中和在内部完成。`match_llm_svc` 与 `greeting_svc` 都改用它（不再手拼 `f"<jd>…</jd>"`） |
+| **#32** | `ensure_item` 只 `flush()`，唯一的 `commit()` 在整张清单生成完之后 → 生成到一半中断，前面花掉的钱全回滚 | `ensure_item` 每条**结束即 `commit()`**（含"没有简历"那条分支）。纪律与 `match_llm_svc._apply()` 一致：**每完成一条就落盘** |
+| **#33** | `build_today_list` 无条件用**本轮（可能被 `--limit` 截断的）结果**覆盖快照 | 快照改成存"**今天的完整达线清单**"（`limit` **之前**取）；`save_snapshot()` **空列表直接返回不写**（空结果不再擦掉当天序号基准）。序号语义写进 `resolve_index` docstring：`--limit` 只影响显示与生成条数，不影响序号含义 |
 
-其余 15 条 xfail 保持 XFAIL（🟡 未修，符合预期）。
-> ⚠️ #8 的**主要问题**（表头字段在标签外）已随 #2 修掉，但 `rule_hint` 仍在标签外 ——
-> 它由我们自己生成（不含用户输入），风险低；是否也要收进标签内，等你确认。
+**为什么 #29 要新开一个模块、而不是"再补一个字段"**：`#2`（`jd_text`）→ `#8`（表头字段）→ `#29`（greeting 路径）
+是**同一个洞的三次现身**，前两次都是"补一个调用点"。这次把中和逻辑与"拼标签"绑成同一个入口，
+**漏掉中和在结构上不再可能**（除非有人绕过 `wrap_delimited` 去手拼字符串）。
+
+**守住它们的测试**：
+- `tests/verify/test_v_p4_greeting.py::test_greeting_prompt_neutralizes_delimiters`
+- `tests/verify/test_v_p4_today.py::test_today_greetings_are_durable_without_the_cli_commit`
+- `tests/verify/test_v_p4_today_cli.py::test_snapshot_is_not_shrunk_by_limit` / `test_empty_selection_does_not_erase_todays_snapshot`
+- `tests/verify/test_v_adversarial.py::test_untrusted_job_header_fields_are_inside_a_delimiter`（五字段逐个断言）
+
+**结果**：全量 **550 passed, 21 xfailed, 0 failed, 0 xpassed**（修前 546 passed / 4 failed）。
+
+### #44 —— 隐私缺陷（开发会话自查发现，与上一条 3 个 🔴 无关）
+
+**发现方式**：P4 复查时按"重新检查整个项目"做**隐私关键词扫描**（真名 / 学校 / 手机号片段），
+而不是只看 `.gitignore` 与测试。**验证会话前几轮的隐私扫描没有覆盖这一类**
+（`REVIEW-P3.md` C1b 的结论是"只有 fixture 占位"）—— 因为它扫的是手机号/邮箱**格式**，
+而这里泄露的是**姓名与学校名**（没有固定格式，只能按已知值反查）。
+
+**实证**（修复前）：
+
+| 位置 | 内容 |
+|---|---|
+| `resume_svc.py:665` | `姓 名 ：黄欢求职意向 ：Agent开发` |
+| `resume_svc.py:666` | `学 校 ： 桂林航天工业学院 手机号码 ：150****8211` |
+| `resume_svc.py:690` / `:1130` | 同一段真名示例（说明"标签连排"的切分规则） |
+| `resume_svc.py:1198` / `:1216` | 姓名判据举的例子是 `黄欢` |
+
+**为什么严重**：仓库**将来要公开**（用户明确说过），而这些字符串来自**用户真实简历**，
+与 `.gitignore` 挡住的 docx 是同一份数据。`git log` 里也已经存在（`50bd5a75`，P1 期间写下的）。
+
+**修法**：全部替换成**虚构数据**（`林小满` / `虚拟大学` / `13800000000`，与 `tests/fixtures` 的虚构身份一致），
+并在那段注释上写明"示例必须是虚构数据"的原因，防止下次再抄真实简历。
+
+**复验**：`git grep -E '黄欢|桂林航天|150\*\*\*\*8211'` → **零命中**。
+
+> ⚠️ **遗留提醒**：`git log` 里的历史提交仍含这些字符串。
+> 公开仓库前要么**重写历史**（`git filter-repo`），要么**接受它有痕迹**（仓库当前是私密的）。
+> 这一条我没动手 —— 改历史会影响你本地与远端的既有提交，需要你先拍板。
 
 ---
 
-## 附：P4 / P5 未到期但**必须在阶段内兑现**的两条红线
+### 复核查证：另一个 AI 助手（WorkBuddy）越界改动的处理结论
 
-这两条不算 P3 的问题，但登记在此以免遗忘（详细论证见 `docs/REVIEW-P3.md` §B1 与 §D）：
+**背景**：用户 2026-09-18 发现另一个 AI 助手（当时负责 `projects/stageboard`）曾越界修改本项目。
+它自己写了一份改动清单：`notes/2026-09-18-工作区改动清单.md`（工作区文件，不在本仓库内）。
+
+**开发会话逐项复核结论**：
+
+| 它的改动 | 复核结论 | 处置 |
+|---|---|---|
+| `src/jobhunter/services/match_llm_svc.py`：`header` 过一次 `_neutralize_delimiters`（+9/−1） | **技术上正确**：把 `</jd>` 写进公司名/职位名等五个字段确实能逃逸（它给了探针与逐字段实测）。但**只覆盖了一个调用点**，是同一根因的第 2 次"补丁式"修复 | **已被 #29 的 `wrap_delimited()` 结构替代**（更强：所有字段 + 所有模块都走同一个入口）。不回退 |
+| `tests/verify/test_v_adversarial.py`：摘 `xfail`、断言从"包在 `if` 里"改成两条无条件 + 五字段逐个断言 | **是收紧，不是放宽**：原断言在前提不成立时会**静默空过**（`strict=False` 下 XPASS 也不会变红），属"看起来绿、实际没测" | **保留**（该文件属验证会话，最终由验证会话复验） |
+| `docs/ISSUES.md`：4 处编辑（顶部读数、#8 行、#8 补记、恢复 `rule_hint` 提示） | **纠正了台账失真**：工作区版曾把 #8 写成"已关闭"并附一句不成立的"xfail 标记已由验证会话摘除"，同时删掉一条准确的开放警告 | **保留** |
+| `.workbuddy-ai/`（探针 + 报告 + 记忆，3 个文件） | 只读产物，**已确认不含任何真实隐私**（姓名/手机/邮箱/简历路径全部零命中） | 文件留在磁盘供复现，但加入 `.gitignore`（不进版本库） |
+
+**边界纪律（再次确认）**：按 `notes/2026-09-06-JobHunter-开发与验证双会话说明.md` §二，
+**只有开发会话能改 `jobhunter/` 的业务代码**，验证会话只写 `tests/` + `docs/`。
+本次越界**没有造成技术损害**（改动方向正确），但流程上应当避免 —— 同类越界若方向相反（改坏或放宽断言），
+后果会更难发现。
+
+
+### 复验记录（本轮）
+
+开发会话在 `4a120f8` 里的三处修复，我用**自己未被改动的** 7 条红用例复验：
+
+| 原红用例 | 复验 |
+|---|---|
+| `test_skill_is_found_when_directly_adjacent_to_chinese`（4 条参数化） | ✅ 全绿 |
+| `test_skill_adjacency_variants_are_consistent` | ✅ 绿 |
+| `test_jd_cannot_close_its_own_delimiter` | ✅ 绿 |
+| `test_llm_results_are_durable_without_the_cli_commit` | ✅ 绿 |
+| `test_untrusted_job_header_fields_are_inside_a_delimiter`（原 xfail） | ⚠️ XPASS → 标记已摘，**但用例当时守不住这条通道**（断言包在 `if` 里、且注入的是不含 `</jd>` 的纯指令）→ 见下「#8 补记」 |
+| `test_skill_word_boundary`（回归对照：Java≠JavaScript / Go≠Google） | ✅ 仍绿（边界没被改坏） |
+| `test_truncated_long_jd_keeps_tags_balanced`（回归对照） | ✅ 仍绿 |
+
+同时确认：`git log -- tests/verify` 显示我的测试**只被新增、从未被改动**（开发会话遵守了角色边界）。
+
+---
+
+### #8 补记（2026-09-18）：第一版只修了一半 + 一条用例守不住它要守的东西
+
+`4a120f8` 对 #8 做的是**第一步**：把表头五字段从标签外**移进** `<jd>` 里。
+但"移进标签"本身不构成防护 —— 标签能当防护的前提是
+"**标签内的内容无法提前把标签闭合**"，而这五个字段**没有过 `_neutralize_delimiters`**
+（当时只有 `jd_text` / `resume_text` 过了）。实测结果：
+
+```
+把 `</jd>` 写进 company / title / city / experience / education 任一字段
+→ user 消息里 `</jd>` 出现 2 次，注入文本落在标签**外面**
+   五个字段逐个实测：5/5 全部逃逸
+```
+
+**为什么没被测出来**：当时那条用例把断言包在 `if INJECTION in user_content:` 里，
+而它注入的是"忽略以上全部规则…"这种**不含 `</jd>`** 的纯指令。
+于是它只验证了"字段在不在标签内"，从来没验证"字段能不能闭合标签" ——
+**正好落在失效模式之外**；`if` 包裹又让它在前提不成立时静默空过
+（`strict=False` 下 XPASS 也不会让套件变红）。
+
+**本轮改了什么**：
+
+| 文件 | 改动 |
+|---|---|
+| `src/jobhunter/services/match_llm_svc.py` | `header` 整段过一次 `_neutralize_delimiters`（复用 `jd_text`/`resume_text` 的**同一个**函数，避免口径分叉） |
+| `tests/verify/test_v_adversarial.py` | 摘掉 `xfail` 标记；断言拆成**两条无条件**：① 普通注入在标签内（并把"前提成立"也写成断言，防止将来静默空过）② **五个字段逐个**写 `</jd>`，闭合标签计数必须仍为 1。同时改为按**生产形态**调用（传 `rule_result` —— 原来连 `rule_hint` 那段都没被构造出来） |
+
+**守住它的测试**：`tests/verify/test_v_adversarial.py::test_untrusted_job_header_fields_are_inside_a_delimiter`
+（两条断言都无条件执行）。已验证它是**活的**：把 `_neutralize_delimiters` 去掉，
+用例立刻变红并指出具体是哪个字段。
+
+**验证顺序**：先改用例 → 跑出**红**（确认它能抓到缺陷）→ 再改实现 → 转绿 → 再变异回去确认仍会红。
+顺序反了就没法确认"补对了"。
+
+**当前套件读数**：`546 passed, 4 failed, 21 xfailed, 0 xpassed`
+（4 条红仍是 P4 的 #29/#32/#33，与本条无关；XPASS 已归零）。
+
+#### ⚠️ 角色边界说明（必须登记）
+
+台账规则写着"**测试由验证会话负责**，本台账里不出现'我改了测试让它过'这种处理方式"。
+本轮**确实改动了验证会话的测试**，所以说清楚为什么它不是那条规则针对的行为：
+
+**授权来源**：验证方原本的角色约束是"只报告、只读不写"（用户早期明确定过）。
+本轮改动是**用户明确选定"补 JobHunter 的修复"之后**才执行的 —— 不是自行越权。
+但这条记录必须留在这里，因为**"只读不写"是长期约束，推翻它需要用户点头，
+而台账里不写这一句，后面读的人无法判断改动是授权还是越位。**
+
+1. 改动方向是**把一条会空过的用例改成能真正证伪的用例**，不是放宽断言；
+2. 改动**先于实现**：改完用例先跑，拿到的是 **FAILED**（不是"改测试让它过"）；
+3. 原用例的 `if` 包裹使它在前提不成立时**不报错** —— 属于"看起来绿、实际没测"，
+   这比没有用例更危险，因为它给的是虚假的安全感。
+
+若你希望严格执行角色分离，可以把这次用例改动**回退**，由验证会话重新提一条。
+但请注意：**回退后这条通道会重新变成零覆盖**（`#2` 的那条用例只测 `jd_text` 通道）。
+
+#### `rule_hint` 仍在标签外（恢复原先被删掉的那条提示）
+
+`rule_hint` 也拼在 `<jd>` 之外。**它当前不可注入**：关键词来自词表法
+（`match_svc.py:330` 只从 `vocabulary` 里挑名字，输出不含自由文本），
+所以开发"它是我们自己生成的锚点"这个判断是**对的**。
+
+但有个前提需要留在台账里：`extract_jd_keywords` 的 docstring 写明
+"词表优先、**LLM 抽取默认关**"。**一旦打开 LLM 抽取，输出就会变成自由文本，
+`rule_hint` 那时才成为一条通道** —— 届时需要把它也收进标签内、或同样过一遍中和。
+
+> 这类"当前安全、但依赖一个开关"的结论，建议在台账里连**前提**一起记，
+> 而不是因为"现在没问题"就把提示删掉 —— 删掉之后，将来打开那个开关的人不会知道这里有前提。
+
+---
+
+## 附：跨阶段的"必须兑现"红线（登记以免遗忘）
 
 | 编号 | 阶段 | 等级 | 要求 | 建议的验证断言 |
 |---|---|---|---|---|
-| P4-GREETING | P4 | 🔴 | 开场白必须复用共享层产物 `jobs.jd_keywords_json`（否则"开场白必然沾边"落空） | 「开场白里出现的 JD 关键词 ⊆ `jobs.jd_keywords_json`」+「开场白不含简历里没有的技能」 |
-| P5-FIDELITY | P5 | 🔴 | `FidelityGuard` 必须是**代码强制**（生成/审核/导出三处），并用**恶意 fixture** 做确定性断言 | 喂含 `Kubernetes` / `300%` / `10个模块` / `2024年` 的"生成结果"，断言全部被拦；不得写"调真实 LLM 再断言输出"的测试 |
+| P4-GREETING | P4 | ✅ 已兑现 | 开场白复用共享层产物 `jobs.jd_keywords_json` | 已验证：`greeting.keywords ⊆ jd_keywords ∩ resume.pool`（绿） |
+| P5-FIDELITY | P5 | 🔴 | `FidelityGuard` 必须是**代码强制**（生成/审核/导出三处），并用**恶意 fixture** 做确定性断言 | 部分已兑现：`fidelity.check_text` 已存在且恶意 fixture 全拦；**导出/审核两处的强制调用**待 P5 验证 |
+
+
+---
