@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from jobhunter.config.settings import AppSettings
+from jobhunter.llm.base import LLMResponse
 from jobhunter.llm.mock import MockProvider
 from jobhunter.models import Job, Resume
 from jobhunter.services import fidelity, greeting_svc, match_svc, resume_svc
@@ -288,6 +289,129 @@ def test_partial_fallback_keeps_the_good_version(settings, candidate, session):
     assert result.full == GOOD_FULL  # 完整版是模型的
     assert result.short != "太短"  # 精简版降级
     assert any(issue.startswith("short") for issue in result.issues)
+
+
+# ===========================================================================
+# 字数修复调用（真实联调发现：模型稳定超字数 → 几乎每条都降级模板）
+# ===========================================================================
+def test_length_violation_triggers_one_repair_and_keeps_llm_text(settings, candidate, session):
+    """超字数时先让模型自己改一遍；改好了就用模型的文本（而不是直接降级模板）。
+
+    ★ 这条守的是真实联调暴露的问题：模型写出 195 字的完整版（上限 150），
+      第一次联调时**每一版都降级成模板** —— 用户花了钱拿到模板，功能等于废掉。
+    """
+    job = make_job()
+    too_long = _good_greeting(full=GOOD_FULL * 2)
+
+    class TwoShot(MockProvider):
+        """第一次返回超长版，第二次（修复调用）返回合格版。"""
+
+        def complete(self, payload: Any) -> Any:
+            self.calls.append(payload)
+            content = too_long if len(self.calls) == 1 else _good_greeting()
+            return LLMResponse(
+                content=content, model=self.model, tokens_in=10, tokens_out=20, cost=0.0
+            )
+
+    provider = TwoShot()
+    result = greeting_svc.generate_greeting(
+        job, candidate, session=session, provider=provider, settings=settings
+    )
+    assert len(provider.calls) == 2, "没有走修复调用"
+    assert result.source == "llm", result.issues
+    assert result.repaired == ["full"]
+    assert result.full == GOOD_FULL
+
+
+def test_repair_also_failing_still_falls_back_to_template(settings, candidate, session):
+    """修完还不合格 → 老老实实降级模板，并把原因留下来。"""
+    job = make_job()
+    too_long = _good_greeting(full=GOOD_FULL * 3)
+
+    class AlwaysLong(MockProvider):
+        def complete(self, payload: Any) -> Any:
+            self.calls.append(payload)
+            return LLMResponse(
+                content=too_long, model=self.model, tokens_in=1, tokens_out=1, cost=0.0
+            )
+
+    result = greeting_svc.generate_greeting(
+        job, candidate, session=session, provider=AlwaysLong(), settings=settings
+    )
+    assert result.repaired == []
+    assert result.source == "template"
+    assert any("字数" in issue for issue in result.issues)
+
+
+def test_fidelity_failure_does_not_trigger_repair(settings, candidate, session):
+    """★ 编造类失败**绝不让模型「改一遍就好」**：那是信任问题，不是笔误。
+
+    让同一个模型再写一遍，我们无法保证它是"照着改"还是"换个说法继续编"。
+    所以这类失败一律直接降级到确定性模板。
+    """
+    job = make_job()
+    fabricated = _good_greeting(
+        full=(
+            "您好，我在项目里用 Kubernetes 做过容器编排，也做过 RAG 问答，"
+            "熟悉 LangChain 的链路搭建与提示词调试，能快速上手你们的业务。"
+            "方便的话，想请教一下这个岗位目前最看重哪一块？"
+        )
+    )
+
+    class Spy(MockProvider):
+        def complete(self, payload: Any) -> Any:
+            self.calls.append(payload)
+            return LLMResponse(
+                content=fabricated, model=self.model, tokens_in=1, tokens_out=1, cost=0.0
+            )
+
+    provider = Spy()
+    result = greeting_svc.generate_greeting(
+        job, candidate, session=session, provider=provider, settings=settings
+    )
+    assert len(provider.calls) == 1, "编造类失败也去调了修复 —— 不该发生"
+    assert result.source == "template"
+    assert any("Kubernetes" in issue for issue in result.issues)
+
+
+def test_is_length_only_failure_classification(settings):
+    """字数与"别的失败"必须区分开（修复调用只认前者）。
+
+    ★ 用 `_length_problems()` 的真实输出做输入（而不是手写字符串）：
+      这条判定的正确性依赖"闸门与它用同一套措辞"，
+      手写字符串会把这条耦合关系测没了。
+    """
+    long_text = "字" * 200
+    length_reason = greeting_svc._length_problems(long_text, version="full", settings=settings)
+    assert length_reason, "前提：200 字对 80-150 的区间来说确实超了"
+
+    assert greeting_svc.is_length_only_failure(
+        length_reason, long_text, version="full", settings=settings
+    )
+    # 字数 + 别的失败混在一起 → 不是"纯字数问题"
+    assert not greeting_svc.is_length_only_failure(
+        [*length_reason, "用了禁用词「贵司」"], long_text, version="full", settings=settings
+    )
+    # 文本本身不超字数（只是别的失败）→ 也不是
+    assert not greeting_svc.is_length_only_failure(
+        ["用了禁用词「贵司」"], "很短", version="full", settings=settings
+    )
+
+
+def test_prompt_states_countable_budget(settings, candidate):
+    """提示词里必须写清"按字符数、含标点、汉字算 1 个"，并有目标区间与自检要求。
+
+    实测教训：只写"80-150 字"，模型会理解成"差不多这个量级"。
+    """
+    job = make_job()
+    payload = greeting_svc.build_payload(
+        job, candidate, keywords=["Python"], variant="with_project", settings=settings
+    )
+    system = payload.messages[0].content
+    assert "字符" in system
+    assert "自己数一遍" in system
+    assert str(settings.greeting.full_max_chars) in system
+    assert str(settings.greeting.short_max_chars) in system
 
 
 # ===========================================================================

@@ -62,7 +62,13 @@ __all__ = [
 ]
 
 #: 提示词版本号：改了下面的 SYSTEM_PROMPT 或 build_payload 的任何字，**必须 +1**。
-GREETING_PROMPT_VERSION = 1
+#: v2（2026-09-18）：真实 key 联调发现模型**稳定超字数**（完整版 195 字 / 精简版 112 字，
+#:   上限分别是 150 / 60）→ 几乎每条都降级成模板（钱花了、拿到模板）。
+#:   改法：把"字数"写成**可数的字符预算 + 目标区间 + 自检要求**，并加一次"只针对字数"的修复调用。
+#: v3（2026-09-18 二次联调）：精简版仍稳定超（实测 69/66 字 vs 上限 60）→
+#:   在提示词里写明"它要填进有字数上限的输入框，一句话 + 一个问题就够"，
+#:   并给出更窄的目标区间（30-55），而不是只说一句"不超过 60"。
+GREETING_PROMPT_VERSION = 3
 
 #: 送进提示词的 JD 关键词上限（太多会让模型抓不住重点，也推高 token）
 _MAX_KEYWORDS = 8
@@ -73,12 +79,25 @@ VARIANTS = ("with_project", "without_project")
 
 # ★ JSON 模式三件套：① 提示词含 "json" 字样（就在下面这段里）
 #   ② 给 schema 示例 ③ max_tokens 给足（两个版本各一百多字，800 足够）。
+#
+# ★ 字数为什么要写成"目标区间 + 自检"（不是一句"80-150 字"就够）：
+#   实测模型把"80-150 字"理解成"差不多这个量级"，写出 195 字（超 30%）。
+#   给它一个**更窄的目标区间**（100-130）并让它**自己数一遍**，命中率高得多；
+#   真正的硬约束仍由代码闸门兜（超了就走一次修复调用，再不行才用模板）。
 SYSTEM_PROMPT = """你是求职开场白助手，帮求职者写发给 HR 的第一条消息。
 
 硬性要求（违反任何一条这条消息就作废）：
 1. 只能使用我提供的「可用素材」里的技能与项目，**绝对不许**添加素材之外的技能、
    数字或学历（例如素材里没有 Kubernetes，就不能写"熟悉 Kubernetes"）。
-2. 完整版 80-150 字，精简版不超过 60 字（按字符数算，含标点）。
+2. **字数（按字符数，含标点；一个汉字算 1 个字符）**：
+   - 完整版：**必须落在 {full_min}-{full_max} 个字符之间**，目标写到
+     {full_target_low}-{full_target_high} 之间；
+   - 精简版：**不超过 {short_max} 个字符**，目标 {short_target_low}-{short_target_high}。
+     ⚠️ 精简版是要填进**有字数上限的输入框**的，必须真的短：
+     **一句话自报方向 + 一个具体问题**就够，不要罗列技能清单。
+     实测提醒：把"技能+项目+问题"都塞进去一定会超过 {short_max} 字。
+   - 写完**自己数一遍**：超上限就删掉最不重要的一句；不到下限就补一句素材里真实的项目细节。
+   - 宁可比目标区间短一点，也不要贴着上限写。
 3. 不许用这些套话：{banned}
 4. 语气像一个正常的年轻人说话，不要"尊敬的 HR""百忙之中"这类公文腔。
 5. 结尾用一个**具体的、轻量的问题**引导对方回复（不要"期待您的回复"）。
@@ -86,6 +105,24 @@ SYSTEM_PROMPT = """你是求职开场白助手，帮求职者写发给 HR 的第
 
 json 输出结构（字段名必须完全一致）：
 {{"full": "完整版开场白", "short": "精简版开场白"}}
+"""
+
+#: 修复调用的提示词（**只针对字数问题**，见 `build_repair_payload`）
+REPAIR_PROMPT = """你上一次的输出**字数不合格**，需要重写。
+仍然遵守原来的全部硬性要求（素材不许扩、禁用词、结尾提问）。
+
+不合格的地方：
+{problems}
+
+请重新输出 json（字段名不变），这一次**先想好每一句多少字，再落笔**：
+- 完整版：{full_min}-{full_max} 个字符，目标 {full_target_low}-{full_target_high}
+- 精简版：不超过 {short_max} 个字符，目标 {short_target_low}-{short_target_high}
+  （一句话自报方向 + 一个具体问题，别罗列技能；实测"技能+项目+问题"一定超）
+
+上一版内容（可以删减、改写，但不许引入新的技能/数字/学历）：
+<previous>
+{previous}
+</previous>
 """
 
 
@@ -109,9 +146,52 @@ class Greeting:
     issues: list[str] = field(default_factory=list)
     #: 这次用到的交集关键词（排查"为什么沾边/不沾边"看它）
     keywords: list[str] = field(default_factory=list)
+    #: 哪几版是**经过一次"字数修复"调用**才合格的（真实联调加的：模型爱超字数）
+    repaired: list[str] = field(default_factory=list)
 
     def text_for(self, version: str = "full") -> str:
         return self.short if version == "short" else self.full
+
+
+def _length_problems(text: str, *, version: str, settings: AppSettings) -> list[str]:
+    """字数问题的**唯一判定点**（闸门与修复调用都用它，避免两套口径）。
+
+    ★ 为什么必须单一来源：修复调用要判断"这次失败是不是**只**由字数造成"。
+      如果闸门用一套措辞、这里用另一套，就会出现
+      "明明只超了字数、却被判成不是纯字数问题"（或反过来）——
+      我第一版就是两套措辞 + 比数量，测试立刻打脸。
+    """
+    greeting = settings.greeting
+    if version == "full":
+        if not greeting.full_min_chars <= len(text) <= greeting.full_max_chars:
+            return [
+                f"完整版字数 {len(text)} 不在 {greeting.full_min_chars}-"
+                f"{greeting.full_max_chars}（按字符数）"
+            ]
+        return []
+    if len(text) > greeting.short_max_chars:
+        return [f"精简版字数 {len(text)} 超过 {greeting.short_max_chars}（按字符数）"]
+    return []
+
+
+def is_length_only_failure(
+    reasons: list[str], text: str, *, version: str, settings: AppSettings
+) -> bool:
+    """判断一次失败是否**只**由字数造成（只有这种才允许让模型自己修）。
+
+    ★ 为什么别的失败不许"让模型改一遍就好"：
+      保真类失败（编造了技能 / 数字 / 学历）是**信任问题**，不是笔误 ——
+      让同一个模型再写一遍，它是"照着改"还是"换个说法继续编"，我们无法保证。
+      所以那类失败一律**直接降级到确定性模板**。
+      字数问题不一样：它可数、可验证，且改短不会引入新事实。
+
+    ★ 判定方式：`reasons` 与"这个文本真实存在的字数问题"**集合相等** ——
+      而不是比数量（数量相等会把"禁用词 + 恰好也超字数"误判成纯字数问题）。
+    """
+    length_reasons = _length_problems(text, version=version, settings=settings)
+    if not length_reasons:
+        return False
+    return set(reasons) == set(length_reasons)
 
 
 def pick_variant(index: int, *, forced: str | None = None) -> str:
@@ -124,6 +204,21 @@ def pick_variant(index: int, *, forced: str | None = None) -> str:
 def _clip(text: str, limit: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + "\n…（已截断）"
+
+
+def _length_hints(settings: AppSettings) -> dict[str, int]:
+    """提示词里的字数参数（目标区间比硬上限窄，留出模型"估不准"的余量）。"""
+    greeting = settings.greeting
+    return {
+        "full_min": greeting.full_min_chars,
+        "full_max": greeting.full_max_chars,
+        # 目标区间取硬区间的中间偏上：太靠下限容易被砍到不够
+        "full_target_low": greeting.full_min_chars + 20,
+        "full_target_high": max(greeting.full_min_chars + 20, greeting.full_max_chars - 20),
+        "short_max": greeting.short_max_chars,
+        "short_target_low": max(15, greeting.short_max_chars // 2),
+        "short_target_high": greeting.short_max_chars - 5,
+    }
 
 
 def build_payload(
@@ -139,7 +234,7 @@ def build_payload(
     ★ 素材里只给 `JD 关键词 ∩ 简历技能` —— 这就是"不许编造"的实现方式：
       模型拿不到素材之外的东西，就没有机会编。
       （再叠加 `fidelity.check_text()` 做第二道，两道都要有：
-        模型可能从 JD 里"看到"某个技能就顺手写出来。）
+        模型可能从 "JD 里"看到"某个技能就顺手写出来。）
     """
     banned = "、".join(settings.greeting_banned_words) or "（无）"
     resume_text = _clip(_resume_digest(candidate), _MAX_RESUME_CHARS)
@@ -170,7 +265,10 @@ def build_payload(
         prompt_version=GREETING_PROMPT_VERSION,
         task="greeting",
         messages=[
-            LLMMessage(role="system", content=SYSTEM_PROMPT.format(banned=banned)),
+            LLMMessage(
+                role="system",
+                content=SYSTEM_PROMPT.format(banned=banned, **_length_hints(settings)),
+            ),
             LLMMessage(role="user", content=user_content),
         ],
         json_mode=True,
@@ -178,6 +276,43 @@ def build_payload(
         # 话术类任务用高温（llm/base.py 的约定）：同样输入要"像人写的"，
         # 而打分类任务才需要低温求稳定。
         temperature=0.7,
+    )
+
+
+def build_repair_payload(
+    previous: LLMMessage,
+    problems: list[str],
+    *,
+    settings: AppSettings,
+) -> PromptPayload:
+    """构造"只修字数"的第二次调用。
+
+    ★ 为什么值得多花一次调用（真实联调实测）：
+      模型对"80-150 字"的遵守率很低（实测写出 195 字的完整版、112 字的精简版），
+      于是**几乎每条都降级成模板** —— 用户花了钱却拿到模板话术，
+      而这个功能的价值恰恰在"像人写的"。字数问题可数、可验证、改短不会引入新事实，
+      是**最适合让模型自己修**的一类失败。
+    ★ 只修字数：保真类失败绝不走这条路（见 `is_length_only_failure`）。
+    """
+    previous_message = LLMMessage(role="user", content=previous.content)
+    repair_body = REPAIR_PROMPT.format(
+        problems="\n".join(f"- {item}" for item in problems),
+        previous=previous_message.content[-1200:],
+        **_length_hints(settings),
+    )
+    return PromptPayload(
+        prompt_version=GREETING_PROMPT_VERSION,
+        task="greeting",
+        messages=[
+            LLMMessage(
+                role="system",
+                content=SYSTEM_PROMPT.format(banned="（同上一版要求）", **_length_hints(settings)),
+            ),
+            LLMMessage(role="user", content=repair_body),
+        ],
+        json_mode=True,
+        max_tokens=800,
+        temperature=0.3,  # 修复要"照着改"而不是重新发挥 → 用低温
     )
 
 
@@ -229,16 +364,9 @@ def _gate_reasons(
     vocabulary: dict[str, list[str]],
 ) -> list[str]:
     """返回这条文案违反的硬约束（空列表 = 通过）。"""
-    reasons: list[str] = []
-    greeting = settings.greeting
-
-    if version == "full":
-        if not greeting.full_min_chars <= len(text) <= greeting.full_max_chars:
-            reasons.append(
-                f"完整版字数 {len(text)} 不在 {greeting.full_min_chars}-{greeting.full_max_chars}"
-            )
-    elif len(text) > greeting.short_max_chars:
-        reasons.append(f"精简版字数 {len(text)} 超过 {greeting.short_max_chars}")
+    # ★ 字数这一道**复用** `_length_problems()`，不在这里另写一遍：
+    #   两套措辞会让 `is_length_only_failure()` 判错（我第一版就是这么错的）。
+    reasons: list[str] = _length_problems(text, version=version, settings=settings)
 
     for word in settings.greeting_banned_words:
         if word and word in text:
@@ -388,10 +516,13 @@ def generate_greeting(
         task="greeting",
     )
     content = ""
+    content_from_cache = False
+    payload: PromptPayload | None = None
     if session is not None and use_cache and cache_key:
         hit = llm_cache.get_cached(session, cache_key)
         if hit is not None:
             content = hit.content
+            content_from_cache = True
 
     if not content:
         payload = build_payload(
@@ -428,24 +559,90 @@ def generate_greeting(
         fallback.issues.append(f"模型输出解析失败：{exc}")
         return fallback
 
-    # ★ 逐版本判定：某一版不合格就**只降级那一版**（另一版还能用）。
+    return _settle_versions(
+        parsed,
+        job=job,
+        candidate=candidate,
+        keywords=keywords,
+        variant=variant,
+        settings=settings,
+        vocabulary=vocabulary,
+        provider=provider,
+        # 命中缓存时没有本次的 payload → 不做修复调用（省一次钱；缓存里的文本
+        # 上次已经过闸门，要么合格要么就是当时判定的结果）
+        previous_message=None if content_from_cache or payload is None else payload.messages[-1],
+    )
+
+
+def _settle_versions(
+    parsed: LLMGreeting,
+    *,
+    job: Job,
+    candidate: ResumeCandidate,
+    keywords: list[str],
+    variant: str,
+    settings: AppSettings,
+    vocabulary: dict[str, list[str]],
+    provider: LLMProvider | None,
+    previous_message: LLMMessage | None,
+) -> Greeting:
+    """把模型输出"落定"成最终两个版本：过闸门 → 字数可修则修 → 仍不过则用模板。
+
+    ★ 为什么单独抽出来：这段有 4 个决策点（哪版不合格、是否纯字数问题、
+      修复后是否合格、是否降级），藏在 `generate_greeting` 里既难读也难测。
+      抽出来后可以单独喂"模型输出"进来看结论（见 test_greeting_svc.py）。
+    """
     template = _template_greeting(
         job, candidate, keywords=keywords, variant=variant, settings=settings
     )
-    issues: list[str] = []
     final = {"full": parsed.full.strip(), "short": parsed.short.strip()}
-    for version in ("full", "short"):
-        reasons = _gate_reasons(
-            final[version],
+    failures: dict[str, list[str]] = {}
+
+    def check(text: str, version: str) -> list[str]:
+        return _gate_reasons(
+            text,
             version=version,
             keywords=keywords,
             candidate=candidate,
             settings=settings,
             vocabulary=vocabulary,
         )
+
+    for version in ("full", "short"):
+        reasons = check(final[version], version)
         if reasons:
-            issues.extend(f"{version}：{reason}" for reason in reasons)
-            final[version] = template.full if version == "full" else template.short
+            failures[version] = reasons
+
+    repaired: list[str] = []
+    if failures and provider is not None and provider.is_configured() and previous_message:
+        fixable = [
+            version
+            for version, reasons in failures.items()
+            if is_length_only_failure(reasons, final[version], version=version, settings=settings)
+        ]
+        if fixable:
+            problems = [item for version in fixable for item in failures[version]]
+            try:
+                repair_response = provider.complete(
+                    build_repair_payload(previous_message, problems, settings=settings)
+                )
+                repaired_parsed = parse_greeting(repair_response.content)
+            except (DeepSeekError, ValueError) as exc:
+                logger.warning("字数修复调用失败，直接降级模板：%s", exc)
+            else:
+                for version in fixable:
+                    fixed = (
+                        repaired_parsed.full if version == "full" else repaired_parsed.short
+                    ).strip()
+                    if fixed and not check(fixed, version):
+                        final[version] = fixed
+                        repaired.append(version)
+                        del failures[version]
+
+    issues: list[str] = []
+    for version, reasons in failures.items():
+        issues.extend(f"{version}：{reason}" for reason in reasons)
+        final[version] = template.full if version == "full" else template.short
 
     return Greeting(
         full=final["full"],
@@ -454,4 +651,5 @@ def generate_greeting(
         source="template" if issues else "llm",
         issues=issues + [item for item in template.issues if issues],
         keywords=keywords,
+        repaired=repaired,
     )
