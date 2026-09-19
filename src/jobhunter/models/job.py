@@ -75,7 +75,7 @@ class Job(BaseModel):
     url: Mapped[str | None] = mapped_column(Text)
     # ★ 来自哪个搜索词/渠道 → "哪个渠道有效"复盘的原始数据
     source_keyword: Mapped[str | None] = mapped_column(String(120))
-    # ★ 归一化(公司|职位|城市) 的 hash → 去重第二层兜底（平台 ID 拿不到时）
+    # ★ 归一化(公司|职位|城市) 的 hash → 去重第三层兜底（平台 ID 与 URL 都拿不到时）
     dedup_norm_hash: Mapped[str | None] = mapped_column(String(64))
 
     # ---- 共享中间层产物 ★★ -------------------------------------------------
@@ -114,7 +114,7 @@ class Job(BaseModel):
     __table_args__ = (
         # 去重第一层：按平台 ID 精确匹配（命中率最高，必须走索引）
         Index("ix_jobs_platform_job_id", "platform_job_id"),
-        # 去重第二层：归一化 hash 兜底
+        # 去重第三层：归一化 hash 兜底
         Index("ix_jobs_dedup_norm_hash", "dedup_norm_hash"),
         # 数据库层兜住重复：同一平台下同一个 platform_job_id 只能有一条。
         # NULL 不参与唯一约束 → 手动粘贴的岗位（platform_job_id 为 NULL）不受影响。

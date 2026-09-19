@@ -1,23 +1,27 @@
-"""岗位业务：入库 + **两层去重** + 列表（P2）。
+"""岗位业务：入库 + **三层去重** + 列表（P2）。
 
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║ ★★ 本模块最重要的一条纪律：去重命中时**绝不覆盖人工决策字段**             ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
-我把 `jobs` 表的字段分成三类，只有第一类允许被"再次抓取"覆盖：
+我把 `jobs` 表的字段分成四类，只有第一类允许被"再次抓取"覆盖：
 
     ┌─ ① 抓取派生字段（每次抓到都可以更新）
     │    jd_text / jd_hash / jd_fetch_status / salary_* / experience / education
-    │    / is_intern / city / company / title / url / last_seen_at
+    │    / is_intern / city / company / title / dedup_norm_hash / last_seen_at
     │
-    ├─ ② 人工决策字段（**绝不覆盖**）
+    ├─ ② 来源 / 身份字段（**首次为准**：库里有值就不动，库里为空才补写）
+    │    url / source_keyword  这个岗位是从哪找到的
+    │    platform_job_id       它是平台上的哪一条（这条记录的"身份证"）
+    │
+    ├─ ③ 人工决策字段（**绝不覆盖**）
     │    status            我已经把它标成 skipped / applied 了
     │    matched_resume_id 我手工指定过用哪份简历
     │    match_score / llm_score / rule_score / rule_detail_json / reason_json
     │                     已经花过成本（含 LLM 调用费）算出来的结果
     │    jd_keywords_json  共享中间层的产物，P3/P4/P5 都复用它
     │
-    └─ ③ 我批注的字段
+    └─ ④ 我批注的字段
          note（将来会有）
 
 ★ 为什么这条纪律值得单独立一块注释
@@ -29,16 +33,45 @@
     "这工具怎么老是推我已经排除的岗位"。
 
     这个坑在技术评审里被明确点出来过，所以实现里用**显式白名单**的方式写：
-    只更新列在 `_REFRESHABLE_FIELDS` 里的字段，其余一律不动。
+    只更新列在 `REFRESHABLE_FIELDS` / `FIRST_WINS_FIELDS` 里的字段，其余一律不动。
 
-★ 为什么要两层去重
+★ 为什么 ②（来源信息）也按"首次为准"（ISSUE #20 的裁决 A）
+
+    原来 `url` / `source_keyword` 挂在 ① 里，重复录入时会被新值覆盖。后果不是报错，
+    而是**记忆被篡改**：同一个岗位第一次是从"AIGC 内推群"里的链接看到的，
+    第二次是从搜索词"AI Agent 深圳"刷到的，覆盖之后库里只剩后者 ——
+    将来 `jh stats` 复盘"哪个渠道有效"时，看到的就是一份被改写过的历史。
+
+    为什么它和 ③ 是同一条纪律：③ 守的是"人工结论不被抓取顺手改掉"，
+    ② 守的是"来源事实不被后来的抓取顺手改掉"，两者的共同点是
+    **后来的那次抓取并不比第一次更权威**。所以规则一样：命中已有记录就不再改写。
+
+    ★ 代价（明确认下来，别当成 bug 再"修"回去）：万一那个岗位后来换了链接
+      （页面搬迁、短链换成正式链接），库里存的仍是第一次那个 URL —— "自动更新"看着贴心，
+      但它同时抹掉了"我当初是从哪个链接找到的"这条事实。宁可保留历史，也不静默改写；
+      真要换链接该由用户显式操作（`jh job` 目前只有 add / list / show / skip，没有编辑命令）。
+
+    ★ 但边界必须写清楚：**"首次为准"不等于"永远留空"**。
+      第一次录入时手动粘贴的 JD 没有 URL、也没有搜索词，第二次带着链接录进来 ——
+      这时库里那一列是空的，应当**补上**（否则一条本来能补全的信息就永久丢了）。
+      规则因此是"**有值就不动，空值才补写**"，而不是"第一次之后一律忽略"。
+
+★ 为什么要三层去重（编号与 `find_duplicate` 一致）
 
     · 第一层 `platform_job_id`（平台内 ID）：最可靠，但**只有从 URL 抓到才有**；
       手动粘贴的岗位没有它。
-    · 第二层 `dedup_norm_hash`（公司+职位+城市 归一化）：兜底层。
-      它更宽松，所以规则要**保守**（见 `compute_dedup_norm_hash` 的说明）。
+    · 第二层 **URL 完全相同**：★ 这一层是实测踩出缺陷后补的 ——
+      公司自建招聘站（美团这类）的页面**根本不写公司名**，第三层的
+      "公司+职位+城市"缺一件就放弃匹配，结果是**同一个链接加三次、
+      库里出现三条一模一样的记录**。同一个链接第二次打开还是同一个岗位，
+      它比第三层可靠、又比第一层宽容（很多站点把岗位 ID 藏在 JS 里，URL 里取不到）。
+    · 第三层 `dedup_norm_hash`（公司+职位+城市 归一化）：兜底层。
+      它更宽松，所以规则要**保守**（见 `compute_dedup_norm_hash` 的说明），
+      并且还要过 ④ 的否决条件。
 
-    两层都不命中 → 新记录。任何一层命中 → 走"只刷新抓取派生字段"的路径。
+    三层都不命中 → 新记录。任何一层命中 → 走"只刷新抓取派生字段"的路径。
+    ★ ④（两个都非空且不同的平台 ID 不模糊合并）**不是第四层**，是第三层的否决条件 ——
+      它只否定第三层这一次命中，不参与"逐层往下试"的顺序（见 `find_duplicate`）。
 """
 
 from __future__ import annotations
@@ -59,6 +92,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DECISION_FIELDS",
+    "FIRST_WINS_FIELDS",
     "REFRESHABLE_FIELDS",
     "UpsertOutcome",
     "UpsertResult",
@@ -89,13 +123,26 @@ REFRESHABLE_FIELDS: tuple[str, ...] = (
     "jd_text",
     "jd_hash",
     "jd_fetch_status",
-    "url",
-    "source_keyword",
-    "platform_job_id",
     "dedup_norm_hash",
 )
 
-#: ② 人工决策 / 已花成本算出来的字段：**任何情况下都不被去重逻辑覆盖**
+#: ② 来源 / 身份字段：**首次为准** —— 库里已有值就绝不改写，只在库里为空时补写。
+#:
+#: 为什么单独一份清单、而不是塞回 ①：
+#:   · 它们记录的是"这个岗位是从哪找到的"（来源事实）与"它是平台上的哪一条"
+#:     （身份），**后来的抓取并不比第一次更权威**，覆盖等于篡改历史（ISSUE #20）；
+#:   · `platform_job_id` 本来就是这个规则，只是写成循环里的一行特例；
+#:     三者的语义完全一样，合成一份清单后就不必再靠"记得那行特例"了。
+#:
+#: ★ 边界：**"首次为准"不等于"永远留空"**。第一次录入没有 URL / 关键词时，
+#:   第二次录进来必须补上（`upsert_job` 里的 `not getattr(existing, name, None)` 分支）。
+FIRST_WINS_FIELDS: tuple[str, ...] = (
+    "platform_job_id",
+    "url",
+    "source_keyword",
+)
+
+#: ③ 人工决策 / 已花成本算出来的字段：**任何情况下都不被去重逻辑覆盖**
 #: （这份清单是"声明式"的：即使将来有人往 upsert 里加了字段，
 #:   只要它在这里，测试 `test_dedup_never_touches_decision_fields` 就会拦住。）
 DECISION_FIELDS: tuple[str, ...] = (
@@ -120,7 +167,8 @@ class UpsertResult:
     job_id: int
     #: 命中的是哪一层去重（便于排查"为什么这两个被认为是同一个岗位"）
     matched_by: str | None = None
-    #: 实际被更新的字段名（**永不包含 DECISION_FIELDS**）
+    #: 实际被更新的字段名（**永不包含 DECISION_FIELDS**；
+    #: `FIRST_WINS_FIELDS` 只在"库里为空、这次补上了"时才会出现）
     updated_fields: list[str] = field(default_factory=list)
     #: 内容（JD 正文）是否发生变化 —— 变了才需要让 LLM 缓存失效
     jd_changed: bool = False
@@ -157,7 +205,7 @@ def compute_dedup_norm_hash(
     title: str | None,
     city: str | None,
 ) -> str | None:
-    """去重第二层的归一化 hash（公司 + 职位 + 城市）。
+    """去重第三层的归一化 hash（公司 + 职位 + 城市）。
 
     ★★ 规则的取舍：**宁可漏合并，也不要错合并**
 
@@ -235,8 +283,11 @@ def find_duplicate(session: Session, detail: JobDetail) -> tuple[Job | None, str
 
     ④ 为什么必要（另一个实测缺陷）：同一家公司同城挂两个相似标题的岗位
         （`AI Agent 开发工程师` 与 `…（急招）`），平台 ID 是 job-001 / job-002。
-        没有 ④ 时 ③ 会命中，接着"刷新"逻辑会把那条的 `platform_job_id`
-        **从 job-001 改成 job-002** —— 记录换了身份，而用户已投递的那条会挂错岗位。
+        没有 ④ 时 ③ 会命中：两条**并成一条** —— 用户再也看不到第二个岗位，
+        job-002 的 JD / 薪资还会覆盖到 job-001 那条记录上（信息串味），
+        而投递记录只认 job-001，事后完全对不上账。
+        （`platform_job_id` 另有 `FIRST_WINS_FIELDS` 兜着、不至于被改写身份，
+          但"两个岗位并成一条"这个后果只能靠 ④ 挡，所以 ④ 不能因为有了那层保护就删。）
     """
     if detail.platform_job_id:
         found = session.scalars(
@@ -286,6 +337,14 @@ def upsert_job(
 
     ★ `source_keyword` 记的是"这个岗位是从哪个搜索词/渠道来的"
       → 将来 `jh stats` 回答"哪个渠道有效"就靠它。
+
+    ★★ 它的写入规则是**首次为准**（与 `url` / `platform_job_id` 同属
+      `FIRST_WINS_FIELDS`，理由见模块 docstring 的 ISSUE #20 一段）：
+
+        · 库里这条已经有了来源 → **不改**。同一岗位第二次从别的渠道录入时，
+          把来源改写成后者会让"这个岗是从哪找到的"失真；
+        · 库里是空的（第一次录入时手动粘贴、没带链接或搜索词）→ **补上**。
+          这条反向守卫同样重要：不补的话一条本来能补全的信息就永久丢了。
     """
     existing, matched_by = find_duplicate(session, detail)
     jd_hash = compute_jd_hash(detail.jd_text)
@@ -329,11 +388,13 @@ def upsert_job(
     updated: list[str] = []
     jd_changed = False
 
-    # ★ 更新前先落地"看起来像新值的占位"检查：绝不触碰 DECISION_FIELDS
-    for name in REFRESHABLE_FIELDS:
+    # ★ 两份清单之间**不许有交集**：有交集就意味着某个字段会被去重逻辑覆盖，
+    #   而它的清单上写着"不许覆盖"。这里做一次防御性断言（元测试里也有一条）。
+    for name in (*REFRESHABLE_FIELDS, *FIRST_WINS_FIELDS):
         if name in DECISION_FIELDS:  # pragma: no cover - 防御性断言，测试里也有
             raise AssertionError(
-                f"编程错误：{name} 同时出现在可刷新与决策字段里 —— 决策字段绝不能被去重覆盖"
+                f"编程错误：{name} 同时出现在可刷新/首次为准与决策字段里 —— "
+                "决策字段绝不能被去重覆盖"
             )
         if name == "platform_job_id":
             new_value = detail.platform_job_id
@@ -351,6 +412,22 @@ def upsert_job(
             new_value = detail.fetch_status
         else:
             new_value = getattr(detail, name, None)
+
+        # ★★ 来源 / 身份字段：**首次为准**（ISSUE #20）
+        #   库里有值 → 一律不改：`url` / `source_keyword` 是"这个岗从哪找到的"这段事实，
+        #   第二次从别的渠道录入并不比第一次更权威，覆盖等于篡改历史，事后复盘渠道效果时
+        #   看到的就是假数据；`platform_job_id` 更是记录的"身份" —— 万一三层判定出现意外
+        #   （比如归一化 hash 碰撞），覆盖 ID 会让记录换了身份，而投递记录还挂在原岗位上。
+        #   ★ 反向守卫：库里**为空**时这次必须补上（第一次手动粘贴没有 URL / 搜索词，
+        #     第二次带着链接录进来）—— 所以是"有值不动、空值才补"，不是"永远留空"。
+        if name in FIRST_WINS_FIELDS:
+            if getattr(existing, name, None):
+                continue
+            if new_value in (None, ""):
+                continue
+            setattr(existing, name, new_value)
+            updated.append(name)
+            continue
 
         # JD 正文与抓取状态要一起看：
         #   · 只有内容真的变了才覆盖正文（否则 jd_hash 会跟着抖动，P3 的 LLM 缓存白白失效）；
@@ -371,18 +448,6 @@ def upsert_job(
             updated.append(name)
             continue
 
-        # ★ platform_job_id 特殊处理：**只在库里那条没有 ID 时补上**。
-        #   不能无条件覆盖 —— 万一两层判定出现意外（比如归一化 hash 碰撞），
-        #   覆盖 ID 会让记录"换了个身份"，而它的投递记录还挂在原来那个岗位上。
-        if name == "platform_job_id":
-            if existing.platform_job_id:
-                continue
-            if not new_value:
-                continue
-            setattr(existing, name, new_value)
-            updated.append(name)
-            continue
-
         # 空值不覆盖已有值：抓取失败时不该把之前抓到的字段清空
         if new_value in (None, ""):
             continue
@@ -396,7 +461,7 @@ def upsert_job(
 
     session.flush()
     logger.info(
-        "岗位已存在（命中 %s）：id=%s，刷新 %d 个抓取字段，决策字段保持不变",
+        "岗位已存在（命中 %s）：id=%s，刷新 %d 个抓取字段，决策字段与来源字段保持不变",
         matched_by,
         existing.id,
         len(updated),

@@ -310,18 +310,36 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 
 > 去重命中时**绝不覆盖人工决策字段**。
 
-实现方式是两份显式字段清单：
+实现方式是三份显式字段清单（`job_svc.py` 里一一对应，文档口径与代码必须一致）：
 
 | 清单 | 内容 | 规则 |
 |---|---|---|
-| `REFRESHABLE_FIELDS` | company / title / city / experience / education / is_intern / salary_* / jd_text / jd_hash / jd_fetch_status / url / source_keyword / platform_job_id / dedup_norm_hash | 重复遇到同一岗位时**允许刷新** |
+| `REFRESHABLE_FIELDS` | company / title / city / experience / education / is_intern / salary_* / jd_text / jd_hash / jd_fetch_status / dedup_norm_hash | 重复遇到同一岗位时**允许刷新** |
+| `FIRST_WINS_FIELDS` | platform_job_id / url / source_keyword | **首次为准**：库里有值就不动，库里为**空**时才补写 |
 | `DECISION_FIELDS` | status / match_score / llm_score / rule_score / rule_detail_json / reason_json / matched_resume_id / jd_keywords_json / found_at | **任何情况下都不被去重逻辑覆盖** |
 
-两条测试从两个方向守住它：
+**`url` / `source_keyword` 为什么从「可刷新」挪进「首次为准」**（ISSUE #20 的裁决 A）：
+
+它们是**来源信息**（"这个岗位是从哪找到的"），与 `DECISION_FIELDS` 守的是同一条纪律 ——
+后来的那次抓取**并不比第一次更权威**。覆盖的后果不是报错，而是"记忆被篡改"：
+同一岗位先是从内推群里的链接录进来、后来又从搜索词刷到，覆盖之后库里只剩后一个渠道，
+`jh stats` 复盘"哪个渠道有效"时看到的是一份被改写过的历史。
+`platform_job_id` 本来就是这个规则（原来写成循环里的一行特例），三者语义相同，
+现在合成一份清单，不必再靠"记得那行特例"。
+
+★ 边界（反向守卫，同样有用例守）：**「首次为准」不等于「永远留空」**。
+第一次手动粘贴的 JD 没有 URL、也没写 `--keyword`，第二次带着链接录进来时，
+库里那一列是空的 → **补上**；否则一条本来能补全的信息就永久丢了。
+规则是"有值不动、空值才补"，而且是**逐字段**判断（已有 `url` 不妨碍补 `source_keyword`）。
+
+四条测试从不同方向守住它（都在 `tests/unit/test_job_svc.py`）：
 - `test_dedup_never_touches_decision_fields`：把决策字段写成"不可能由代码推导"的值，
   再跑一次 upsert，断言它们一个都没变、而抓取字段确实刷新了；
-- `test_decision_fields_and_refreshable_fields_do_not_overlap`：两份清单不许有交集
-  （元测试 —— 将来有人往可刷新清单里加 `status` 会立刻失败）。
+- `test_decision_fields_and_refreshable_fields_do_not_overlap`：三份清单**两两不许有交集**
+  （元测试 —— 将来有人往可刷新清单里加 `status` 会立刻失败）；
+- `test_dedup_keeps_the_first_url_and_source_keyword`：第二次录入不改写已有来源；
+- `test_dedup_backfills_url_and_source_keyword_when_first_was_empty` +
+  `test_first_wins_is_per_field_not_all_or_nothing`：第一次为空时必须补上（逐字段）。
 
 ### 去重的三层判定（② 与 ④ 都是真实页面验收后补的）
 
@@ -340,9 +358,11 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 
 **④ 为什么必须有**（实测踩出来的真实缺陷）：同一家公司在同一城市挂两个相似标题的岗位
 （`AI Agent 开发工程师` 与 `AI Agent 开发工程师（急招）`），平台 ID 是 job-001 / job-002。
-没有 ④ 时 ③ 会命中，接着"刷新"逻辑会把库里那条的 `platform_job_id` 从 job-001
-**改成 job-002** —— 记录换了个身份，而用户如果已经投过 job-001，
-投递记录就会挂到 job-002 上，完全对不上账。
+没有 ④ 时 ③ 会命中，把两条**并成一条**：用户再也看不到第二个岗位，
+job-002 的 JD / 薪资还会覆盖到 job-001 那条记录上（信息串味），
+而投递记录只认 job-001，事后完全对不上账。
+（`platform_job_id` 现在另有 `FIRST_WINS_FIELDS` 兜着、不至于被改写身份，
+但"两个岗位并成一条"这个后果只能靠 ④ 挡 —— 所以 ④ 不能因为有了那层保护就删。）
 
 ### 抓取质量的独立交叉验证（用 harness 的浏览器工具）
 
@@ -353,7 +373,10 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 11 项关键内容全部命中，导航（首页/LongCat人才招聘/北斗计划…）与页脚
 （版权所有/京ICP备…）**零残留** —— 这比"看一眼觉得对"硬得多。
 
-### 第二层去重的"宁漏不错"取舍
+### 归一化 hash 那一层的"宁漏不错"取舍
+
+（这一层按现在的编号是**第三层**，②是 URL、①是 platform_job_id。
+标题刻意不写层号 —— 编号已经变过一次，下次再变就不用改标题了。）
 
 `compute_dedup_norm_hash` 在**三个字段缺任何一个**时返回 `None`（放弃模糊匹配）：
 
@@ -382,7 +405,7 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 | 提示词 0 | 目录结构 + schema/Alembic 方案 + P0 计划 | ✅ 已产出（3 份 docs） |
 | **P0** | 骨架 + 工程底座 + CI + README | ✅ **已完成**（结束时 107 测试绿；双平台 CI 绿） |
 | **P1** | 简历导入解析 + `jh resume split` | ✅ **已完成**（176 测试绿；双平台 CI 绿） |
-| **P2** | `jh job add <url\|--file\|--manual\|--html>` + 两层去重 | ✅ **已完成**（254 测试绿；抓取链路端到端验证通过） |
+| **P2** | `jh job add <url\|--file\|--manual\|--html>` + 三层去重 | ✅ **已完成**（254 测试绿；抓取链路端到端验证通过） |
 | P3 | 共享层 + 两级匹配 + `jh match explain` + `jh gap` | ✅ **已完成** |
 | P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | ✅ **已完成** |
 | P4.5 | 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | ✅ **已完成** |

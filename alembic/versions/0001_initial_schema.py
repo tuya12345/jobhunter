@@ -78,7 +78,8 @@ def upgrade() -> None:
         sa.Column("jd_fetch_status", sa.String(length=20), nullable=True),
         sa.Column("url", sa.Text(), nullable=True),
         sa.Column("source_keyword", sa.String(length=120), nullable=True),
-        # ★ 去重第二层兜底
+        # ★ 去重第三层兜底（归一化 hash；ISSUES #21 统一口径时把注释里的层号对齐了代码：
+        #   ① platform_job_id → ② URL 完全相同 → ③ 这一列）
         sa.Column("dedup_norm_hash", sa.String(length=64), nullable=True),
         # ★★ 共享中间层产物：被匹配 / 定制简历 / 开场白三处复用
         sa.Column("jd_keywords_json", sa.Text(), nullable=True),

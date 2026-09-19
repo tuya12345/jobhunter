@@ -30,6 +30,15 @@ DeepSeek 的接口就是 OpenAI 的 `/chat/completions`，请求/响应结构非
     它们重试一次基本就好了，且与提示词无关。
     "返回了空 content / 不是 JSON"属于**业务层**失败，由 `match_llm_svc` 决定
     重试还是降级到规则分。混在一起重试会放大 token 消耗且难定位。
+
+★★ 刻意**不**请求、也**不**保存 `reasoning_content`（ISSUES #23 的裁决 A）
+
+    当前用的 `deepseek-chat` 根本不返回这个字段（只有 reasoner 类模型才返回），
+    所以"解析它"是一条永不执行的死路径；留着它只会让读代码的人以为
+    「我们处理了推理内容」。将来真换到 reasoner、想用它排查"为什么给这个分"时再加 ——
+    但加的时候必须**同时把它的成本计入统计**：推理 tokens 计在
+    `usage.completion_tokens` 里，只取 `reasoning_content` 却不计成本，
+    `jh stats` 就会开始说谎（这类"看着便宜、实际最贵"的账最难查）。
 """
 
 from __future__ import annotations
@@ -211,6 +220,9 @@ class DeepSeekProvider(LLMProvider):
           为什么截断：错误页动辄几十 KB，全文塞进异常会淹没真正有用的信息。
           为什么脱敏：万一某个代理把请求头回显进错误页，`sk-...` 就会顺着
           异常消息进日志/终端 —— 密钥泄露的代价远大于多留几个字符的排查价值。
+
+        ★ 这里只读 `choices[0].message.content`，**不读 `reasoning_content`** ——
+          刻意的，理由见模块 docstring（当前模型不返回它，留着就是死路径）。
         """
         if response.status_code >= 400:
             # 让 httpx 抛，交由上层统一处理（4xx 不重试的判定在 _is_retryable）

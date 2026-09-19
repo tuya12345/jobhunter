@@ -448,7 +448,7 @@ def _clean_company_for_dedup(company: str) -> str:
 def normalize_for_dedup(*parts: str) -> str:
     """把公司 / 职位 / 城市等字段归一化成"用于比对"的字符串（供 dedup hash 用）。
 
-    ★★ 这是去重第二层的核心，规则直接决定"会不会把同一个岗位当成两个"。
+    ★★ 这是去重第三层（归一化 hash）的核心，规则直接决定"会不会把同一个岗位当成两个"。
 
     处理的真实噪音（HR 改标题不改岗位是常态）：
         · 大小写、空格、全半角差异     → `AI Agent` vs `ai  agent`

@@ -136,7 +136,7 @@ def test_normalize_for_dedup_ignores_noise() -> None:
     """★ 归一化要能穿透 HR 常改的那几种噪音。
 
     同一个岗位，HR 改标题不改岗位 —— 下面这些写法必须归一到同一个字符串，
-    否则去重第二层形同虚设（每次重抓都新增一条）。
+    否则去重第三层形同虚设（每次重抓都新增一条）。
     """
     base = normalize_for_dedup("某某科技（深圳）有限公司", "Python开发工程师", "深圳")
     for noisy_title in (
@@ -219,8 +219,8 @@ def test_extract_platform_job_id_from_company_sites() -> None:
     """★ 公司自建招聘站的岗位 ID 在**查询参数**里，也要能抠出来。
 
     实测来历：美团用 `?jobUnionId=4592562550`。抠不到这个 ID 会连锁出两个问题：
-    去重第一层失效，而第二层又因为"页面没写公司名"而放弃 →
-    **同一个链接加三次产生三条重复记录**。
+    去重第一层失效，而第三层又因为"页面没写公司名"而放弃 →
+    **同一个链接加三次产生三条重复记录**（后来第二层"URL 完全相同"就是为此补的）。
     """
     assert (
         extract_platform_job_id(

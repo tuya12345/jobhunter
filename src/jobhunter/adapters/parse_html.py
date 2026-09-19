@@ -7,7 +7,7 @@
     浏览器（adapters/manual.py, Playwright）
         └─ 交出可信的「页面标题 + 可见文本 + 关键区域的 HTML」
               └─ 本模块：把文本解析成 JobDetail（**不碰网络、不需要浏览器**）
-                    └─ services/job_svc.py：入库 + 两层去重
+                    └─ services/job_svc.py：入库 + 三层去重
 
 这么分的直接收益：**P2 的测试完全不需要浏览器**。真实招聘站点在 CI 里
 要么打不开、要么要登录、要么随时改版；而"给定这段文本能解析出什么"是确定性的，
@@ -144,7 +144,7 @@ def extract_platform_job_id(url: str, platform: str | None = None) -> str | None
     ★ 拿不到时返回 None，**绝不拿 URL 本身当 ID**：
       URL 里常带 `?lid=`、`&securityId=`、时间戳等会话参数，
       同一个岗位两次访问的 URL 可能不同 —— 用 URL 当 ID 会产生假重复/假新增。
-      拿不到就交给第二层的归一化 hash 兜底（这也是它存在的意义）。
+      拿不到就交给第三层的归一化 hash 兜底（这也是它存在的意义）。
     """
     if not url:
         return None
