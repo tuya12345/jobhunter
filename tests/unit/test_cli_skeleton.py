@@ -43,13 +43,15 @@ from jobhunter.cli.common import EXIT_NOT_IMPLEMENTED
 
 runner = CliRunner()
 
-# 19 个顶层命令（写死在这里是刻意的：改动命令集合时这条测试会提醒你
+# 顶层命令（写死在这里是刻意的：改动命令集合时这条测试会提醒你
 # "这是一个对外契约的变化，确认一下是不是有意的"）
+#   ★ 2026-09-19 加了 `cache`（ISSUES #25：llm_cache 原来没有清理入口、也看不见命中率）
 EXPECTED_COMMANDS = (
     "init",
     "resume",
     "job",
     "match",
+    "cache",
     "gap",
     "today",
     "apply",

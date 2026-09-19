@@ -293,11 +293,24 @@ process_result_value (读取)：SQLite 返回 naive → 补 tzinfo=UTC
 | **`cache_key`** | Text **PRIMARY KEY** | ❌ | ★★ `sha256(prompt_version ｜ model ｜ jd_hash ｜ resume.content_hash)` |
 | `task` | Text | ✅ | `match` / `greeting` / `tailor` / `jd_parse` / `question_predict` / `leads_parse` |
 | `response_json` | Text(`_json`) | ❌ | 原始结构化响应 |
-| `tokens_in` / `tokens_out` | Integer | ✅ | ★ 成本可见 |
-| `cost` | Numeric/Real | ✅ | ★ 累计花了多少钱（DeepSeek 便宜也要能看见） |
+| `tokens_in` / `tokens_out` | Integer | ✅ | ★ 这一行**当初**的用量（≠ 本次调用，见下方命中率口径） |
+| `cost` | Numeric/Real | ✅ | ★ 这一行**当初**花了多少钱（DeepSeek 便宜也要能看见） |
+| `hits` | Integer | ❌（默认 0） | ★ 这行结果**被复用了几次**（迁移 0004，ISSUES #25；只在 `llm/cache.py::get_cached()` 自增） |
+| `last_hit_at` | UTCDateTime | ✅ | 最近一次被复用的时间（NULL = 从没被复用） |
 | `created_at` | UTCDateTime | | |
 
 **索引**：主键即索引；另加 `ix_llm_cache_task`（按任务统计命中率/成本）。
+
+**命中率 / 省下的口径**（`jh cache stats` 会原样打印，命令见 `docs/config.md` §8）：
+
+```
+命中率 = Σhits ÷ (Σhits + 行数)     每一行 = 一次真实付费调用
+省下   = Σ(每行 cost × 该行 hits)   没记成本的行不计入
+```
+
+★ 为什么 `hits` 落在**这张表的行上**而不是另建流水表：清缓存必须真的"什么都不留下"
+（否则清完之后命中率还挂在一个已经不存在的缓存上）；代价是**同 key 重算时旧 `hits` 归零**，
+口径是"当前这份缓存被复用了几次"。
 
 ### ★★ 为什么缓存 key 必须**包含简历 hash**（评审原始 bug）
 

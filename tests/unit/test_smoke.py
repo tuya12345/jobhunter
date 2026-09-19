@@ -32,7 +32,8 @@ from jobhunter.storage.migrate import current_revision, downgrade_base, upgrade_
 #   0001 初始 11 张表
 #   0002（P6）interview_questions.interview_id 可空 + 新增 job_id（预测题挂岗位）
 #   0003（#42）application_events.event_type 加 CHECK（EVENT_TYPES 八取一）
-EXPECTED_REVISION = "0003"
+#   0004（#25）llm_cache 加 hits / last_hit_at（命中率）
+EXPECTED_REVISION = "0004"
 EXPECTED_TABLES = 11
 
 runner = CliRunner()

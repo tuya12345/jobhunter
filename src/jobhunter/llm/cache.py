@@ -44,22 +44,29 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
 from jobhunter.llm.base import PromptPayload
 from jobhunter.models import LLMCache
+from jobhunter.models.base import utc_now_default
 from jobhunter.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 __all__ = [
+    "SAVED_COST_NOTE",
     "CachedResponse",
     "compute_cache_key",
     "get_cached",
     "payload_fingerprint",
     "put_cached",
 ]
+
+#: "省下多少"的定义（ISSUE #26）—— 与 `services/cache_stats_svc.py` 的 `SAVED_NOTE`
+#: 是同一句话的两个视角，**改一处就要改另一处**（两边都由测试盯着文案里有"cost"）。
+SAVED_COST_NOTE = "命中一次 = 省下那一行 llm_cache.cost（历史值）；没记成本的行不计入"
 
 
 @dataclass
@@ -68,11 +75,29 @@ class CachedResponse:
 
     content: str
     model: str
+    #: ⚠️ 这三个是**这一行当初**的用量与成本，不是"本次调用"花了多少。
+    #: 命中缓存时本次成本是 0（ISSUE #26）；想让用户看到"省了多少"，用 `saved`。
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost: float | None = None
     #: 是否命中缓存（恒为 True；写上是为了让调用方的返回结构与 Provider 一致）
     from_cache: bool = True
+    #: 命中前这行已经被复用过几次（含本次之后的计数值由 `hits_after` 表示）
+    hits: int = 0
+    #: 最近一次被复用的时间（本次命中已经写进去了，所以不会是 None）
+    last_hit_at: datetime | None = None
+
+    @property
+    def saved(self) -> float | None:
+        """这一次命中省下了多少钱 = 那一行的 `cost`（ISSUE #26 的口径，见 `SAVED_COST_NOTE`）。
+
+        ★ 为什么"省下"就等于 `cost` 而不是别的算法：
+          那一行代表"同样的输入曾经真的调用过一次"，命中的意思正是
+          "这一次没有再做那次调用" —— 省下的就是那一次的钱。
+          `cost` 为空（老行、或 Provider 没给出成本）时返回 None，
+          调用方应当把它算成"没记成本"而不是"省了 0 元"。
+        """
+        return self.cost
 
 
 def payload_fingerprint(payload: PromptPayload) -> str:
@@ -160,16 +185,52 @@ def compute_cache_key(
 
 
 def get_cached(session: Session, cache_key: str) -> CachedResponse | None:
-    """按 key 取缓存；没有就返回 None。"""
+    """按 key 取缓存；没有就返回 None。**命中时在这里自增 `hits`。**
+
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║ 这是"命中"这件事**唯一**的写入点（ISSUES #25）                          ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    ★ 为什么自增放在这里，而不是各个调用点自己记一笔：
+
+      命中率算不出来的根因是"没有东西记被复用了几次"。五个调用点
+      （match / greeting / tailor / followup / question）各写一遍的话，
+      第六个调用点必然漏 —— 而这个项目已经因为同一种形态吃过三次亏
+      （#37 形参没人传、#24 只接了一个调用点、#55 于是又漏了四个）。
+      放在唯一的读入口之后，"以后新增调用点会不会漏计数"这个问题
+      **结构上不再存在**：不经过 `get_cached()` 就拿不到缓存内容。
+
+    ★ 只 `flush()` 不 `commit()`（这是有意的，别"顺手修成 commit"）：
+
+      调用方本来就握着事务边界（`match_llm_svc._apply()` / `question_svc`
+      都是"业务结果 + 缓存"一起提交，见 #3 的记录）。这里 commit 会
+      把调用方还没写完的业务数据**提前落盘**，反而制造"缓存写了、结果没写"
+      的中间态。只 flush 的话：成功 → 计数与业务结果一起落盘；
+      失败 → 一起回滚，计数也没算上（一次失败的操作谈不上"省了钱"）。
+
+    ★ 只读路径上不会写坏数据：
+
+      `get_cached()` 自己不开新连接、不碰别的表，只改这一行的两个计数列；
+      查询没命中时**一行都不写**（所以纯读代码路径跑一万次也不会造出幽灵行）。
+    """
     row = session.get(LLMCache, cache_key)
     if row is None:
         return None
+
+    hits_before = row.hits or 0
+    row.hits = hits_before + 1
+    row.last_hit_at = utc_now_default()
+    # 只 flush：把 UPDATE 交给调用方的事务（理由见 docstring 第 ★ 条）
+    session.flush()
+
     return CachedResponse(
         content=row.response_json,
         model=row.model or "",
         tokens_in=row.tokens_in,
         tokens_out=row.tokens_out,
         cost=row.cost,
+        hits=hits_before,
+        last_hit_at=row.last_hit_at,
     )
 
 
@@ -192,6 +253,12 @@ def put_cached(
       用 ORM 的 get/merge 语义最直白，也不会误删 created_at。
       注意**不覆盖 created_at**：它表示"第一次算出来是什么时候"，
       是排查"这个分数是不是陈年老数据"的依据。
+
+    ★ `hits` / `last_hit_at` 也不在这里重置（#25 的口径）：
+      重写同一行的内容时，这两个计数说的是"**当前这份**结果被复用了几次"。
+      把它清零等于每次重算都把缓存价值抹掉，而 `jh cache stats` 正是要看它。
+      （也就是说：想真正归零只有 `jh cache clear` —— 口径写在
+       `services/cache_stats_svc.py` 的模块说明里。）
     """
     existing = session.get(LLMCache, cache_key)
     if existing is not None:

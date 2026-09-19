@@ -30,12 +30,18 @@ runner = CliRunner()
 
 MIGRATION_0003 = "ck_application_events_event_type"
 
+#: 当前 head 的 revision。0004（#25，llm_cache 加 hits/last_hit_at）之后
+#: 它不再是那个断言里写死的 "0003" —— 这里只保留与 #42 有关的断言，
+#: 把"head 是哪个版本"留给 `test_smoke.py::test_revision_is_at_head` 一处去守。
+HEAD_REVISION = "0004"
+
 
 # ===========================================================================
 # #42 —— event_type 的 CHECK 约束（迁移 + 服务层两道）
 # ===========================================================================
 def test_migration_is_at_0003(engine) -> None:
-    assert current_revision(engine) == "0003"
+    """#42 的约束在 head 版本上依然生效（revision 号本身由 smoke 守）。"""
+    assert current_revision(engine) == HEAD_REVISION
 
 
 def test_event_type_check_exists_in_db(engine) -> None:
@@ -162,7 +168,7 @@ def test_migration_repairs_invalid_event_types_before_adding_the_check(db_url) -
             rows = conn.execute(
                 text("SELECT event_type, payload_json FROM application_events ORDER BY id")
             ).all()
-        assert current_revision(engine) == "0003"
+        assert current_revision(engine) == HEAD_REVISION
     finally:
         engine.dispose()
 
@@ -227,7 +233,7 @@ def test_migration_downgrade_removes_the_check_and_keeps_data(db_url) -> None:
     upgrade_head(db_url)  # 三连的最后一步：还能再升回去
     engine = create_db_engine(db_url)
     try:
-        assert current_revision(engine) == "0003"
+        assert current_revision(engine) == HEAD_REVISION
         assert "application_events" in set(inspect(engine).get_table_names())
     finally:
         engine.dispose()

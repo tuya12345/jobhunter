@@ -29,6 +29,29 @@
     · 缓存是纯派生数据，可以随时整体清掉而不影响业务数据 ——
       独立表让"清缓存"成为一句 DELETE，不会有牵连。
 
+★★ `hits` / `last_hit_at` 两列（ISSUES #25）—— 为什么"被复用了几次"必须落库
+
+    这张表原来只记"这一行是多少钱算出来的"，没有记"这一行被复用了几次"。
+    于是命中率**根本算不出来**（`jh cache stats` 要它），只能给一个"有多少行"
+    —— 而"有多少行"回答不了"缓存到底有没有用"。
+
+    两条路可选：
+      ① 每行加两列，在**唯一入口** `llm/cache.py::get_cached()` 自增；
+      ② 另建一张"命中流水表"，每次命中写一行。
+    选了 ①，理由：
+      · 命中流水表与 `jh cache clear` 的承诺自相矛盾 —— 本文件下面写着"删掉缓存
+        不影响业务数据"，而清空缓存后流水表里还留着"曾经命中过"，命中率会挂在
+        一个已经不存在的缓存上；
+      · ① 让"命中"这件事只有一个写入点（`get_cached`），以后新增调用点不会漏计数
+        ——"形参加了但没人传"在这个项目已经出现过三次（#37 / #24 / #55）。
+    代价：同 key 重算（`put_cached` 覆盖写）时旧 `hits` 会归零，口径是"当前这份
+    缓存被复用了多少次"，不是"这个任务历史上被复用多少次"。写在 `cache_stats_svc`
+    的模块说明里，免得下一个人以为是 bug。
+
+★ `hits` 为什么给 server_default / default=0 而不是可空：
+    可空的话 "0 次命中" 与 "还没统计过" 就分不出来，而这两者对命中率的影响
+    完全不同（前者算 0%、后者应当算"无数据"）。默认 0 让口径唯一。
+
 ★ 为什么**不建外键**：
     缓存与业务生命周期解耦。删掉一个岗位不应该级联删缓存
     （缓存命中判断本来就走 cache_key，不依赖岗位是否存在）。
@@ -70,9 +93,17 @@ class LLMCache(Base):
 
     # 用量与成本：DeepSeek 很便宜，但"便宜"不等于"不用看"。
     # 有了这三列，`jh stats` 才能回答"这个月花了多少钱、哪个任务最贵"。
+    #
+    # ⚠️ 它们是**这一行当初真花掉的钱**，不是"本次调用"的钱：
+    #    命中缓存时本次成本记 0（ISSUE #26），要算"省下多少"就用 cost × hits。
     tokens_in: Mapped[int | None] = mapped_column(Integer)
     tokens_out: Mapped[int | None] = mapped_column(Integer)
     cost: Mapped[float | None] = mapped_column(Float)
+
+    #: 这行结果被复用了几次（只在 `llm/cache.py::get_cached()` 自增）
+    hits: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    #: 最近一次被复用的时间（从没命中过则为 NULL，`jh cache stats` 用它回答"还在用吗"）
+    last_hit_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, default=utc_now_default, nullable=False
@@ -90,4 +121,4 @@ class LLMCache(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<LLMCache key={self.cache_key[:12]}… task={self.task!r}>"
+        return f"<LLMCache key={self.cache_key[:12]}… task={self.task!r} hits={self.hits}>"

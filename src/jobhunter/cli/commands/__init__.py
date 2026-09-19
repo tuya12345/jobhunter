@@ -24,6 +24,7 @@ import typer
 
 from jobhunter.cli.commands.apply_cmd import app as apply_app
 from jobhunter.cli.commands.assessment_cmd import app as assessment_app
+from jobhunter.cli.commands.cache_cmd import app as cache_app
 from jobhunter.cli.commands.cal_cmd import app as cal_app
 from jobhunter.cli.commands.demo_cmd import app as demo_app
 from jobhunter.cli.commands.followup_cmd import app as followup_app
@@ -48,6 +49,10 @@ COMMANDS: list[tuple[str, typer.Typer]] = [
     ("resume", resume_app),  # P1 简历
     ("job", job_app),  # P2 岗位录入
     ("match", match_app),  # P3 匹配打分
+    # ★ P3 收尾（ISSUES #25 / #26）：LLM 缓存的看板与清理。
+    #   放在 match 后面而不是按字母序摆到最后 —— 只用过 LLM 精评的人才需要它，
+    #   而且 `jh match run` 结尾那句"缓存省下多少"正指向这里。
+    ("cache", cache_app),
     ("gap", gap_app),  # P3 反向技能缺口
     ("today", today_app),  # P4 待投清单
     ("apply", apply_app),  # P4 / P4.5 投递与零手打跟进
