@@ -218,8 +218,14 @@ class ManualAdapter(JobSource):
             browser = playwright.chromium.launch(headless=True)
             try:
                 context = browser.new_context(
-                    # 用正常的中文桌面 UA：不是伪装，而是让站点返回中文页面
-                    # （默认 UA 会带 "HeadlessChrome" 字样，部分站点会直接拒绝）
+                    # ★ 为什么固定用「中文 + 桌面版 Chrome」的 UA 与 locale（ISSUES #19）：
+                    #   · locale=zh-CN  → 让站点返回**中文**页面（默认 en-US 会拿到英文文案，
+                    #     公司名/岗位名都变成英文，关键词抽取与匹配全部失真）；
+                    #   · 桌面 UA       → 让站点返回**桌面版**页面结构。移动版是另一套 DOM，
+                    #     解析规则（最长文本块 / data-test 属性）在移动版上不成立。
+                    #   它**不是**用来规避风控的：整个进程只发这一个 UA、**不随请求轮换**、
+                    #   不伪造 Referer/Cookie；抓取路径也仍然只是"用户手动给的单个链接"，
+                    #   没有自动翻页、没有批量遍历（见 docs/COMPLIANCE.md §5.2 / §5.5）。
                     locale="zh-CN",
                     viewport={"width": 1440, "height": 900},
                     user_agent=(

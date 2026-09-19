@@ -41,6 +41,7 @@ from pydantic_settings import (
 )
 
 from jobhunter.config.paths import PathSet, default_paths
+from jobhunter.config.vocabulary import BUILTIN_SKILLS
 
 __all__ = [
     "AppSettings",
@@ -55,6 +56,14 @@ __all__ = [
 
 # 环境变量名：指定 config.yaml 的位置（CLI 的 --config 也写这个变量）
 ENV_CONFIG = "JH_CONFIG"
+
+#: 单条开场白禁用词的长度上限（ISSUES #43）。
+#:
+#: ★ 为什么要有上限：禁用词走的是**朴素子串匹配**（`if word in text`）。
+#:   写进去一整个句子，就等于"开场白里不能出现这句话的任何一个片段"，
+#:   正常文案会被大面积误伤（`docs/config.md` §6 记着一次同类事故）。
+#:   12 字足够覆盖真实套话（"感谢您的阅读"是 6 字），再长就该考虑换个判定方式了。
+MAX_BANNED_WORD_CHARS = 12
 
 
 class _YamlSource(YamlConfigSettingsSource):
@@ -160,13 +169,18 @@ class TailorSettings(BaseModel):
 class RateLimitSettings(BaseModel):
     """频率克制（合规红线之一）。
 
-    随机延时 + 翻页上限 + 出错即停 —— 不做自动搜索，但即使抓详情也要有节奏，
+    随机延时 + 出错即停 —— 不做自动搜索，但即使抓详情也要有节奏，
     避免给目标站点造成压力，也避免被风控标记。
+
+    ★ 这里**刻意没有** `max_pages`（ISSUES #18）：它曾经存在，但全仓没有任何读取点，
+      而 `docs/COMPLIANCE.md` 却据此声称"抓取路径带翻页上限"——
+      **合规文档声称一个不存在的控制，比一个没人读的配置项严重得多**。
+      现在默认路径只抓用户手动给的单个链接，没有自动翻页，所以也不需要这个上限。
+      将来真要做翻页，配置项和文档要一起加（并且要有真实读取点）。
     """
 
     min_delay_seconds: float = Field(default=2.0, ge=0.0)
     max_delay_seconds: float = Field(default=5.0, ge=0.0)
-    max_pages: int = Field(default=3, ge=1, le=50)
 
     @model_validator(mode="after")
     def _check_range(self) -> RateLimitSettings:
@@ -354,9 +368,77 @@ class AppSettings(BaseSettings):
             if not aliases:
                 raise ValueError(f"skill_aliases[{canonical!r}] 的别名列表不能为空")
 
-        # 禁用词只做去空，不强制非空（用户可以一个都不填）
-        self.greeting_banned_words = [w for w in self.greeting_banned_words if w.strip()]
+        self._check_learning_whitelist()
+        self._check_banned_words()
         return self
+
+    # ------------------------------------------------------------------
+    # ISSUES #43：这两项以前"写错了不报错"，后果都是**静默无效**
+    # ------------------------------------------------------------------
+    def _check_learning_whitelist(self) -> None:
+        """学习白名单里的词必须是**词表里存在的技能**。
+
+        ★ 挡的是什么：白名单的用途是"允许提、但必须标注『在学习』"。
+          如果写成一个词表里没有的词（九成是拼错，比如 `LanchChain`），
+          它既抽不出来、也不会有任何一份 JD 提到它 ——
+          用户以为放开了某个技能，实际上这份白名单**永远是空的**，而且不报错。
+
+        ★ 为什么"必须是词表里的词"而不是"随便写、我们自动收进词表"：
+          后者正是改动前的行为（`resume_svc.load_skill_vocabulary` 会把白名单里的词
+          `setdefault` 进词表），它让**拼写错误也变得合法**——错词只是安静地躺在词表里。
+          现在改为：想加一个新技能，先在 `skill_aliases` 里把它声明成规范名
+          （那样它本来就会进词表、也才能从 JD 里抽出来），再放进白名单。
+          报错信息里直接给出这一步，用户不用去翻文档。
+        """
+        if not self.learning_whitelist:
+            return
+        known = set(BUILTIN_SKILLS) | set(self.skill_aliases)
+        unknown = [w for w in self.learning_whitelist if w.strip() and w.strip() not in known]
+        blank = [w for w in self.learning_whitelist if not w.strip()]
+        if blank:
+            raise ValueError(
+                "learning_whitelist 里有空白项：期望每一项都是一个技能名，"
+                "空白项永远匹配不上任何东西（多半是多写了一个 `-`）"
+            )
+        if unknown:
+            raise ValueError(
+                "learning_whitelist 里出现了词表里没有的技能："
+                + "、".join(repr(w) for w in unknown)
+                + "。\n"
+                "  期望：只写内置技能词表（见 jobhunter/config/vocabulary.py）里已有的技能名，"
+                "或先把它作为规范名写进 skill_aliases。\n"
+                "  为什么必须这样：白名单里的错词永远不会命中任何 JD，"
+                "「我在学 X」这条规则会静默失效 —— 你只会觉得这个功能没效果。"
+            )
+
+    def _check_banned_words(self) -> None:
+        """开场白禁用词必须是**有意义的短词**（ISSUES #43）。
+
+        ★ 以前这里只做 `[w for w in ... if w.strip()]` 静默去空，问题有两个：
+          · 用户在列表里多写一个空行 / 一个 `-`，配置看起来"生效了"，其实被悄悄丢掉；
+          · 超长句子当禁用词会**误伤**：禁用词是朴素子串匹配，
+            写进去一整句话，等于要求开场白不能出现那句话里的任何一个字序组合
+            （`docs/config.md` §6 记着上一次同类事故：太短的词导致每条文案都被判违规）。
+          所以现在：空串/纯空白直接报错，并给一个长度上限。
+        """
+        for index, word in enumerate(self.greeting_banned_words):
+            if not word.strip():
+                raise ValueError(
+                    f"greeting_banned_words 第 {index + 1} 项是空的（值 {word!r}）："
+                    "空字符串会被当成『匹配一切』的禁用词，必须删掉这一项"
+                )
+            if word != word.strip():
+                raise ValueError(
+                    f"greeting_banned_words 第 {index + 1} 项首尾有空白（值 {word!r}）："
+                    f"期望写成 {word.strip()!r}，否则匹配不上任何正常文案"
+                )
+            if len(word) > MAX_BANNED_WORD_CHARS:
+                raise ValueError(
+                    f"greeting_banned_words 第 {index + 1} 项太长"
+                    f"（{len(word)} 字 > 上限 {MAX_BANNED_WORD_CHARS}）："
+                    f"值 {word!r}。禁用词是朴素子串匹配，写一整句话会误伤大量正常文案 —— "
+                    "请只留套话级词（如 贵司 / 三生有幸 / 冒昧打扰）"
+                )
 
     # ------------------------------------------------------------------
     # 便捷访问

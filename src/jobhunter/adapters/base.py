@@ -19,7 +19,9 @@
     1. 适配器**只做读**：抓详情、解析页面。**绝不**点击投递按钮、
        绝不点赞/私信/关注 —— 不做任何写操作。
     2. 频率克制：请求之间必须有随机延时（config 的 rate_limit），
-       遵守翻页上限，出错即停；不绕过验证码/风控/签名。
+       出错即停；不绕过验证码/风控/签名。
+       ★ 这里原本还写着"遵守翻页上限"，随 ISSUES #18 一并删掉：那个上限从来没有读取点，
+         而默认路径只抓**用户手动给的单个链接**，根本没有翻页可限（见 COMPLIANCE.md §5.2）。
     3. 失败必须能降级：抓不到就返回 `None` 并让上层提示"手动粘贴 JD"，
        绝不让整条链路断掉（网络不通也要能用 —— 这是 `--manual` 存在的理由）。
 """
@@ -128,9 +130,7 @@ class JobSource(ABC):
         """
         raise NotImplementedError
 
-    def search(
-        self, keyword: str, city: str | None = None, *, max_pages: int = 1
-    ) -> list[SearchResult]:
+    def search(self, keyword: str, city: str | None = None) -> list[SearchResult]:
         """搜索岗位（**可选能力，默认不支持**）。
 
         默认抛 NotImplementedError —— 这是一个**故意的**设计：
@@ -138,6 +138,12 @@ class JobSource(ABC):
             · BOSS 的自动搜索必须先过 spike 验证，没通过就不该有实现；
             · 一个明确报错的"未支持"，比一个偷偷返回空列表的假实现好得多
               （后者会让人误以为"搜了但没结果"）。
+
+        ★ 这里原本带一个 `max_pages` 参数（ISSUES #18 时删掉）：它和配置里的
+          `rate_limit.max_pages` 一起构成了"我们有翻页上限"的错觉 ——
+          而**这个方法没有任何实现、也没有任何调用方**，那个"上限"从来没生效过。
+          将来真要做自动搜索，**参数、配置项、COMPLIANCE 的说明要一起加回来**，
+          不要只加其中一样（那正是 #18 的成因）。
         """
         raise NotImplementedError(
             f"{type(self).__name__} 不支持搜索。"
