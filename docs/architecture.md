@@ -124,7 +124,9 @@ projects/jobhunter/
 ├── spikes/
 │   └── boss_search_spike.py          [P2] 自动搜索可行性 spike（2h，可选）
 ├── prompts/
-│   └── tailor.md                     [P5] ★ 七要素提示词（版本号写在文件里，见"提示词版本纪律"）
+│   ├── tailor.md                     [P5] ★ 七要素提示词（版本号写在文件里，见"提示词版本纪律"）
+│   ├── question.md                   [P6] ★ JD 预测面试题
+│   └── followup.md                   [P6] ★ 追问话术
 │                                     ⚠️ match / greeting 的提示词目前仍内联在各自 svc 里
 │                                        （`match_llm_svc.SYSTEM_PROMPT` / `greeting_svc.SYSTEM_PROMPT`）；
 │                                        要不要一起搬到 prompts/ 记在 P9 收尾清单里
@@ -144,6 +146,7 @@ projects/jobhunter/
 │   │       ├── gap_cmd.py            [P0 占位 / P3 实现]
 │   │       ├── today_cmd.py          [P0 占位 / P4 实现]
 │   │       ├── apply_cmd.py          [P0 占位 / P4+P4.5 实现] ★ 单命令应用
+│   │       ├── tailor_cmd.py         [P0 占位 / P5 实现] ★ brief/analyze/list/diff/approve/export
 │   │       ├── interview_cmd.py      [P0 占位 / P6 实现]
 │   │       ├── question_cmd.py       [P0 占位 / P6 实现]
 │   │       ├── assessment_cmd.py     [P0 占位 / P6 实现]
@@ -151,8 +154,7 @@ projects/jobhunter/
 │   │       ├── weak_cmd.py           [P0 占位 / P6 实现]
 │   │       ├── stats_cmd.py          [P0 占位 / P6 实现]
 │   │       ├── report_cmd.py         [P0 占位 / P6 实现]
-│   │       ├── cal_cmd.py            [P0 占位 / P6 实现]
-│   │       ├── tailor_cmd.py         [P0 占位 / P5 实现] ★ brief/analyze/list/diff/approve/export
+│   │       ├── followup_cmd.py       [P0 占位 / P6 实现]
 │   │       ├── leads_cmd.py          [P0 占位 / P7 实现]
 │   │       └── demo_cmd.py           [P0 占位 / P9 实现]
 │   ├── services/
@@ -163,11 +165,22 @@ projects/jobhunter/
 │   │   ├── match_svc.py              [P3] ★ 核心
 │   │   ├── gap_svc.py                [P3]
 │   │   ├── greeting_svc.py           [P4]
-│   │   ├── track_svc.py              [P4/P6]
-│   │   ├── tailor_svc.py             [P5]
-│   │   ├── fidelity.py               [P5] ★ FidelityGuard
-│   │   ├── leads_svc.py              [P7]
-│   │   └── report_svc.py             [P6]
+│   │   ├── apply_svc.py              [P4/P4.5] 投递状态与事件流
+│   │   ├── today_svc.py              [P4] 待投清单
+│   │   ├── export_svc.py             [P4] 导出（只写新文件）
+│   │   ├── tailor_svc.py             [P5] ★ 定制简历（brief/analyze/approve/export）
+│   │   ├── fidelity.py               [P4/P5] ★ FidelityGuard（防编造，三处强制）
+│   │   ├── interview_svc.py          [P6] 面试场次
+│   │   ├── question_svc.py           [P6] 面试问题（记录 + JD 预测）
+│   │   ├── assessment_svc.py         [P6] 笔试/测评 + 截止提醒
+│   │   ├── offer_svc.py              [P6] Offer 登记与年包比较
+│   │   ├── weak_svc.py               [P6] 薄弱点聚合（按没答上来次数）
+│   │   ├── track_svc.py              [P6] 投递时间轴（读 append-only 事件流）
+│   │   ├── stats_svc.py              [P6] 转化率口径（"至少走到过"）
+│   │   ├── report_svc.py             [P6] 周报 Markdown
+│   │   ├── followup_svc.py           [P6] 追问话术（只生成，不发送）
+│   │   ├── cal_svc.py                [P6] .ics 导出（面试/笔试/Offer 截止）
+│   │   └── leads_svc.py              [P7]
 │   ├── adapters/
 │   │   ├── __init__.py
 │   │   ├── base.py                   [P0] ★ JobSource / JobDetail 契约（定死接口）
@@ -179,7 +192,9 @@ projects/jobhunter/
 │   │   ├── base.py                   [P0] ★ LLMProvider 抽象
 │   │   ├── deepseek.py               [P3] DeepSeek（OpenAI 兼容）
 │   │   ├── mock.py                   [P0] ★ 测试用假 Provider（CI 不联网）
-│   │   └── cache.py                  [P3] llm_cache 读写 + cache_key 计算
+│   │   ├── cache.py                  [P3] llm_cache 读写 + cache_key 计算
+│   │   ├── safety.py                 [P4.5] ★ wrap_delimited（不可信输入的中和）
+│   │   └── prompts.py                [P6] ★ prompts/*.md 的加载 + 版本纪律（三处共用）
 │   ├── storage/
 │   │   ├── __init__.py
 │   │   ├── db.py                     [P0] ★ engine/session + PRAGMA(WAL/FK/busy_timeout)
@@ -372,7 +387,7 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 | P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | ✅ **已完成** |
 | P4.5 | 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | ✅ **已完成** |
 | P5 | AI 定制简历（`tailor brief` → 完整版 + FidelityGuard） | ✅ **已完成**（本轮交付；详见 `STATUS.md`） |
-| P6 | 看板 + 面试 + 问题记录 + 笔试/Offer + 统计 + 报告 + .ics | 未开始 |
+| P6 | 看板 + 面试 + 问题记录 + 笔试/Offer + 统计 + 报告 + .ics | ✅ **已完成**（详见 `STATUS.md`） |
 | P7 | App 线索（技术验证：1 平台 + probe + 抓屏 + YAML 降级链） | 未开始 |
 | P8 | Web 界面（移出主线） | 未开始 |
 | P9 | 开源收尾（README 定稿 / demo 独立库 / LICENSE / COMPLIANCE） | 未开始 |

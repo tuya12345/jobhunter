@@ -29,7 +29,9 @@ from jobhunter.storage.db import EXPECTED_PRAGMAS, check_pragmas, create_db_engi
 from jobhunter.storage.migrate import current_revision, downgrade_base, upgrade_head
 
 # 迁移脚本里的版本号（改了迁移就要改这里 —— 这本身就是一道提醒）
-EXPECTED_REVISION = "0001"
+#   0001 初始 11 张表
+#   0002（P6）interview_questions.interview_id 可空 + 新增 job_id（预测题挂岗位）
+EXPECTED_REVISION = "0002"
 EXPECTED_TABLES = 11
 
 runner = CliRunner()

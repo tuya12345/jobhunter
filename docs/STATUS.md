@@ -6,6 +6,126 @@
 
 ---
 
+## P6 —— 完整跟进体系（看板 + 面试 + 问题 + 笔试/Offer + 统计 + 报告 + 日历）
+
+**状态**：✅ 开发完成 → 待按流程提交平台，**等待复验**
+**测试**：`pytest tests/` **781 passed / 0 failed**（含 `tests/verify/`，24 xfailed 是验证会话登记的 🟡/🟢）
+　　　　本阶段新增 **103 条**：`test_p6_tracking.py`（45，我）+ `test_assessment_offer.py`（29，子代理）
+　　　　+ `test_cal.py`（29，子代理）
+**阶段标记**：`jh --version` = `phase P6`
+**契约**：提示词 8（plan 786-814）+ 模块④（plan 357-366）
+
+### 1. 做了什么（9 条命令 + 1 个 schema 迁移）
+
+| 命令 | 行为 |
+|---|---|
+| `jh apply --timeline <job_id>` | 投递时间轴：读 append-only 事件流，按**发生时间**（不是录入顺序）画 |
+| `jh interview add/list` | 约面（推进到 interview + 写 `interview_scheduled` 事件）；`--upcoming` 只看接下来要面的 |
+| `jh question add` | 记真实被问的题（`source=recorded`）；`--interview` 或 `--job` 二选一；3 档自评 + `--weak` |
+| `jh question predict <job_id>` | ★ 按 JD 猜 N 道题（`source=predicted`）→ 存库、**挂岗位**；同岗位重复题跳过 |
+| `jh question list` | 按面试/岗位/来源过滤 |
+| `jh weak` | ★ 按知识点聚合、**按"没答上来次数"降序** + 一句结论（🔴/🟡/🟢）；实录与预测**分列** |
+| `jh assessment add/list` | 笔试/测评 + 截止时间（`--upcoming` 复用 `reminder_svc` 的 3 天窗口常量） |
+| `jh offer add/compare` | Offer 登记 + 横向比较（★ 年包 = 月薪 × 月数，最大者高亮） |
+| `jh followup <job_id>` | ★ 追问话术（**只生成，不发送**）；`--sent` 才写 `followup` 事件 |
+| `jh stats [--days] [--export md\|csv]` | ①平台转化率 ②开场白变体 ③方向回音（只记录，不宣称显著性） |
+| `jh report [--since] [--out]` | 求职周报 Markdown（只写新文件） |
+| `jh cal export [--days]` | .ics（面试 1 小时 / 笔试与 Offer 截止 30 分钟提醒），**幂等覆盖**同一文件 |
+
+**schema 迁移 `0002`**（本阶段唯一的结构变更，也是设计缺口被真实用法暴露出来的一次）：
+`interview_questions.interview_id` 由 NOT NULL 改为**可空**，新增 `job_id`（FK→jobs，`SET NULL`）。
+原因：`jh question predict <job_id>` 拿的是**岗位**，而"准备面试"通常发生在面试还没约上的时候；
+坚持 NOT NULL 只能逼用户编一个面试时间、或造一条假的 `interviews` 记录 ——
+后者会污染 `jh interview list`、`jh stats` 的面试场次统计和顶部"本周面试"提醒。
+回滚是**有损**的（先删预测题再改回 NOT NULL），但真实记录一条不动，迁移文件里写明了。
+
+### 2. 关键设计决定（都有测试守着）
+
+| 决定 | 为什么 |
+|---|---|
+| 统计口径 = **"至少走到过这一步"**（当前状态 ∪ 事件流里出现过的状态） | 按当前状态算会系统性低估：现在被拒的投递，可能走到过二面。事件流 append-only 就是为了这个 |
+| 每个比率都带分子/分母 `25.0%（6/24）` | 只有百分比时，`100%` 是 1/1 还是 20/20 看不出来 —— 而这决定它是不是噪声 |
+| 样本 < 10 条时**明说**"别据此下结论" | 纪律：只记录对比，不宣称统计显著性（评审采纳）。工具不该生成伪结论 |
+| `jh weak` 按**没答上来次数**排序，不按平均分 | 平均分被"只问过一次、答得一般"的题拉平；"同一知识点连续三次答不上来"才是信号 |
+| 实录 / 预测**分列展示**，`--recorded-only` 可过滤 | 预测题答不上来 = 准备不足；实录答不上来 = 能力缺口。合并会得出两个都不准的结论 |
+| 预测题**不过** FidelityGuard | 它是**提问**（"你了解过 Kubernetes 吗"），不是"声称我会"。按编造拦掉会把最有价值的准备题删掉 |
+| 追问话术**过** FidelityGuard（与开场白同一套）+ 确定性模板兜底 | 它是要发给 HR 的；而追问消息短、结构固定，写一份只用真话拼的模板完全可行（与 `tailor analyze` 的"没有诚实模板"形成对照） |
+| 时间轴读 `occurred_at`（发生时间），不是 `created_at`（录入时间） | 补记的事件在时间轴上该落在**发生的时刻**，否则"昨晚面的试今天记"看起来像今天面的 |
+| `.ics` **覆盖**同名文件（其它导出都只写新文件） | 日历是**幂等快照**：产生 `jobhunter-2.ics` 会让用户每次导入都多一份重复事件 |
+| 登记笔试/面试/Offer 时投递状态**只前进不回退** | 副作用不该把用户明确设过的状态改回去（补记一场已面完的面试，不该把 offer 拽回 interview） |
+| `jh followup --sent` 才写事件 | 生成 ≠ 发送。把生成当发送会让时间轴撒谎 |
+
+### 3. 与计划书字面不一致的一处（有意为之）
+
+计划书写的是 `jh apply timeline <job_id>`，实现是 **`jh apply --timeline <job_id>`**。
+原因：`jh apply` 是**单命令应用**，它的 callback 带可变位置参数（`3=applied "字节"` 那种语法），
+而 Click 在"组回调声明了位置参数"时**永远不会分派子命令** —— `timeline` 会被当成位置参数吃掉
+（`apply_cmd.py` 的模块 docstring 从 P4.5 起就记着这条坑，并已有测试守着）。
+功能完全一致，只是形状从子命令改成选项。
+
+### 4. 因此失效的用例（请验证会话处理，我没有动 `tests/verify/`）
+
+`tests/verify/test_v_checklist12.py::test_unimplemented_features_report_honestly` 里这几条现在会红
+（它们断言这些命令仍是占位）：
+
+| 参数化用例 | 现在的行为 |
+|---|---|
+| `["apply", "--timeline", "1"]` | 真实现（无库时 exit 1 + "请先运行 jh init"） |
+| `["followup", "1"]` | 真实现 |
+| `["stats"]` | 真实现 |
+| `["offer", "compare"]` | 真实现 |
+| `["cal", "export"]` | 真实现 |
+| `["report"]` | 真实现 |
+
+`["leads", ...]`（P7）与 `["demo"]`（P9）仍然有效。
+我自己的 `tests/unit/test_cli_skeleton.py` 已同步把这些移出占位清单并注明由功能测试接手。
+
+### 5. 已知边界 / 未覆盖的地方
+
+1. **`jh stats` 的"方向"用的是打分时存下来的 `jd_direction`**（`jobs.rule_detail_json`），
+   没打过分的岗位归到「（未打分）」。这样统计与"我当时看到的匹配结果"一致，
+   但也意味着**没跑过 `jh match run` 的岗位不进方向分组**（不是漏统计，是没数据）。
+2. **`--upcoming`（笔试）包含"已过期但状态仍待做"的条目**，而顶部提醒只推未来 3 天 ——
+   有意差异：列表是"我该处理什么"，提醒是"什么快到点了"。
+3. **`jh report` 的薄弱点是累计口径**（不只看这一周），报告里写明了；
+   想只看某周不足以支撑结论（样本太小）。
+4. **追问话术的"沾边"要求比开场白松**（提到一个真会的东西即可）：它的核心是"问一下进度"，
+   不是"推销技能"。
+5. **`jh cal export` 只覆盖三种事件**（面试/笔试截止/Offer 截止），不含自定义日程。
+6. 预测题与真实题的**去重只看完全相同**（归一化后逐字相等），不做模糊相似 ——
+   引入主观阈值会让人丢掉该看的题。
+
+### 6. 建议重点验证的地方（verify hints）
+
+1. **状态机**：`rejected` 从任意状态、`offer` 从 `interview` 直接跳；重复打标**不写重复事件**
+   （数事件条数）。
+2. **统计口径**：造"走到 interview 后被拒"的投递，断言它仍算进 已读/回复/约面 ——
+   这是本阶段最容易写错的一处（按当前状态算会静默低估）。
+3. **时间轴**：反向录入（先记 viewed 再补记更早的 replied）→ 断言时间轴按**发生时间**排序。
+4. **迁移 0002**：`upgrade → downgrade → upgrade` 三连；downgrade 会删掉预测题
+   （真实题保留）；预测题在 `interview_id IS NULL` 下能插入，删岗位时 `job_id` 变 NULL 而记录保留。
+5. **`jh weak`**：同一知识点 3 次没答上来必须排第一；实录/预测分列；没分类的题要**被提示**出来。
+6. **追问话术**：编造类输出（"精通 Kubernetes / 提升 300%"）必须降级成模板并说明原因；
+   `--sent` 之前不得写 followup 事件。
+7. **`.ics`** 可拿真日历软件导入一次（我用文本断言守住了 CRLF/折行/转义/UID 稳定性，
+   但"Outlook/手机日历能不能导入"只有真导入才知道 —— 这一步我没做）。
+
+### 7. 关键文件
+
+| 文件 | 职责 |
+|---|---|
+| `services/track_svc.py` | 时间轴（事件流 → 人话） |
+| `services/interview_svc.py` / `question_svc.py` | 面试场次 / 问题记录 + JD 预测 |
+| `services/assessment_svc.py` / `offer_svc.py` | 笔试与 Offer（年包比较） |
+| `services/weak_svc.py` / `stats_svc.py` / `report_svc.py` | 薄弱点 / 转化率口径 / 周报 |
+| `services/followup_svc.py` / `cal_svc.py` | 追问话术（带闸门）/ .ics 导出 |
+| `llm/prompts.py` | ★ 提示词文件加载 + 版本纪律（P6 抽出，tailor 也改用它） |
+| `prompts/question.md` / `prompts/followup.md` | 两个新提示词（七要素，版本号在文件里） |
+| `alembic/versions/0002_question_job_id.py` | 预测题挂岗位的迁移 |
+| `src/jobhunter/models/constants.py` | 新增 `INTERVIEW_STATUSES` |
+
+---
+
 ## P5 —— AI 定制简历 + FidelityGuard
 
 **状态**：✅ 开发完成 → 待按流程提交平台，**等待复验**

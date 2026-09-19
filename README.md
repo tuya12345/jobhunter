@@ -176,14 +176,37 @@ jh tailor list                  # 看历史版本
 jh tailor diff 3                # 看某版建议的前后对比（原 → 改 + 理由）
 jh tailor approve 3 --all       # 逐条批准（approve 前会**再校验一遍**）
 jh tailor export 1              # 导出 docx（★ 只写新文件，原简历 hash 不变）
+
+# ⑨ 面试与问题（P6）—— 把"记录工具"变成"准备工具"
+jh interview add --job 3 --round 一面 --at "2026-09-11 14:00" --mode 视频
+jh interview list --upcoming    # 接下来要面什么
+jh question predict 3           # ★ 按 JD 猜 5 道可能被问的题（source=predicted）
+jh question add --interview 2 --q "..." --rating bad --category "Redis 缓存" --weak
+jh weak                         # ★ 该补什么：按知识点聚合、按"没答上来次数"排序
+jh apply --timeline 3           # 这单一路怎么走过来的（读 append-only 事件流）
+
+# ⑩ 笔试 / Offer / 追问（P6）
+jh assessment add --job 3 --kind 笔试 --deadline "2026-09-11 23:59"
+jh assessment list --upcoming
+jh offer add --job 3 --salary "20-25K" --salary-month 22000 --months 15 --deadline "2026-09-20"
+jh offer compare                # ★ 年包 = 月薪 × 月数，横向比（15 薪 vs 13 薪差 5 万/年）
+jh followup 3 --copy            # ★ 追问话术（投了 N 天没动静）；本工具不会替你发送
+
+# ⑪ 复盘：统计 / 周报 / 日历（P6）
+jh stats                        # 平台转化率 / 开场白变体 / 方向回音（只记录，不宣称显著性）
+jh report                       # 求职周报 Markdown（只写新文件）
+jh cal export                   # 面试 + 笔试/Offer 截止导出 .ics（给自己手机日历提醒）
 ```
 
-**MVP 到此完成** —— 从零到能用的完整流程就是上面①~⑧：
+**MVP 到此完成** —— 从零到能用的完整流程就是上面①~⑪：
 
 ```
 jh init → jh resume add → jh job add <链接> → jh match run → jh gap
        → jh today → jh today --copy N → 去招聘 App 粘贴投递 → jh apply N=applied
        → 想为某个岗位定制简历：jh tailor brief N → analyze N → approve → export
+       → 约上面：jh interview add → 面完 jh question add（--weak 标答崩的）
+       → 收到笔试/Offer：jh assessment add / jh offer add → jh offer compare
+       → 每周复盘：jh stats / jh report；手机提醒：jh cal export
        → 之后每天随便敲任何一条 jh 命令，顶部都会告诉你"有几条该跟进了"
 ```
 
@@ -208,8 +231,27 @@ jh init → jh resume add → jh job add <链接> → jh match run → jh gap
 > ★ 判不出来的维度（比如 JD 太短、一个技能词都没抽到）会把权重**让给**其余维度，
 > 而不是给 0 分；`jh match explain` 里会写明 `redistributed`。
 
-> 当前进度：**P0–P5 已完成（★ MVP 完成）**，其余命令仍是**占位**，
+> 当前进度：**P0–P6 已完成**，其余命令仍是**占位**，
 > 执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
+> （P7 是 App 线索的技术验证，P8 是 Web 界面，P9 是开源收尾。）
+
+### 转化率为什么可信（P6 的统计口径）
+
+`jh stats` / `jh report` 只做一件事：**把"至少走到过哪一步"数出来**。
+
+| 口径 | 怎么算 | 为什么这么定 |
+|---|---|---|
+| 投递数 | 有 `applied_at` 的投递 | `pending`（还没投）不算，否则分母被灌水 |
+| 回复率 | "至少走到过 `replied`" / 投递数 | ★ 按**当前状态**算会系统性低估：现在被拒的那条，可能走到过二面 |
+| 约面率 | "至少走到过 `assessment`" / 投递数 | 笔试/测评邀请也是"对方要我了" |
+| 每个比率 | 都带分子/分母，如 `25.0%（6/24）` | 只有百分比时，`100%` 是 1/1 还是 20/20 看不出来 —— 而这决定它是不是噪声 |
+
+**只记录对比，不宣称统计显著性**：一个秋招可能就 100 次投递，分到两个开场白变体各 50 次，
+回复事件可能只有个位数。所以工具只打印数字与样本量，样本 < 10 条时直接提示"别据此下结论"，
+**不会**生成"建议使用变体 A"这类伪结论。
+
+事件流 `application_events` 是 **append-only** 的（只追加、不改不删）—— 这正是上面这些
+口径能长期复现的原因：三个月后回头算转化率，结果和当时一致。
 
 ### 定制简历为什么"改了但不编"（P5 的 FidelityGuard）
 

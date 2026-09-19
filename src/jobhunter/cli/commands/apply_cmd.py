@@ -54,11 +54,11 @@ from typing import Annotated
 import typer
 from rich.table import Table
 
-from jobhunter.cli.common import console, err_console, not_implemented, require_db, success, warn
+from jobhunter.cli.common import console, err_console, require_db, success, warn
 from jobhunter.config.settings import get_settings
 from jobhunter.models import Job
 from jobhunter.models.constants import APPLICATION_STATUSES
-from jobhunter.services import apply_svc, today_svc
+from jobhunter.services import apply_svc, today_svc, track_svc
 
 app = typer.Typer(
     help="投递打标：批量(3=applied) / 模糊匹配 / 单条 / 待处理列表 / 时间轴",
@@ -98,9 +98,10 @@ def apply_root(
         bool, typer.Option("--yes", "-y", help="模糊匹配到多条时不询问，全部应用")
     ] = False,
 ) -> None:
-    """零手打跟进入口（P4.5：批量 / 模糊匹配 / 待处理清单）。"""
+    """零手打跟进入口（P4.5：批量 / 模糊匹配 / 待处理清单；P6：时间轴）。"""
     if timeline is not None:
-        not_implemented(f"jh apply --timeline {timeline}（投递时间轴）", "P6")
+        _print_timeline(timeline)
+        return
 
     tokens, status, yes = _pull_options_out_of_tokens(list(tokens or []), status, yes)
 
@@ -148,6 +149,59 @@ def apply_root(
 
     # ---- 模糊匹配（★ P4.5）：按公司名/职位名找，命中多条**列出来让我选** ------
     _mark_by_keyword(" ".join(tokens), status, yes=yes)
+
+
+# ===========================================================================
+# P6：投递时间轴
+# ===========================================================================
+def _print_timeline(job_id: int) -> None:
+    """`jh apply --timeline <job_id>`：把事件流画成一条时间轴。
+
+    ★ 为什么是 `--timeline` 而不是计划书里写的 `jh apply timeline <id>`：
+      模块 docstring 里写了那个 Click 硬限制 —— `jh apply` 是**单命令应用**，
+      callback 带可变位置参数（`3=applied "字节"` 那种语法），
+      于是 `timeline` 会被当成位置参数吃掉，子命令永远不会被分派。
+      功能完全一致（甚至更短），只是形状从子命令改成选项。
+    """
+    engine, factory = require_db()
+    try:
+        with factory() as session:
+            try:
+                timeline = track_svc.build_timeline(session, job_id)
+            except LookupError as exc:
+                err_console.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=1) from exc
+    finally:
+        engine.dispose()
+
+    console.print()
+    console.print(
+        f"[bold]{timeline.company or '—'} · {timeline.title or job_id}[/bold]"
+        f"　[dim]（job_id={timeline.job_id}）[/dim]"
+    )
+    left = "还没投出去" if timeline.days is None else f"投出去 {timeline.days} 天"
+    console.print(f"  当前状态：[bold]{timeline.status_label}[/bold]　｜　{left}")
+    console.print()
+
+    if timeline.empty:
+        warn("这条投递还没有任何事件。")
+        for note in timeline.notes:
+            console.print(f"  [dim]· {note}[/dim]")
+        return
+
+    table = Table(title="投递时间轴", header_style="bold cyan")
+    table.add_column("时间")
+    table.add_column("发生了什么", overflow="fold")
+    for entry in timeline.entries:
+        table.add_row(entry.local_text, entry.label)
+    console.print(table)
+
+    for note in timeline.notes:
+        console.print(f"  [dim]· {note}[/dim]")
+    console.print(
+        "  [dim]事件流是 append-only 的：它记的是**真实发生过的顺序**，"
+        "不会因为当前状态被改写。[/dim]"
+    )
 
 
 # ===========================================================================

@@ -392,8 +392,15 @@ def test_cli_pending_empty_is_friendly(isolated_env: Path):
     assert "没有待处理的投递" in result.output
 
 
-def test_cli_timeline_still_placeholder(cli_world):
-    """时间轴是 P6 的活 —— 现在必须诚实地说没做。"""
+def test_cli_timeline_is_implemented(cli_world):
+    """时间轴在 P6 落地了（原来是"诚实地说没做"的占位用例）。
+
+    ★ 这条用例的演化本身就是这个名单的纪律：阶段推进时**移出占位清单**，
+      同时由功能测试接手（`test_p6_tracking.py` 覆盖时间轴的内容与顺序）。
+      这里只保留一条"它不再是占位"的守卫，避免这条路径整个没人管。
+    """
     result = runner.invoke(app, ["--no-remind", "apply", "--timeline", "1"])
-    assert result.exit_code == 2
-    assert "P6" in result.output
+    assert result.exit_code == 0, result.output
+    assert "尚未实现" not in result.output
+    # 这个岗位还没投过 → 时间轴要**说清原因**，而不是画一条空表出来
+    assert "还没有投递记录" in result.output

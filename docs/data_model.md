@@ -198,7 +198,8 @@ process_result_value (读取)：SQLite 返回 naive → 补 tzinfo=UTC
 | 列 | 类型 | 可空 | 说明 |
 |---|---|---|---|
 | `id` | Integer PK | | |
-| `interview_id` | FK→`interviews.id` | ❌ | `CASCADE` |
+| `interview_id` | FK→`interviews.id` | ✅ | `CASCADE`。★ **P6 由 NOT NULL 改为可空**（迁移 `0002`） |
+| `job_id` | FK→`jobs.id` | ✅ | ★ **P6 新增**：`predicted`（JD 预测题）挂岗位；`SET NULL` |
 | `question` | Text | ❌ | |
 | `my_answer` | Text | ✅ | |
 | `rating` | Text | ✅ | ★ 3 档：`bad` / `ok` / `good`（不搞 5 档，样本太小没意义） |
@@ -207,9 +208,21 @@ process_result_value (读取)：SQLite 返回 naive → 补 tzinfo=UTC
 | **`source`** | Text | ✅ | ★★ `recorded`（我记的） / `predicted`（**JD 预测的**）—— 让"记录工具"变成"准备工具" |
 | `created_at` | UTCDateTime | | |
 
-**索引**：`ix_interview_questions_interview_id`、`ix_question_category`（`category`）、`ix_question_is_weak`（`is_weak`）→ `jh weak` 聚合走索引。
+**索引**：`ix_interview_questions_interview_id`、`ix_interview_questions_job_id`、
+`ix_question_category`（`category`）、`ix_question_is_weak`（`is_weak`）→ `jh weak` 聚合走索引。
 **为什么 `source` 很重要**：预测题和真实被问的题**必须能区分**，否则 `jh weak` 会被
 "我自己猜的题"污染，结论失真。
+
+**为什么改可空 + 加 `job_id`（迁移 `0002`，P6 实现时才暴露的设计缺口）**：
+
+两张来源的**归属**根本不同 —— 真实题属于**某一场面试**，预测题属于**某个岗位**。
+而 `jh question predict <job_id>` 拿的是岗位，这个动作又通常发生在"面试还没约上"的时候。
+坚持 NOT NULL 只有两条路：逼用户为一个还不存在的面试编时间，或者造一条假的 `interviews`
+记录来挂预测题 —— 后者会污染 `jh interview list`、`jh stats` 的面试场次统计、
+以及顶部"本周面试"提醒。**为了装下一条数据而污染三个功能的输入**，所以改 schema。
+
+回滚（`downgrade`）会先删掉 `interview_id IS NULL` 的预测题再改回 NOT NULL：
+这是**有损回滚**，但只影响 predicted 行，真实记录一条都不动（迁移文件里写明了）。
 
 ---
 

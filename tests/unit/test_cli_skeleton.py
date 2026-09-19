@@ -78,25 +78,18 @@ EXPECTED_COMMANDS = (
 #   它们在没有数据库时会报"请先运行 jh init"（exit 1）—— 那是**正确的**行为，
 #   由 `test_*_commands_are_implemented` 那几条用例单独覆盖。
 #
-# ★ P4 仍然留在名单里的 `apply` 语法（它们是 P4.5 的活，现在会明确说"P4.5 实现"）：
-#     `3=applied` 批量打标、`--pending` 待处理列表、`--timeline` 时间轴（P6）、
-#     按关键词模糊匹配。
-# ★ P4.5 之后仍留在名单里的 `apply` 语法：只有 `--timeline`（P6）。
-#   批量打标 `3=applied` 与 `--pending` 已经是真功能了，由 test_followup.py 覆盖。
+# ★ `apply` 的所有语法现在都是真功能了（P4/P4.5/P6）：批量打标、`--pending`、
+#   `--timeline`、模糊匹配 —— 分别由 test_followup.py 与 test_p6_tracking.py 覆盖。
 # ★ P5 之后 `tailor brief` 也移出名单（它是真功能了，由 test_tailor_cli.py / test_tailor_svc.py
 #   覆盖）。**移出意味着必须由功能测试接手**，不能两头都不管 —— 这正是这个名单的维护纪律。
+# ★ P6 之后移出的（都由本阶段的功能测试接手）：
+#     `weak` / `stats` / `report` / `followup` / `apply --timeline` /
+#     `interview list` / `question predict` / `assessment list` / `offer compare` / `cal export`
+#     → 分别由 test_p6_tracking.py（状态机/事件流/统计/时间轴/薄弱点/周报/追问）、
+#       test_assessment_offer.py、test_cal.py 覆盖。
+#   仍然留在名单里的只有 P7 的 `leads` 与 P9 的 `demo`。
 PLACEHOLDER_INVOCATIONS: list[list[str]] = [
-    ["weak"],
-    ["stats"],
-    ["report"],
     ["demo"],
-    ["followup", "1"],
-    ["apply", "--timeline", "1"],
-    ["interview", "list"],
-    ["question", "predict", "1"],
-    ["assessment", "list"],
-    ["offer", "compare"],
-    ["cal", "export"],
     ["leads", "export"],
 ]
 

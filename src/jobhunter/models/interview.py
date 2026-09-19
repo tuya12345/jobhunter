@@ -64,13 +64,37 @@ class Interview(BaseModel):
 
 
 class InterviewQuestion(BaseModel):
-    """一道面试题：题目 + 我的回答 + 自评 + 知识点分类。"""
+    """一道面试题：题目 + 我的回答 + 自评 + 知识点分类。
+
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║ 为什么 `interview_id` 可空、还多了一个 `job_id`（P6 加，见迁移 0002）        ║
+    ╚══════════════════════════════════════════════════════════════════════════╝
+
+    这张表同时装两类题，而它们的**归属**根本不同：
+
+        recorded   我真实被问到的题  → 属于**某一场面试**（有 interview_id，没有 job_id）
+        predicted  我拿 JD 猜的题    → 属于**某个岗位**（有 job_id，没有 interview_id）
+
+    一开始（P0 建表时）把 `interview_id` 写成了 NOT NULL，理由是"问题总是面试里问的"。
+    但 P6 的 `jh question predict <job_id>` 拿的是**岗位**而不是面试场次 ——
+    准备面试往往发生在"面试还没约上"的时候。若坚持 NOT NULL，就只能：
+      · 逼用户先 `jh interview add`（为了一个还不存在的面试时间造假数据），或
+      · 造一条假的面试记录来挂预测题 → 它会出现在 `jh interview list`、
+        `jh stats` 的面试场次统计、以及顶部"本周面试"提醒里 ——
+        **为了塞下一条数据而污染三个功能的输入**，这是最差的一种妥协。
+
+    所以：可空 + 加 `job_id`。回填规则见迁移 0002 的 docstring。
+    """
 
     __tablename__ = "interview_questions"
 
-    interview_id: Mapped[int] = mapped_column(
-        ForeignKey("interviews.id", ondelete="CASCADE"), nullable=False
+    #: 属于哪一场面试（`recorded` 才填；`predicted` 为 None）
+    interview_id: Mapped[int | None] = mapped_column(
+        ForeignKey("interviews.id", ondelete="CASCADE")
     )
+    #: 属于哪个岗位（`predicted` 才填）。★ SET NULL 而不是 CASCADE：
+    #: 岗位记录被清理时，不该连带删掉"我为它准备过哪几道题"（那是我的准备成果）。
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"))
     question: Mapped[str] = mapped_column(Text, nullable=False)
     my_answer: Mapped[str | None] = mapped_column(Text)
     # bad / ok / good（3 档，见模块 docstring）
@@ -91,6 +115,8 @@ class InterviewQuestion(BaseModel):
 
     __table_args__ = (
         Index("ix_interview_questions_interview_id", "interview_id"),
+        # 预测题按岗位查（"这个岗位我准备过哪几道题"）
+        Index("ix_interview_questions_job_id", "job_id"),
         # `jh weak` 的聚合查询主索引
         Index("ix_interview_questions_category", "category"),
         Index("ix_interview_questions_is_weak", "is_weak"),

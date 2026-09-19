@@ -46,13 +46,19 @@ from jobhunter.config.settings import AppSettings, get_settings
 from jobhunter.llm import cache as llm_cache
 from jobhunter.llm.base import LLMMessage, LLMProvider, PromptPayload
 from jobhunter.llm.deepseek import DeepSeekError
+from jobhunter.llm.prompts import (
+    PromptFile,
+    PromptFileError,
+    load_prompt_file,
+    prompt_path,
+)
 from jobhunter.llm.safety import wrap_delimited
 from jobhunter.models import Job, Resume, ResumeVersion
 from jobhunter.services import match_svc, resume_svc
 from jobhunter.services.fidelity import FidelityGuard, FidelityReport
 from jobhunter.services.match_svc import ResumeCandidate
 from jobhunter.utils.docx import DocLine, write_docx, write_markdown
-from jobhunter.utils.io import ensure_dir, read_text
+from jobhunter.utils.io import ensure_dir
 from jobhunter.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -85,17 +91,16 @@ __all__ = [
 #: LLM 缓存里的任务名（与 match / greeting 区分开，避免 key 撞上）
 TASK = "tailor"
 
-#: 系统提示词文件（相对项目根）。★ 计划书明确要求它放在这里，而不是散在 Python 里：
-#: 提示词是**要反复改**的东西，改一次就得能看出"改了哪一版"。
-PROMPT_RELATIVE_PATH = Path("prompts") / "tailor.md"
+#: 提示词文件名（相对项目根的 prompts/）。★ 计划书要求它放在那里，
+#: 而不是散在 Python 里：提示词是要反复改的东西，改一次就得能看出"改了哪一版"。
+PROMPT_NAME = "tailor.md"
 
 #: 送进提示词的简历正文上限。一份两页简历大约 2000-3000 字，
 #: 6000 足够放下，又能挡住"简历里塞了一篇小说"这种极端输入把 token 打爆。
 _MAX_RESUME_CHARS = 6000
 _MAX_JD_CHARS = 3000
 
-#: 提示词文件里声明的版本号：`<!-- prompt-version: 3 -->`
-_PROMPT_VERSION_RE = re.compile(r"<!--\s*prompt-version:\s*(?P<version>\d+)\s*-->")
+#: 提示词文件里声明的版本号：`<!-- prompt-version: 3 -->`（解析在 `llm/prompts.py`）
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 #: 文本归一：比较"原文是否逐字存在"时忽略所有空白（Word 里的换行/空格不可靠）
 _WS_RE = re.compile(r"\s+")
@@ -140,70 +145,41 @@ class TailorPromptError(TailorError):
 # ===========================================================================
 # 提示词加载（prompts/tailor.md，七要素齐全）
 # ===========================================================================
-@dataclass(frozen=True)
-class TailorPrompt:
-    """加载好的提示词。"""
+#: ★ P6 起，加载逻辑抽到 `llm/prompts.py`（question / followup 也要用同一套纪律）。
+#: 这里只保留"文件名 + 把共享异常翻译成本模块异常"这一层，免得三处各写一套。
+PROMPT_NAME = "tailor.md"
 
-    version: int
-    #: 去掉版本注释后的正文
-    body: str
-    path: Path
+#: 兼容别名：`TailorPrompt` 现在就是共享层的 `PromptFile`
+TailorPrompt = PromptFile
 
 
 def _prompt_path(settings: AppSettings, path: Path | str | None = None) -> Path:
-    """定位提示词文件：显式路径 > 配置根目录 > 项目根目录。
+    """定位 `prompts/tailor.md`（转调 `llm/prompts.prompt_path`）。
 
-    ★ 为什么要有"项目根目录"这一路兜底（与 `config.yaml` 的查找逻辑同一个理由）：
-      `settings.paths.root` 是**config.yaml 所在目录**。测试里 config 在 tmp 目录，
-      于是 <tmp>/prompts/tailor.md 不存在 —— 没有兜底的话所有涉及提示词的测试
-      都得先把文件拷过去，那等于把"文件在哪"这件事藏进测试辅助函数里。
-      开发机上也一样：把 config.yaml 指到别处（备份/多份配置）时，
-      提示词仍然在项目里，不该因此报"找不到"。
+    ★ 这个私有包装**刻意保留**：验证会话的独立用例
+      （`tests/verify/test_v_p5.py::test_prompt_fingerprint_guard_is_armed`）
+      通过它拿到"真实提示词文件"，再自己算摘要来验证指纹守卫真的上膛了。
+      他们不该被迫在测试里硬编码一个相对路径 —— 那是把实现细节复制一份。
     """
-    if path is not None:
-        return Path(path)
-    from jobhunter.config.paths import find_project_root
-
-    candidates = (
-        settings.paths.root / PROMPT_RELATIVE_PATH,
-        find_project_root() / PROMPT_RELATIVE_PATH,
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[0]
+    return prompt_path(PROMPT_NAME, settings, path=path)
 
 
 def load_prompt(
     settings: AppSettings | None = None, *, path: Path | str | None = None
-) -> TailorPrompt:
-    """读 `prompts/tailor.md` 并取出它声明的版本号。
+) -> PromptFile:
+    """读 `prompts/tailor.md`（版本号写在文件第一行）。
 
-    ★ 为什么版本号写在**文件里**（`<!-- prompt-version: N -->`）而不是 Python 常量：
-      缓存 key 里必须含版本号（否则改完提示词还在吃旧结果），
+    ★ 版本号为什么写在**文件里**而不是 Python 常量：缓存 key 里必须含版本号，
       而"改了文件忘了改常量"是必然会发生的。写进文件后，
-      `tests/unit/test_tailor_svc.py` 里的"正文指纹"测试会在
-      "正文变了但版本没 +1"时直接失败 —— 把口头纪律变成红灯。
-
-    ★ 为什么不内置一份兜底的提示词：那样文件丢了程序照样跑，
-      但跑的是**旧提示词**，而且没人会发现。宁可直接报错。
+      `tests/unit/test_tailor_svc.py` 的"正文指纹"测试会在
+      "正文变了但版本没 +1"时直接失败 —— 把口头纪律变成一次红灯。
+    ★ 为什么把 `PromptFileError` 翻译成 `TailorPromptError`：
+      调用方只认识"定制简历的提示词错误"，不该被迫 import 两个异常类型。
     """
-    settings = settings or get_settings()
-    target = _prompt_path(settings, path)
-    if not target.is_file():
-        raise TailorPromptError(
-            f"找不到提示词文件：{target}\n"
-            f"  · 正常情况下它应该在项目根的 prompts/tailor.md\n"
-            f"  · 如果是把项目搬走了，用 --config 指定新的 config.yaml 位置即可"
-        )
-    raw = read_text(target)
-    match = _PROMPT_VERSION_RE.search(raw)
-    if match is None:
-        raise TailorPromptError(
-            f"提示词文件里没有版本号：{target}\n  请在文件开头加一行：<!-- prompt-version: 1 -->"
-        )
-    body = _PROMPT_VERSION_RE.sub("", raw, count=1).strip()
-    return TailorPrompt(version=int(match.group("version")), body=body, path=target)
+    try:
+        return load_prompt_file(PROMPT_NAME, settings, path=path)
+    except PromptFileError as exc:
+        raise TailorPromptError(str(exc)) from exc
 
 
 def render_system_prompt(prompt: TailorPrompt, settings: AppSettings) -> str:
