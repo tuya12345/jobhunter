@@ -236,6 +236,10 @@ def _print_analysis(result: tailor_svc.TailorResult, *, job: Job) -> None:
             border_style="cyan",
         )
     )
+    # ★ ISSUE #26：命中缓存时"本次花了 0"与"省下多少"要分开说
+    #   （口径与 `jh cache stats` 同一个乘积，统一在 cache_stats_svc 里算）
+    if result.saved_stats.summary:
+        console.print(f"  [dim]{result.saved_stats.summary}[/dim]")
     if analysis.strengths:
         console.print("[bold]它认为的优势[/bold]（都是简历里有的）：")
         for item in analysis.strengths[:6]:

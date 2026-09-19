@@ -54,7 +54,7 @@ from jobhunter.llm.prompts import (
 )
 from jobhunter.llm.safety import wrap_delimited
 from jobhunter.models import Job, Resume, ResumeVersion
-from jobhunter.services import match_svc, resume_svc
+from jobhunter.services import cache_stats_svc, match_svc, resume_svc
 from jobhunter.services.fidelity import FidelityGuard, FidelityReport
 from jobhunter.services.match_svc import ResumeCandidate
 from jobhunter.utils.docx import DocLine, write_docx, write_markdown
@@ -249,6 +249,10 @@ class TailorResult:
     report: FidelityReport = field(default_factory=FidelityReport)
     #: 命中缓存（没有花钱）
     from_cache: bool = False
+    #: 命中缓存省下的钱与条数（ISSUE #26；口径与 `jh cache stats` 同一个乘积）
+    saved_stats: cache_stats_svc.CacheHitStats = field(
+        default_factory=cache_stats_svc.CacheHitStats
+    )
     #: 写库后的版本 id（没写库时为 None）
     version_id: int | None = None
 
@@ -680,11 +684,15 @@ def analyze(
     )
     content = ""
     from_cache = False
+    saved_stats = cache_stats_svc.CacheHitStats()
     if use_cache and cache_key:
         hit = llm_cache.get_cached(session, cache_key)
         if hit is not None:
             content = hit.content
             from_cache = True
+            # ★ ISSUE #26：命中是**历史**结果 —— 这里记的是"省下多少"，
+            #   不是"本次花了多少"（本次花 0，口径见 cache_stats_svc）。
+            saved_stats.add(hit)
 
     if not content:
         content = _complete_with_retry(provider, payload, settings)
@@ -718,6 +726,7 @@ def analyze(
         dropped=dropped,
         report=report,
         from_cache=from_cache,
+        saved_stats=saved_stats,
     )
 
 

@@ -42,7 +42,7 @@ from jobhunter.llm.prompts import PromptFile, PromptFileError, load_prompt_file,
 from jobhunter.llm.safety import wrap_delimited
 from jobhunter.models import Interview, InterviewQuestion, Job
 from jobhunter.models.constants import QUESTION_RATINGS
-from jobhunter.services import match_svc
+from jobhunter.services import cache_stats_svc, match_svc
 from jobhunter.services.match_svc import ResumeCandidate
 from jobhunter.utils.logging import get_logger
 
@@ -117,6 +117,10 @@ class PredictResult:
     skipped: list[str] = field(default_factory=list)
     prompt_version: int = 0
     from_cache: bool = False
+    #: 命中缓存省下的钱与条数（ISSUE #26；口径与 `jh cache stats` 同一个乘积）
+    saved_stats: cache_stats_svc.CacheHitStats = field(
+        default_factory=cache_stats_svc.CacheHitStats
+    )
 
 
 # ===========================================================================
@@ -323,11 +327,15 @@ def _model_content(
     prompt: PromptFile,
     provider: LLMProvider,
     use_cache: bool,
-) -> tuple[str, bool]:
-    """取模型输出（命中缓存就直接用），返回 `(content, from_cache)`。
+) -> tuple[str, bool, cache_stats_svc.CacheHitStats]:
+    """取模型输出（命中缓存就直接用），返回 `(content, from_cache, saved_stats)`。
 
     ★ 抽出来的理由不只是"分支太多"：缓存与真调用这两条路径的**写入语义不同**
       （缓存要 commit 才算真的花了钱不白花），单独放一处才不会漏。
+
+    ★ 第三个返回值是 ISSUE #26 的"本次省下多少"（口径见 `cache_stats_svc`）：
+      命中缓存时本次**花 0**，省下的钱单独记 —— 老行为把命中的历史 cost
+      当成"本次成本"，命中几次就把成本报几倍。
     """
     # ★★ 先把提示词拼出来，再用**它自己的指纹**算 key（ISSUES #24 / #55）：
     #   职位名/城市/JD 关键词/简历要点都会进提示词，而四个固定成分覆盖不到它们。
@@ -347,10 +355,12 @@ def _model_content(
         task=TASK,
         prompt_fingerprint=llm_cache.payload_fingerprint(payload),
     )
+    saved_stats = cache_stats_svc.CacheHitStats()
     if use_cache and cache_key:
         hit = llm_cache.get_cached(session, cache_key)
         if hit is not None:
-            return hit.content, True
+            saved_stats.add(hit)
+            return hit.content, True, saved_stats
 
     try:
         response = provider.complete(payload)
@@ -370,7 +380,7 @@ def _model_content(
         # ★ 花钱拿到的结果必须立刻落库：不 commit 的话，后面任何异常
         #   （包括"用户只是看看、命令报错退出"）都会让这次调用白花钱。
         session.commit()
-    return response.content, False
+    return response.content, False, saved_stats
 
 
 def predict_questions(
@@ -411,7 +421,7 @@ def predict_questions(
             "  · 要用预测：把 key 写进项目根的 .env"
         )
 
-    content, from_cache = _model_content(
+    content, from_cache, saved_stats = _model_content(
         session,
         job,
         candidate,
@@ -434,7 +444,12 @@ def predict_questions(
             select(InterviewQuestion).where(InterviewQuestion.job_id == job.id)
         )
     }
-    out = PredictResult(questions=predicted, prompt_version=prompt.version, from_cache=from_cache)
+    out = PredictResult(
+        questions=predicted,
+        prompt_version=prompt.version,
+        from_cache=from_cache,
+        saved_stats=saved_stats,
+    )
     for item in predicted:
         text = item.question.strip()
         if _norm(text) in existing:

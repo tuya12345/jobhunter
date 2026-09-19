@@ -126,6 +126,10 @@ def question_predict(
         f"[bold]按 JD 预测的面试题[/bold]（{job.title or job_id}）"
         + ("　[dim]（命中缓存，没花钱）[/dim]" if result.from_cache else "")
     )
+    # ★ ISSUE #26：命中缓存时"本次花了 0"与"省下多少"要分开说
+    #   （口径与 `jh cache stats` 同一个乘积，统一在 cache_stats_svc 里算）
+    if result.saved_stats.summary:
+        console.print(f"  [dim]{result.saved_stats.summary}[/dim]")
     if not result.stored:
         warn("这次没有新题入库（都一样，或者模型没给出可用的题）。")
         if result.skipped:

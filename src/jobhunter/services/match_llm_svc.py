@@ -59,7 +59,7 @@ from jobhunter.llm.base import LLMMessage, LLMProvider, LLMResponse, PromptPaylo
 from jobhunter.llm.deepseek import DeepSeekError
 from jobhunter.llm.safety import wrap_delimited
 from jobhunter.models import Job
-from jobhunter.services import match_svc
+from jobhunter.services import cache_stats_svc, match_svc
 from jobhunter.services.match_svc import MatchResult, ResumeCandidate
 from jobhunter.utils.logging import get_logger
 
@@ -349,7 +349,21 @@ def parse_verdict(content: str) -> LLMMatchVerdict:
 # ===========================================================================
 @dataclass
 class LLMRunStats:
-    """一次批量精评的统计（`jh match run` 结尾打印它）。"""
+    """一次批量精评的统计（`jh match run` 结尾打印它）。
+
+    ★★ "本次花了多少"与"这次省下多少"是两笔账（ISSUE #26），不许合并
+
+      老行为：命中缓存时把 `hit.tokens_in/tokens_out/cost`（**历史值**）
+      加进 `tokens_*/cost`。后果是同一份缓存命中 10 次，`jh match run`
+      报的成本就翻 10 倍 —— 用户会以为这工具很贵，而它其实很便宜。
+      更糟的是它**不报错**：数字看起来完全合理。
+
+      现在：
+        · `tokens_*/cost` 只统计**本次真的调用了模型**的那些次（命中记 0）；
+        · `saved_*` 单独记"因为命中缓存而少花的钱"（口径见
+          `llm/cache.py::SAVED_COST_NOTE` 与 #25 的 `cache stats`，同一个乘积）。
+      两者在 `jh match run` 的结尾分行显示（见 `match_cmd._print_llm_summary`）。
+    """
 
     #: 真正发出去的请求数
     calls: int = 0
@@ -359,11 +373,21 @@ class LLMRunStats:
     degraded: int = 0
     #: 没配密钥或没跑成，整层跳过
     skipped: bool = False
+    #: ★ 本次**真的花了**的用量与成本（命中缓存记 0，不再累加历史值）
     tokens_in: int = 0
     tokens_out: int = 0
     cost: float = 0.0
+    #: ★ 本次因为命中缓存而省下的成本（累加口径只有一份，见 `CacheHitStats`）
+    saved_stats: cache_stats_svc.CacheHitStats = field(
+        default_factory=cache_stats_svc.CacheHitStats
+    )
     #: 失败原因（去重后的前几条，打印给用户看）
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def saved_cost(self) -> float:
+        """本次省下的钱（`jh match run` 打印用；没命中就是 0）。"""
+        return self.saved_stats.saved_cost
 
     def add_error(self, message: str) -> None:
         if message not in self.errors:
@@ -513,9 +537,10 @@ async def _evaluate_job(
             else:
                 _apply(session, job, verdict)
                 stats.cached += 1
-                stats.tokens_in += hit.tokens_in or 0
-                stats.tokens_out += hit.tokens_out or 0
-                stats.cost += hit.cost or 0.0
+                # ★ ISSUE #26：命中的是**历史**结果 —— 本次 tokens/cost 记 0，
+                #   另记"省下多少"。这里**不**加 `hit.tokens_in/out/cost`：
+                #   那三个是"这一行当初花了多少"，累加进来会把成本按命中次数翻倍。
+                stats.saved_stats.add(hit)
                 return _Outcome(job_id=job.id, verdict=verdict, from_cache=True)
 
     last_error = ""
