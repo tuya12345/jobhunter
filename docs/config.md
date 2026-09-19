@@ -3,7 +3,7 @@
 > **两个文件就够**：`config.yaml`（你的求职偏好，**会提交进 Git**）与 `.env`（密钥 + 本机路径，**永不提交**，从 `.env.example` 复制一份改）。
 > 改完**存盘即生效**：每次运行 `jh` 都会重新读一遍（同一个进程内配置有缓存，`jh --config` 会主动清掉）。
 > 优先级从高到低：**显式传参 > 环境变量 `JH_*` > `.env` > `config.yaml` > 代码默认值**（§0）。
-> 写错**不会静默**：`src/jobhunter/config/settings.py` 里带了 pydantic 校验，写错的字段会在启动时变成一句明确报错（§10 列了常见错法）。
+> 写错**不会静默**：`src/jobhunter/config/settings.py` 里带了 pydantic 校验，写错的字段会在启动时变成一句明确报错（§11 列了常见错法）。
 > 建议始终在**仓库根目录**运行 `jh`：`config.yaml` 与 `.env` 都按"当前工作目录"查找（§0 有细节）。
 
 本文里 `settings.py:210` 这类引用都相对 `src/jobhunter/`。
@@ -243,7 +243,13 @@ skill_aliases:
 
 - **是什么**："我在学"白名单：**允许提到**这些技能，但**必须**同时带一个"在学习"的标注词。
 - **默认值**：`[]`（仓库的 `config.yaml` 里给了 `LangChain` / `Kubernetes` 两个例子）。
-- **取值/校验**：字符串列表；没有范围校验（写成标量 → `Input should be a valid list`）。
+- **取值/校验**：字符串列表；★ **每一项都必须是技能词表里已有的技能**
+  （内置词表见 `src/jobhunter/config/vocabulary.py`，或你在 `skill_aliases` 里声明过的规范名）——
+  写错的词会在加载配置时直接报错并告诉你怎么改（ISSUES #43）。
+  · 为什么这么严：白名单里的错词（九成是拼写错误，如 `LanchChain`）**永远不会命中任何 JD**，
+    "我在学 X"这条规则就静默失效了 —— 你只会觉得"这个功能没效果"；
+  · 想加一个词表里没有的新技能：**先**在 `skill_aliases` 里把它写成规范名（那样它才会进词表、
+    也才能从 JD 里抽出来），**再**放进白名单。
 - **★ 它不是"假装会"的后门**（`services/fidelity.py:27, 299-302`）：
   · 白名单里的技能如果**没有**标注词，判定与没进白名单**完全一样** —— 照样报
     `skill_not_in_resume`（"简历里没有这个技能，属于编造"）；
@@ -273,15 +279,17 @@ learning_whitelist:
 - **是什么**：开场白禁用词（LLM 特别爱写套话，HR 一眼看出是群发）。
 - **默认值**：`[]`（代码默认一个词都没有；仓库的 `config.yaml` 给了一份 8 词的实用清单：
   `贵司` / `期待` / `三生有幸` / `百忙之中` / `万分感谢` / `希望能有机会` / `感谢您的阅读` / `冒昧打扰`）。
-- **取值/校验**：字符串列表；**只做去空**，不做非空强制（`settings.py:355-356`）——
-  你可以一个都不填，多写一个空的 `- ` 也不会崩，只会被过滤掉。
+- **取值/校验**：字符串列表，可以一个都不填（`[]` 是合法配置）。但**填进来的每一项都要合规**
+  （ISSUES #43）：不许空串、不许纯空白、首尾不能有空格、**单项最长 12 字**。
+  不合规会在加载配置时报中文错并指出是第几项、哪个值、期望什么。
 - **命中后果**：命中即视为**该版本不合格**（`greeting_svc.py:371-373`，"用了禁用词「X」"）。
   纯字数问题允许让模型修一次，**禁用词与保真类失败一律直接降级到确定性模板**
   （`greeting_svc.py:177-194`：保真类失败是信任问题，不能让同一个模型"再写一遍"）。
 - ⚠️ **写错了会怎样**：匹配是**朴素子串**（`word in text`）。所以：
   · 填 `期待` 会连带拦掉"期待已久""不期待"这类正常表达；
   · 填太短的词（`我`、`的`、`你`）→ 几乎每一版都命中 → 全部降级成模板，你会以为"LLM 坏了"。
-  只留"套话级"的词。
+  只留"套话级"的词。写空项/纯空白/超 12 字的词会在加载配置时**直接报错**
+  （改前是静默丢掉空项 —— 你以为配上了，其实没有；超长词则会大面积误伤）。
 
 ### `greeting.full_min_chars` / `greeting.full_max_chars`
 
@@ -388,8 +396,8 @@ tailor:
 
 ## 6. 频率克制（rate_limit.*）
 
-★ 先说结论：**这三个是合规参数，不是性能参数**（`settings.py:160-165`）。
-本项目的合规态度是"随机延时 + 翻页上限 + `--dry-run` + 出错即停"，
+★ 先说结论：**这两个是合规参数，不是性能参数**（`settings.py:160-165`）。
+本项目的合规态度是"随机延时 + `--dry-run` + 出错即停 + 只抓用户给的单个链接"，
 目的是不给目标站点造成压力、也不被风控标记。想"跑得更快"的正确做法是少录岗位、
 用 `jh match run --no-llm`、靠缓存，而不是调这里。
 
@@ -404,23 +412,23 @@ tailor:
     批量导入就变成连续请求。这等于把合规红线自己拆了 —— 站点压力、风控标记、账号风险都归你，
     而且 README 的合规声明还在那儿写着。**不建议动。**
 
-### `rate_limit.max_pages`
+### ~~`rate_limit.max_pages`~~ —— **已删除（ISSUES #18）**
 
-- **是什么**：翻页上限。
-- **默认值**：`3`。**取值范围**：`1 ≤ max_pages ≤ 50`（`settings.py:169`）。
-- ⚠️ **写错了会怎样**：
-  · `0` → `Input should be greater than or equal to 1`；
-  · ★ **改大不会让你"多抓几页"**：主路径 `jh job add <url>` 是"人给链接、抓单个详情"，**不翻页**；
-    这个上限只服务于**可选**的搜索适配器，而 `JobSource.search(..., max_pages=1)` 默认只取 1 页，
-    并且基类实现是**故意抛 `NotImplementedError`**（`adapters/base.py:131-146`：
-    自动搜索要先过 spike 验证，一个明确报错好过偷偷返回空列表的假实现）。
-    所以本工具**不做自动搜索**，别指望这个数字。
+这一节以前介绍"翻页上限"。P9 复查时核实：**它全仓没有任何读取点**，
+`JobSource.search()` 也只有签名、没有实现、没有调用方 ——
+也就是说，那份"上限"只存在于配置与文档里，从来没有生效过。
+
+一个**没人读的配置项**本身危害有限，但它让 `docs/COMPLIANCE.md` 声称了
+一个不存在的控制（"抓取路径带……翻页上限"），而那是合规自评要拿给人看的部分。
+所以删掉配置项、删掉 `search()` 的 `max_pages` 参数，并把 COMPLIANCE 改成如实描述
+（当前**没有自动翻页路径**：默认只抓用户手动给的单个链接）。
+
+将来真要做自动搜索：**参数、配置项、文档说明要一起加回来**，不要只加其中一样。
 
 ```yaml
 rate_limit:
   min_delay_seconds: 2.0   # 合规红线：抓详情前的随机延时
   max_delay_seconds: 5.0
-  max_pages: 3             # 1-50；主路径不翻页，此项只给可选搜索适配器
 ```
 
 ---
@@ -491,7 +499,43 @@ DEEPSEEK_MODEL=deepseek-chat
 
 ---
 
-## 8. 本地路径与默认简历（data_dir / output_dir / state_dir / db_url / default_resume_path）
+## 8. LLM 缓存（不是配置项：**没有 TTL**，只有看板与清理入口）
+
+- **是什么**：`llm_cache` 是"同样的输入不重复付费"的那张表。它**没有任何配置开关**，
+  也没有 TTL（用户 2026-09-19 裁决 **A：加 `jh cache stats` + `jh cache clear`，不做 TTL**）。
+- **为什么不做 TTL**：缓存的 key 里已经含 `prompt_version` / `model` / `jd_hash` /
+  `resume.content_hash` / 提示词指纹 —— **该失效的时候它自己就失效了**。
+  再叠一层时间维度只会让人搞不清"为什么昨天还在的缓存今天没了"，
+  而它省下的磁盘（几百 KB）与调用（几毛钱）都不值得换这份困惑。
+- **想清就手动清**（缓存是**纯派生数据**，删掉不影响业务数据）：
+
+  ```bash
+  jh cache stats                  # 按任务看条目数 / tokens / 成本 / 被复用次数 / 命中率
+  jh cache stats --task match      # 只看某一类任务
+  jh cache clear                   # 清全部（会先告诉你将删多少条，再问一次）
+  jh cache clear --task greeting --yes   # 只清一类、不再确认
+  ```
+
+  `jh cache clear` **只删 `llm_cache` 一张表**（`models/llm_cache.py` 的那句承诺）。
+  非交互终端（管道 / CI）不会替你确认，要真删得显式加 `--yes`。
+- **命中率口径**（`jh cache stats` 会把它原样打印出来，不必猜）：
+
+  ```
+  命中率 = Σhits ÷ (Σhits + 行数)
+  每一行 = 一次真实付费调用；hits = 这行结果被复用了几次
+  省下   = Σ(每行 cost × 该行 hits)；没记成本的行不计入
+  ```
+
+- ⚠️ **两个容易看错的数字**：
+  · **`tokens` / `cost` 列是"这一行当初花了多少"**，不是"本次调用花了多少"。
+    `jh match run` 命中缓存时本次成本记 **0**，另起一行显示"命中缓存省下 X"（ISSUES #26）——
+    两笔账不要相加。
+  · **清空缓存 = 命中率统计归零**（统计口径就存在这张表上，没有第二张流水表）：
+    这是有意的，为的是让 `jh cache clear` 真的"什么都不留下"。
+
+---
+
+## 9. 本地路径与默认简历（data_dir / output_dir / state_dir / db_url / default_resume_path）
 
 ### `data_dir` / `output_dir` / `state_dir`
 
@@ -546,7 +590,7 @@ DEEPSEEK_MODEL=deepseek-chat
 
 ---
 
-## 9. 环境变量一览
+## 10. 环境变量一览
 
 **通用规则**：任何字段都能用 `JH_` + 字段名大写覆盖（`env_prefix="JH_"`，`settings.py:195`），
 如 `JH_THRESHOLD=70`、`JH_LLM_CONCURRENCY=2`。**列表/字典类字段要写成 JSON**：
@@ -577,7 +621,7 @@ DEEPSEEK_MODEL=deepseek-chat
 
 ---
 
-## 10. 常见改错（症状 → 原因 → 怎么改）
+## 11. 常见改错（症状 → 原因 → 怎么改）
 
 先记住统一的表现形式：配置有问题时 CLI 会打印
 
@@ -606,12 +650,12 @@ DEEPSEEK_MODEL=deepseek-chat
 | 12 | 想把抓取调快点，把延时设成 0 | `rate_limit` 是合规红线，不是性能参数 | 别改。要快就用 `jh match run --no-llm`、靠 LLM 缓存、一次少录几个岗位 |
 | 13 | 改了 `data_dir`，投递记录"全没了" | 库文件不会自己搬家，新位置是个空库 | 旧库还在老位置（`<项目根>/data/jobhunter.db`）。要搬就手动移动 `jobhunter.db` **连 `.db-wal`/`.db-shm` 一起**（或先正常退出程序） |
 | 14 | `.env` 里写 `JH_LOG_LEVEL=DEBUG` 没反应 | 它由 `utils/logging.py` 直接读 `os.environ`，而 `.env` 的值不进 `os.environ` | 用真正的环境变量（Windows：`$env:JH_LOG_LEVEL='DEBUG'`）或直接加 `jh -v/--verbose` |
-| 15 | 改了提示词文件，感觉"完全没起作用" | LLM 缓存 key 含 `prompt_version`，正文改了但版本号没 +1 → 旧结果被复用 | 见 §11：改提示词**必须**把第一行 `<!-- prompt-version: N -->` 加一 |
+| 15 | 改了提示词文件，感觉"完全没起作用" | LLM 缓存 key 含 `prompt_version`，正文改了但版本号没 +1 → 旧结果被复用 | 见 §12：改提示词**必须**把第一行 `<!-- prompt-version: N -->` 加一 |
 | 16 | 分数看起来都差不多，或文案里带「（mock）」 | 环境里设了 `JH_LLM_PROVIDER=mock`（假 Provider，固定返回 `score: 70` 等写死结果） | 取消这个环境变量（`jh demo` 才会主动用它跑演示），或换回 `deepseek` |
 
 ---
 
-## 11. 改配置后要做什么
+## 12. 改配置后要做什么
 
 总原则：**库里已经存下来的东西（分数 / JD 关键词 / 定制版本 / 投递记录）不会因为你改配置而自动重算。**
 `jh today` 读的是库里存好的 `jobs.match_score`，所以"改了权重但分数没变"是预期行为，不是 bug。
@@ -619,19 +663,19 @@ DEEPSEEK_MODEL=deepseek-chat
 | 你改了什么 | 要不要重跑 | 为什么 |
 |---|---|---|
 | `keywords`、`match_dimensions` | **什么都不用做** | 这两个字段不参与打分（§1、§2） |
-| `cities`、`job_type`、`match_weights`、`skill_aliases` | **`jh match run`**（重新打分） | 分数是打分时算出来**存进库里**的（`jobs.match_score`）；JD 关键词与技能命中也在那时用当前词表算出并落 `jd_keywords_json`（`match_svc.py:902, 1059`；简历技能池同样是打分时按当前词表重算的，`match_svc.py:972-1002`） |
+| `cities`、`job_type`、`match_weights`、`skill_aliases` | **`jh match run`**（重新打分） | 分数是打分时算出来**存进库里**的（`jobs.match_score`）；JD 关键词与技能命中也在那时用当前词表算出并落 `jd_keywords_json`（`match_svc.py:902, 1059`；简历技能池同样是打分时按当前词表重算的，`match_svc.py:972-1002`）。★ 默认**跳过已投 / 已跳过的岗位**（ISSUE #27：给不会再投的岗位重算纯属浪费钱），要让它们也一起重算就加 `--all`；本次"算了多少条、跳过多少条"会打在屏幕上 |
 | `threshold` | **不必重跑打分**，但清单会立刻变 | `jh today` 是实时读配置过滤的（`today_svc.py:115`）；`jh match run` 里的分数线只用于显示小结 |
 | 简历文件本身（改了 docx） | **`jh resume add`（重新导入）→ `jh match run`** | 同一份内容重复导入不会新建记录；内容变了 `content_hash` 就变，而它是 LLM 缓存 key 的一部分（`resume_svc.py:30`），旧分自动失效 |
-| `greeting.*`、`greeting_banned_words`、`learning_whitelist` | 重新跑 **`jh today`** | 开场白是每次运行现生成的；闸门每次都会重新判定。★ 但 **LLM 缓存不会因这些配置失效**（key 里没有它们），旧文案仍会被复用，只是过不了新闸门的会被降级成模板 |
+| `greeting.*`、`greeting_banned_words`、`learning_whitelist` | 重新跑 **`jh today`** | 开场白是每次运行现生成的；闸门每次都会重新判定。★ 现在**LLM 缓存也会随之失效**（ISSUES #55）：缓存 key 里含"整份提示词的指纹"，而这些配置都会进提示词 —— 所以不会再把旧文案当成新的给你 |
 | 提示词（仓库根的 `prompts/tailor.md` / `question.md` / `followup.md`，以及代码内嵌的 `PROMPT_VERSION` / `GREETING_PROMPT_VERSION` 常量） | **必须把版本号 +1**，然后重跑对应命令 | 缓存 key 含 `prompt_version`，"改了正文不 +1 就等于没改"（`llm/prompts.py:9-11`；key 定义见 `llm/cache.py:99`）。文件型提示词改第一行的 `<!-- prompt-version: N -->`；内嵌的改常量（开场白在 `services/greeting_svc.py:71`，精评在 `services/match_llm_svc.py:81`） |
 | `tailor.*` | 只影响**之后新生成**的定制版本 → `jh tailor analyze <job_id>` | 已存下来的 `resume_versions` 不会被改写 |
 | `rate_limit.*` | 下一次抓取（`jh job add`）即生效 | 延时在抓取时代入（`adapters/manual.py:186`） |
 | `DEEPSEEK_MODEL` | 下次调用生效，缓存**自动失效** | 缓存 key 含 model → 会重新计费，这是预期的 |
-| `.env` 里的密钥 / `JH_DB_URL` / `JH_DATA_DIR` 等 | 下一次进程启动生效 | ★ 换了 `JH_DATA_DIR`/`JH_DB_URL` 等于换了库：旧数据在旧库里，需要自己搬（§8） |
+| `.env` 里的密钥 / `JH_DB_URL` / `JH_DATA_DIR` 等 | 下一次进程启动生效 | ★ 换了 `JH_DATA_DIR`/`JH_DB_URL` 等于换了库：旧数据在旧库里，需要自己搬（§9） |
 
 ---
 
-## 12. 附：`show_reminders` / `config_file`，以及全部 27 个字段索引
+## 13. 附：`show_reminders` / `config_file`，以及全部 27 个字段索引
 
 ### `show_reminders`
 
@@ -672,21 +716,21 @@ show_reminders: true
 | `match_weights` | §2 | 三维度权重（合计必须 100） | 30/30/40 |
 | `match_dimensions` | §2 | 打分维度的可读声明（**无代码消费**） | 3 项 |
 | `skill_aliases` | §3 | 技能别名/归一化（解 `Java`≠`JavaScript`） | `{}` |
-| `learning_whitelist` | §3 | "我在学"白名单（提了必须带标注） | `[]` |
-| `greeting_banned_words` | §4 | 开场白禁用词 | `[]` |
+| `learning_whitelist` | §3 | "我在学"白名单（提了必须带标注；**词必须是词表里已有的技能**） | `[]` |
+| `greeting_banned_words` | §4 | 开场白禁用词（不许空项/纯空白/超 12 字） | `[]` |
 | `greeting` | §4 | 开场白字数约束 + GitHub | 80/150/60/`""` |
 | `tailor` | §5 | 定制简历的硬约束 | 1.5/30/12/3/2 |
-| `rate_limit` | §6 | 随机延时与翻页上限（合规红线） | 2.0/5.0/3 |
-| `show_reminders` | §12 | 顶部待处理提醒开关 | `true` |
+| `rate_limit` | §6 | 随机延时（合规红线；~~翻页上限~~ 已删，#18） | 2.0/5.0 |
+| `show_reminders` | §13 | 顶部待处理提醒开关 | `true` |
 | `deepseek_api_key` | §7 | 密钥（只从 `.env`/环境变量来） | `""` |
 | `deepseek_base_url` | §7 | API 地址 | `https://api.deepseek.com` |
 | `deepseek_model` | §7 | 模型名（改了缓存自动失效） | `deepseek-chat` |
 | `llm_provider` | §7 | `deepseek` / `mock` | `deepseek` |
 | `llm_concurrency` | §7 | 精评并发度 | `4`（1-16） |
 | `llm_max_retries` | §7 | 业务层重试次数 | `1`（0-3） |
-| `db_url` | §8 | 直接给库连接串（优先于目录） | `None` |
-| `data_dir` | §8 | 数据目录（库 + 抓屏产物） | `None`（→ `<项目根>/data`） |
-| `output_dir` | §8 | 导出目录 | `None`（→ `<项目根>/output`） |
-| `state_dir` | §8 | 运行时状态目录 | `None`（→ `<项目根>/state`） |
-| `default_resume_path` | §8 | 默认简历（只放 `.env`） | `None` |
-| `config_file` | §12 | config.yaml 自身位置（CLI 注入） | `None` |
+| `db_url` | §9 | 直接给库连接串（优先于目录） | `None` |
+| `data_dir` | §9 | 数据目录（库 + 抓屏产物） | `None`（→ `<项目根>/data`） |
+| `output_dir` | §9 | 导出目录 | `None`（→ `<项目根>/output`） |
+| `state_dir` | §9 | 运行时状态目录 | `None`（→ `<项目根>/state`） |
+| `default_resume_path` | §9 | 默认简历（只放 `.env`） | `None` |
+| `config_file` | §13 | config.yaml 自身位置（CLI 注入） | `None` |

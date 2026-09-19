@@ -124,6 +124,83 @@
 `assert "prompt_fingerprint=" not in greeting_svc`（注释里写明"#55 修好时这里会变红，
 请把它改成'必须传'"）。按分工我不动 `tests/verify/`，留给验证会话翻转。
 
+### 8. D 档 12 条的开发侧收尾（2026-09-19 用户已逐条拍板 A/B）
+
+用户对 D 档 15 条全部给了裁决（**A/B**），其中 12 条落在开发侧、3 条不需要改代码
+（#45 保留为长期纪律、#47 新建干净仓库是用户操作、#52 真机导入日历是用户操作）。
+本节按裁决逐条记账。
+
+我做的那五条（其余七条在下一节）：
+
+| # | 裁决 | 改法要点 |
+|---|---|---|
+| #18 | A：删掉 `max_pages` + 修正 COMPLIANCE 措辞 | 删掉 `config.yaml` 的 `rate_limit.max_pages`、`settings.py` 的字段、`JobSource.search()` 的 `max_pages` 形参；`COMPLIANCE.md` 的「频率克制」行改成只列**真实存在**的控制（随机延时 2–5 秒 + 出错即停 + 只抓单个链接），§5.2 从「翻页上限」改写为「**当前没有自动翻页路径**」；`config.md` 留一节"已删除 + 为什么" |
+| #19 | A：保留 UA，但写明用途 | `COMPLIANCE.md` 新增 §5.5：`locale=zh-CN` 是为了**中文页面**、桌面 UA 是为了**桌面版 DOM**（移动版结构不同、解析规则不成立）；并写清边界——UA 是字面量常量、**不轮换**、不伪造 Referer/Cookie、无代理池、路径仍是"人给的单个链接"。代码注释同步 |
+| #21 | A：统一成「三层去重」 | README / roadmap / architecture / `job_svc` 模块注释 / `parse_html` 注释 / 测试注释全部对齐代码事实：① platform_job_id → ② URL 完全相同 → ③ 归一化 hash → ④ 否决条件；顺手全局搜了 `两层`，只改与去重有关的那几处（`prompts/question.md` 的"每个技能点想两层"等无关用法没动） |
+| #28 | A：不动 `.env`，README 提醒一句 | README 的「配置密钥」一节加提醒：`.env` 是本机私密配置（除密钥外常含 `JH_DEFAULT_RESUME_PATH`，简历文件名往往带真名），已被 gitignore、**不要提交或贴给别人**；措辞刻意不写成"仓库里有隐私"（工作区是干净的） |
+| #43 | A：配置加校验，写错就中文报错 | ★ 为让 settings 能校验白名单，把内置词表从 `services/resume_svc.py` 搬到 `config/vocabulary.py`（纯数据；config 不能 import services，会成环），`resume_svc._BUILTIN_SKILLS` 保留同名别名。校验：`learning_whitelist` 的每一项必须是**词表里已有的技能**（内置 ∪ `skill_aliases` 的规范名），错词报错时直接给出"先声明进 skill_aliases"这一步；`greeting_banned_words` 不许空串/纯空白/首尾空格，单项上限 **12 字**（禁用词是朴素子串匹配，一整句话会大面积误伤）。两条都点名"哪个键、第几项、哪个值、期望什么" |
+
+**为什么 #43 的校验值得动结构**：改前的行为是"白名单里的错词被 `setdefault` 收进词表"——
+**拼写错误因此变得合法**，然后安静地永不命中。它不是"多一条校验"，而是把一个
+"看起来配好了、其实没有"的状态变成加载即报错。
+
+**这些点位的守卫**：`tests/unit/test_config_validation.py`（23 条）——
+* 配置层：白名单错词/空白项报错、别名声明过的技能可以通过、反例（仓库 `config.yaml`
+  与 `tests/conftest.py` 的真实配置必须仍然合法，否则等于把工具锁死）；
+* 禁用词：空串/纯空白/首尾空格/超长各自报错，且报错里带出"期望写法"；
+* `max_pages`：字段没了 + **AST 守卫**（`src/` 里不许再把它当代码标识符用；
+  注释里留"为什么删"是允许的）+ `config.yaml` 的 `rate_limit` 段键集合断言 + 文档断言；
+* 文档一致性：COMPLIANCE 的「频率克制」行不许再出现"翻页上限"、README/roadmap 不许
+  出现"两层去重"、UA 一节必须写明"不随请求轮换"且**代码里只有一个 UA**、
+  README 必须有 `.env` 提醒且 `.gitignore` 真的挡住它；
+* 元测试：上面这些守卫读的都是真文件（路径写错会让守卫静默失效）。
+
+### 9. 另外七条（并行子代理执行，我逐条复核过改动与固定读数）
+
+| # | 裁决 | 改法要点 |
+|---|---|---|
+| #20 | A：去重命中时 `url` / `source_keyword` 首次为准 | `job_svc` 新增第三份清单 `FIRST_WINS_FIELDS = (platform_job_id, url, source_keyword)`；规则统一成"**有值不动、空值才补、逐字段判断**"（"首次为准 ≠ 永远留空"有专门用例）。代价写进 docstring：换链接不再自动更新，因为 `jh job` 没有编辑命令，"自动更新"会抹掉"我当初从哪找到的"这条事实。`architecture.md` §4.6 白名单表补这一行；④ 那段按代码事实改写（现在挡"两个岗位并成一条 + JD/薪资串味"，而不是"改写身份"） |
+| #23 | A：不请求也不存 `reasoning_content` | **核查结论：`src/` 零命中，无代码可删**。四路独立核查（`git grep`、多写法正则、PowerShell 递归扫 180 个文件、逐个读请求体与响应解析）。按裁决"不要为了做点什么造空分支"，只在 `llm/deepseek.py` 写明刻意不用它 + 将来换 reasoner 时必须把推理 tokens 的成本计入统计 |
+| #25 | A：加 `jh cache stats` + `jh cache clear`（不做 TTL） | 见下面「命中率」那段。`clear` **只删 `llm_cache` 一张表**（用例断言其余 7 张表行数不变），删前报数，非交互拒绝并要求 `--yes` |
+| #26 | A：命中时本次记 0，另记"省下 X" | 命中分支不再把 `hit.tokens_*` / `hit.cost` 累加进"本次"，改记 `saved_stats`；`jh match run` 结尾分行显示「本次约 ¥X」「命中缓存省下约 ¥Y」并写明**两笔账别相加**。与 #25 共用 `services/cache_stats_svc.py` 一份口径 |
+| #27 | A：默认跳过已投/已跳过，加 `--all` | 取数口径只在 `match_svc.select_scoring_jobs()` 一处：① `status ∈ {applied, skipped}`；② 已有非 pending 投递记录（状态列可能没同步，与 `today_svc` 同一条"两道都要查"）。`--all` 原样返回全部且不改人工裁决状态。屏幕固定打印"算了 N 条、跳过 M 条（已投 x / 已跳过 y）—— 跳过 ≠ 没分"，**两种"跳过"分开说**，不与"低于分数线"合并成一个数字 |
+| #40 | A：导出加 `job_id` + 简历名收窄 | CSV 增 `岗位id` 列、Markdown 每条加「岗位 id：N」+ "序号只在当天有效"的说明；导出物里简历名统一「简历 #N」（查不到 id 写「简历（编号未知）」而**不退回文件名**）。终端仍原样显示简历名（只收窄导出物）。同类问题一并修：`report_svc` 周报的时间轴/面试行补 `（job_id=N）` |
+| #41 | A：`--copy N` 重新生成后回写库 | 新增 `apply_svc.replace_greeting()`（与"只补空字段"方向相反的显式覆盖，同步 `greeting_variant`，**绝不碰** `greeting_sent` / `greeting_edited`）；`--copy` **先回写再复制**，文本没变（缓存命中）时不打印、不写库。★ 有意只做在这条路径：`jh today` 整表路径的既有语义是"绝不覆盖已有开场白"（保护用户手改内容，验证用例守着） |
+
+### 10. 本轮新增的第 13 条：#56（验证会话新登记）
+
+`wrap_delimited("facts", …)` **看着在用统一入口，其实内部是空的** —— `facts` 没登记进
+`DELIMITED_TAGS`，于是正文里写一个 `</facts>` 就能提前闭合（与 #2 / #8 / #29 同族，
+但这次是**名单本身不全**）。修法两步：
+
+1. 把 `facts` 补进名单；
+2. ★ **去掉"假防护"这件事本身**：`wrap_delimited()` 现在**无条件**中和"它自己那个标签"，
+   哪怕该标签还没登记 —— 安全性不再建立在"名单是全的"这个假设上（它已被否定四次）。
+   未登记的标签仍记一条 warning（跨标签中和要靠名单），但**即使忘了登记也不会再出现假防护**。
+
+守卫在 `tests/unit/test_llm_safety.py`（14 条）：源码反查"用了却没登记"（含元测试说明
+**改成传常量会让这条守卫失效** —— 那正是 #56 式的"守卫看着在、其实没守住"）、
+名单里每个标签都必须真被中和、未登记标签自己那个闭合写法也必须被中和、
+AST 守卫禁止手拼分隔标签。
+
+### 11. 本轮的验证读数（2026-09-19，改动冻结后）
+
+| 套件 | 读数 | 说明 |
+|---|---|---|
+| `pytest tests/unit` | **798 passed / 0 failed**（3 deselected） | 本轮新增 5 个测试文件（`test_config_validation` 23 条、`test_cache_cmd` 37 条、`test_issues_27_40_41` 9 条、`test_llm_safety` 14 条，以及 #55 的 `test_cache_key_guard` 7 条） |
+| `pytest tests/verify` | **325 passed / 1 failed** | ★ 那 1 条是验证会话**故意**留的 #55 绊线（`assert "prompt_fingerprint=" not in greeting_svc`，注释写明"#55 修好时改成必须传"）。它新登记的 #56 守卫（`test_no_code_uses_an_unregistered_delimiter_tag`）**现在绿** |
+| `jh demo` 离线全流程 | 退出码 0，11 步全过 | 顺手验证 #27 之后 `match run` 的口径与配置校验都没把演示流程弄坏 |
+| `ruff check .` / `ruff format --check .` / `ruff check --preview --select PLW1514` / `uv lock --check` | 全绿 | 149 files already formatted |
+| 隐私扫描（CI 那一步） | 通过 | 本轮新增的文档与测试都过扫 |
+
+### 12. 已知残留（没修，写在这里而不是留在别人脑子里）
+
+`jh today` **整表**路径在缓存失效时仍是"屏幕是新文本、库内是旧文本"：那条路径的语义是
+"绝不覆盖已有开场白"（`test_v_p4_today_cli.py::test_pending_application_greeting_is_not_silently_replaced`
+守着它，为的是保护用户手改过的内容）。要收口需要给开场白加"来源"信息
+（工具生成 vs 人工写入）才能安全覆盖 —— 这是**新功能而非本次裁决范围**，
+故未擅自扩大改动。`--copy N` 那条路径已按 #41 修好。
+
 ---
 
 ## P9 —— 开源收尾 + 合规自检
@@ -185,9 +262,11 @@
 2. **`.ics` 覆盖同名文件**是唯一偏离"只写新文件"的地方（幂等快照，理由见 `COMPLIANCE.md` §5.4）。
 3. **覆盖率门槛 80% 是刻意的低门槛**：不追高（追覆盖率会催生"为覆盖率而写"的测试），
    当前 84%，掉下来会红。
-4. 三个字段在当前代码里**没有消费者**（子代理发现并写进 `config.md`）：
-   `match_dimensions`、`keywords`（除校验外）、`rate_limit.max_pages`（只作为 `search()` 形参存在）。
+4. 两个字段在当前代码里**没有消费者**（子代理发现并写进 `config.md`）：
+   `match_dimensions`、`keywords`（除校验外）。
    文档按"改它不会影响任何分数/抓取"据实说明 —— 这属于**配置项比实现更超前**，不是 bug。
+   （原先这里是三个字段，第三个 `rate_limit.max_pages` 已在 **ISSUES #18** 里删掉：
+   它连"未来会被读"都不成立，只让 COMPLIANCE 声称了一个不存在的控制。）
 5. **`git filter-repo` 我没跑**：它改写历史、需要用户明确授权（见 §4）。
 
 ### 6. 建议重点验证的地方
