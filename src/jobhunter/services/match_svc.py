@@ -71,8 +71,8 @@ from jobhunter.adapters.parse_text import (
     normalize_text,
 )
 from jobhunter.config.settings import AppSettings, get_settings
-from jobhunter.models import Job, Resume
-from jobhunter.services import resume_svc
+from jobhunter.models import Application, Job, Resume
+from jobhunter.services import job_svc, resume_svc
 from jobhunter.services.resume_svc import DirectionProfile, ResumeContent
 from jobhunter.utils.io import from_json, to_json
 from jobhunter.utils.logging import get_logger
@@ -84,6 +84,7 @@ __all__ = [
     "HardRequirements",
     "MatchResult",
     "ResumeCandidate",
+    "ScoringScope",
     "analyze_gaps",
     "apply_llm_to_job",
     "apply_result_to_job",
@@ -96,6 +97,7 @@ __all__ = [
     "match_jd_resume",
     "resume_skill_pool",
     "rule_detail_summary",
+    "select_scoring_jobs",
     "stored_skill_overlap",
 ]
 
@@ -1089,6 +1091,102 @@ def match_best_candidate(
         if best is None or result.rule_score > best.rule_score:
             best = result
     return best
+
+
+# ===========================================================================
+# ⑦-2 `jh match run` 的取数范围：默认不算"已处理过"的岗位（ISSUE #27）
+# ===========================================================================
+#: 这些岗位状态**默认不再重算**：投出去的、我主动跳过的。
+#: ★ 为什么是"默认"而不是"永远"：重算结果是写回库里的，用户对"我想全部重算一遍"
+#:   （改了权重、改了简历之后）有正当需求 —— 那是他的数据，工具不能替他锁死。
+#:   所以给 `jh match run --all` 作显式出口，见 `select_scoring_jobs`。
+_SKIP_RESCORE_STATUSES = ("applied", "skipped")
+
+
+@dataclass
+class ScoringScope:
+    """`jh match run` 这次的取数范围（打过分的 / 跳过的 / 各自的理由）。"""
+
+    #: 本次要打分的岗位
+    jobs: list[Job] = field(default_factory=list)
+    #: 被跳过的岗位（**分数仍是上次算的那个**，不是"没有分数"）
+    skipped: list[Job] = field(default_factory=list)
+    #: 跳过原因的计数：`status:applied` / `status:skipped` / `applied-unsynced`
+    #: ★ 分成几档而不是一个数字：UI 上要能说清"为什么少了这些条"，
+    #:   混成一个"跳过 N 条"等于把原因藏起来（本项目的静默失真纪律）。
+    reasons: dict[str, int] = field(default_factory=dict)
+    #: 库里一共有多少岗位 = `len(jobs) + len(skipped)`（用于把"都处理过了"说清楚）
+    total: int = 0
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped)
+
+    def reason_text(self) -> str:
+        """跳过原因的一句话（**给人看的**，CLI 直接用）。"""
+        labels = {
+            "status:applied": "已投",
+            "status:skipped": "已跳过",
+            "applied-unsynced": "已有投递记录（岗位状态没同步）",
+        }
+        return "、".join(
+            f"{labels.get(key, key)} {count} 条" for key, count in self.reasons.items() if count
+        )
+
+
+def select_scoring_jobs(session: Session, *, include_all: bool = False) -> ScoringScope:
+    """挑出 `jh match run` 这次真正要打分的岗位（ISSUE #27）。
+
+    ★★ 为什么默认要跳过一部分（用户裁决 A 的理由，原文照搬）：
+
+        已经投过、或我主动跳过的岗位，再花钱重算一遍是**纯浪费** ——
+        尤其 LLM 层是按分数取 Top N 逐条调模型的，把已投的岗位也算进来，
+        等于用我的钱给"不会再投的岗位"重新写一份结论，还会让 `jh stats`
+        的成本看起来更高。
+
+    ★★ 但**不能**因此让用户失去"我想重算全部"的能力：数据是他的。
+       `include_all=True`（CLI 的 `--all`）原样返回全部岗位，跳过列表为空。
+
+    两道判据（都要看，理由与 `today_svc.select_candidates` 同源）：
+
+        ① `jobs.status` 已经是 applied / skipped —— 这是人工决策的结果；
+        ② 已经有**非 pending 的投递记录** —— `jh apply` 会把 `jobs.status`
+           同步成 applied，但历史数据（或手工改过的库）可能只写了一边；
+           这时以"投递记录"这个更硬的事实为准，否则会出现
+           "库里有投递记录、工具却还在给它重算推荐理由"的矛盾。
+
+    ★ 为什么"rejected / offer / interview 等投递状态"也一并排除：
+      它们都属于"这个岗位已经进入投递流程"，重算匹配分的用途（决定要不要投）
+      已经过去了。判据 ② 用的是 `status != pending`，天然覆盖它们。
+
+    ★ 注意返回的 `skipped` **不是**"低于分数线被过滤掉"的岗位 ——
+      那是 `jh match run` 小结里的另一件事（分数线只影响显示与 `jh today`）。
+      两种"跳过"在 UI 上必须分开说，否则用户会以为岗位没被算过（口径见 #27 裁决）。
+    """
+    jobs = list(job_svc.list_jobs(session, limit=None))
+    scope = ScoringScope(jobs=jobs, total=len(jobs))
+    if include_all:
+        return scope
+
+    # ★ 一次性取出"已经动过"的 job_id 集合，而不是每个岗位查一次库
+    #   （岗位数上百时，N+1 查询会让这条命令明显变慢）。
+    active_ids = set(
+        session.scalars(select(Application.job_id).where(Application.status != "pending"))
+    )
+    kept: list[Job] = []
+    for job in jobs:
+        if job.status in _SKIP_RESCORE_STATUSES:
+            scope.skipped.append(job)
+            key = f"status:{job.status}"
+        elif job.id in active_ids:
+            scope.skipped.append(job)
+            key = "applied-unsynced"
+        else:
+            kept.append(job)
+            continue
+        scope.reasons[key] = scope.reasons.get(key, 0) + 1
+    scope.jobs = kept
+    return scope
 
 
 # ===========================================================================

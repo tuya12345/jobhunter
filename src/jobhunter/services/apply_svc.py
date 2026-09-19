@@ -34,6 +34,7 @@ logger = get_logger(__name__)
 __all__ = [
     "ApplicationError",
     "ApplyResult",
+    "GreetingWriteback",
     "PendingRow",
     "SKIP_TOKEN",
     "WAITING_STATUSES",
@@ -43,6 +44,7 @@ __all__ = [
     "list_actionable",
     "mark_greeting",
     "record_event",
+    "replace_greeting",
     "set_status",
     "skip_job",
 ]
@@ -174,6 +176,70 @@ def ensure_pending_application(
     session.add(application)
     session.flush()
     return application, True
+
+
+@dataclass
+class GreetingWriteback:
+    """一次"把刚生成的话术写回库"的结果（供 CLI 如实说出来）。"""
+
+    application_id: int
+    #: 库里的文本是否**真的**被改了（文本一样就不写，避免无意义的 UPDATE）
+    changed: bool
+    #: 覆盖前库里的旧文本（原来是空的就是 None）
+    previous: str | None = None
+    #: ★ 覆盖前这条投递是否已被标记为「已发出」（ISSUE #37 的闭环字段）。
+    #:   回写**不碰**它，但 CLI 要能提醒：库里文本换了新的，而"发过"这个事实不变。
+    was_sent: bool = False
+
+
+def replace_greeting(
+    session: Session,
+    job_id: int,
+    *,
+    greeting: str,
+    variant: str | None = None,
+) -> GreetingWriteback | None:
+    """把**刚生成**的开场白写回库，让"屏幕上看到的"与"库里存着的"始终一致（ISSUE #41）。
+
+    ★ 为什么需要这个入口（验证会话实测的症状）：
+
+        `jh today --copy N` 在**缓存失效**时会重新调模型 → 屏幕上是一段**新文本**，
+        而 `ensure_pending_application` 只补空字段（那是为了保护用户手写的内容），
+        于是库里还是旧值 —— 用户下次在别处看到旧话术，会以为"这工具记错了"。
+
+      ★ 与 `ensure_pending_application` 的方向**正好相反**，别混用：
+        · 那个是"只补空"（清单路径 `jh today` 用它，保护人工内容）；
+        · 这个是**显式覆盖**，只由 `jh today --copy N` 调用 ——
+          那个场景下屏幕上已经是一段新文本，库内必须跟上（用户裁决 #41-A：
+          库内始终最新）。
+
+    ★★ 绝不碰 `greeting_sent` / `greeting_edited`（ISSUE #37 的合规红线）：
+      "生成"不等于"已发出"。回写文本**不能**顺手把闭环字段置位；
+      已经置位的值也原样保留（那是"我确实发过话术"这个事实，
+      不是"这一段文本发过"）。CLI 会在 `was_sent=True` 时额外提醒一句。
+
+    Returns:
+        `None` 表示这个岗位还没有投递记录（没跑过 `jh today`）—— 此时没有可写的对象。
+    """
+    application = get_latest_application(session, job_id)
+    if application is None:
+        return None
+
+    previous = application.greeting_text
+    changed = previous != greeting
+    if changed:
+        application.greeting_text = greeting
+    # 变体跟着一起同步：话术与变体是同一份账，
+    # 只换文本不换变体，A/B 统计会把这段文本算到另一个变体头上。
+    if variant and application.greeting_variant != variant:
+        application.greeting_variant = variant
+    session.flush()
+    return GreetingWriteback(
+        application_id=application.id,
+        changed=changed,
+        previous=previous,
+        was_sent=bool(application.greeting_sent),
+    )
 
 
 def mark_greeting(

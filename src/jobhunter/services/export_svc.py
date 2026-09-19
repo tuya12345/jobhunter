@@ -16,6 +16,16 @@
 ★ 为什么导出内容里**不含简历原文**：导出的 Markdown/CSV 常常会被丢进聊天窗口、
   云笔记或直接发给别人看。里面只要有公司、职位、分数、链接和开场白就够用了；
   把简历正文塞进导出文件，等于给自己挖一个泄露渠道。
+
+★★ ISSUE #40：这份导出物既要能**精确定位岗位**，又不能**扩大隐私面**。
+  两件事是同一条纪律的两面（都是"导出物会被别人看到"）：
+
+    · 加 `job_id`：原来只有"当天清单里的序号"，隔天就对不上了 ——
+      照着清单批量打标 / 隔几天复盘时，"第 3 条"到底是谁全靠猜。
+      岗位 id 是**库里稳定不变**的那个标识（`jh apply --job <id>` 直接能用）。
+    · 简历名收窄成「简历 #id」（`resume_label()`）：简历文件名里往往带着真名
+      （「张三-简历.pdf」），而复盘只需要知道"用的是哪一份"。
+      ⚠️ 只收窄**导出物**：终端里的清单/看板照旧显示简历名 —— 那是用户自己的屏幕。
 """
 
 from __future__ import annotations
@@ -34,11 +44,16 @@ from jobhunter.utils.time import fmt_date_local, now_utc, to_local
 
 logger = get_logger(__name__)
 
-__all__ = ["export_csv", "export_markdown", "unique_path"]
+__all__ = ["export_csv", "export_markdown", "resume_label", "unique_path"]
 
 #: CSV 表头（顺序固定，方便在 Excel 里做透视）
+#: ★ `岗位id` 紧跟 `序号`：两个都是"这一行是谁"，但语义完全不同 ——
+#:   序号只在**当天**的清单里有意义（隔天重排就变了），岗位 id 是库里稳定的那个
+#:   （ISSUE #40：批量打标/复盘靠它，`jh apply --job <id>` 直接可用）。
+#:   并排放是为了让人一眼看出"这两列不是一回事"。
 _CSV_FIELDS = (
     "序号",
+    "岗位id",
     "公司",
     "职位",
     "城市",
@@ -127,6 +142,24 @@ def _stamp(now: datetime | None = None) -> str:
     return local.strftime("%Y%m%d-%H%M")
 
 
+def resume_label(item: TodayItem) -> str:
+    """导出物里的简历标识：**只写编号，不写文件名**（ISSUE #40）。
+
+    ★ 隐私取舍（与模块顶部"导出不含简历原文"同一条出发点）：
+      导出物常被丢进聊天窗口 / 云笔记 / 直接发给别人看，而简历文件名里往往
+      带真名（例如「张三-简历.pdf」）。复盘时只需要知道"用的是哪一份"，
+      编号就够了 —— 终端里照旧显示简历名（那是用户自己的屏幕，不在这里收窄）。
+
+    ★ 为什么"有名字却查不到 id"时不退回文件名：那正是要避免的泄露；
+      写一句「编号未知」比沉默好（用户能发现异常，也知道这一列为什么没编号）。
+    """
+    if item.resume_id is not None:
+        return f"简历 #{item.resume_id}"
+    if item.resume_name:
+        return "简历（编号未知）"
+    return ""
+
+
 def export_markdown(
     items: Iterable[TodayItem], *, output_dir: Path, now: datetime | None = None
 ) -> Path:
@@ -137,16 +170,21 @@ def export_markdown(
         f"# 今日待投清单（{fmt_date_local(local_now)}）",
         "",
         f"共 {len(items)} 条。开场白可直接复制；投完用 `jh apply <序号> --status applied` 打标。",
+        "★ 序号只在**当天**的清单里有效（隔天重排就对不上了）；"
+        "隔天复盘/批量打标请用每条的**岗位 id**：`jh apply --job <id> --status applied`。",
         "",
     ]
     for item in items:
         lines.append(f"## {item.index}. {item.company} · {item.title}")
         lines.append("")
+        # ★ 岗位 id 写在标题下面第一行：它是这一条**唯一稳定**的标识（ISSUE #40）
+        lines.append(f"- 岗位 id：**{item.job.id}**")
         lines.append(f"- 匹配分：**{item.score}**")
         if item.job.city:
             lines.append(f"- 城市：{item.job.city}")
-        if item.resume_name:
-            lines.append(f"- 用哪份简历：{item.resume_name}")
+        label = resume_label(item)
+        if label:
+            lines.append(f"- 用哪份简历：{label}")
         if item.greeting_variant:
             lines.append(f"- 开场白变体：{item.greeting_variant}")
         if item.url:
@@ -186,11 +224,13 @@ def export_csv(
         writer.writerow(
             [
                 item.index,
+                item.job.id,
                 item.company,
                 item.title,
                 item.job.city or "",
                 item.score,
-                item.resume_name,
+                # ★ 只写「简历 #id」，不写文件名（ISSUE #40，理由见 resume_label）
+                resume_label(item),
                 item.greeting_variant,
                 item.url,
                 item.greeting_full,

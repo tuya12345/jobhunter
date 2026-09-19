@@ -69,6 +69,11 @@ class ReportEvent:
     label: str
     company: str = ""
     title: str = ""
+    #: ★ 岗位 id（ISSUE #40 的同类问题：周报也是**导出物**，会被贴进笔记/发给别人）。
+    #:   原来只有"公司 · 职位"，同一家公司的多个岗位在时间轴上完全分不清 ——
+    #:   而"这家公司我投的是哪个岗"恰恰是复盘时最常要回答的问题。
+    #:   与 `_section_next` 里已有的 `（job_id=N）` 保持同一个写法。
+    job_id: int | None = None
 
 
 @dataclass
@@ -117,6 +122,7 @@ def _period_events(session: Session, *, since: datetime, until: datetime) -> lis
                 label=track_svc.entry_label(event),
                 company=job.company or "",
                 title=job.title or "",
+                job_id=job.id,
             )
         )
     return out
@@ -157,7 +163,10 @@ def build_report(
         if when is None or not (start <= when <= end + timedelta(days=7)):
             continue
         label = f"{fmt_datetime_local(when)} {interview.round or '面试'}"
-        report.interviews.append((label, f"{job.company or ''} · {job.title or ''}".strip(" ·")))
+        who = f"{job.company or ''} · {job.title or ''}".strip(" ·")
+        # ★ 同一条纪律（ISSUE #40）：周报里点名的岗位都必须能精确对上，
+        #   否则"周三那场面试是哪家的哪个岗"只能靠回忆。
+        report.interviews.append((label, f"{who}　（job_id={job.id}）"))
 
     for question in session.scalars(
         select(InterviewQuestion)
@@ -197,7 +206,12 @@ def _section_numbers(data: ReportData) -> list[str]:
 
 
 def _section_events(data: ReportData) -> list[str]:
-    """第二节：这一周发生了什么（按天分组的事件流）。"""
+    """第二节：这一周发生了什么（按天分组的事件流）。
+
+    ★ 每行带上 `（job_id=N）`（ISSUE #40 的同类修正）：周报同样会被贴进云笔记、
+      发给别人或几天后自己回看，而**公司 + 职位**在"同一家公司投了两个岗"
+      这种很常见的情况下根本分不清说的是哪个。岗位 id 是稳定的那个标识。
+    """
     lines = ["## 二、这一周发生了什么", ""]
     if not data.events:
         return [*lines, "这一周没有任何状态变化（没有投递/已读/回复/约面/笔试）。", ""]
@@ -207,6 +221,8 @@ def _section_events(data: ReportData) -> list[str]:
             current_day = event.day
             lines += [f"**{event.day}**", ""]
         who = f"{event.company} · {event.title}".strip(" ·")
+        if event.job_id is not None:
+            who = f"{who}　（job_id={event.job_id}）" if who else f"（job_id={event.job_id}）"
         lines.append(f"- `{event.time_text}` {event.label}　{who}")
     return [*lines, ""]
 

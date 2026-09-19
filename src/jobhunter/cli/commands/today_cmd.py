@@ -275,6 +275,10 @@ def _copy_nth(
       而用户以为自己限定在了"999 分以上"的范围里（拿到的是别的岗位的话术）。
       静默忽略选项比报错更糟。筛选与序号的判定统一在
       `today_svc.copy_target()`（它同时保证"序号含义"与"筛选选项"都成立）。
+    ★★ ISSUE #41：**重新生成出来的文本要回写库** —— 缓存失效时这里会调模型拿到
+      一段新文本，库里若还是旧值，用户下次看到的就是另一段话术（以为工具记错了）。
+      回写走 `apply_svc.replace_greeting()`，它**不碰** `greeting_sent`
+      （"生成"不等于"已发出"，见 #37）。
     """
     job, reason = today_svc.copy_target(
         session, index, min_score=min_score, limit=limit, settings=settings
@@ -295,6 +299,10 @@ def _copy_nth(
         err_console.print(f"[red]第 {index} 条还没有开场白[/red]（{item.company} · {item.title}）")
         raise typer.Exit(code=1)
 
+    # ★★ ISSUE #41：先回写库，再复制。顺序有意为之 —— 屏幕上要显示什么、
+    #    库里就该是什么；剪贴板失败也不影响"库内 = 本次生成"这个事实。
+    _write_back_greeting(session, job.id, item)
+
     if copy_to_clipboard(text):
         success(
             f"已复制第 {index} 条（{item.company} · {item.title}）"
@@ -312,6 +320,50 @@ def _copy_nth(
         # 剪贴板不可用也不能让用户白跑一趟 —— 直接把文本打出来让他手动选
         warn("复制到剪贴板失败（这个系统上可能没有 clip/pbcopy/xclip），下面是原文：")
         console.print(text)
+
+
+def _write_back_greeting(session: Session, job_id: int, item: today_svc.TodayItem) -> None:
+    """把 `--copy N` 这次生成的话术回写库内，让"屏幕 == 库内"（ISSUE #41）。
+
+    ★ 为什么只在 `--copy N` 这条路径上做（而不是塞进 `today_svc.ensure_item`）：
+
+      清单路径（`jh today`）的既有语义是"**绝不覆盖已有开场白**"——
+      那是为了保护用户手改过的内容，`tests/verify` 里有一条用例专门守着它。
+      `--copy N` 不一样：用户此刻明确是在"要一段话术去发"，
+      屏幕上已经是这段新文本了，库里留旧值只会造成两边不一致
+      （用户裁决 #41-A：库内始终最新）。
+
+    ★ 文本没变（缓存命中）时什么都不打印、也不写库 —— 那不是"发生了变更"，
+      按本项目"不说没发生的事"的纪律，静默即可。
+
+    ★ 取舍（明知而选）：如果这次生成**降级成了模板**（模型抽风/闸门拦下），
+      回写就意味着库里的旧文本被模板替换掉了。这仍然是对的 ——
+      用户此刻拿到的、看到的就是这段模板（`item.greeting_issues` 也会在清单里显示），
+      "库内 = 屏幕上那一段"是 #41 裁决要的一致性；让库里留一段**不会再显示**的旧文本
+      才是真正会误导人的状态。
+    """
+    if not item.greeting_full:
+        return
+    result = apply_svc.replace_greeting(
+        session,
+        job_id,
+        greeting=item.greeting_full,
+        variant=item.greeting_variant or None,
+    )
+    if result is None or not result.changed:
+        return
+    session.commit()
+    console.print(
+        f"  [dim]库内话术已更新为本次生成的这一版（applications.greeting_text，"
+        f"变体 {item.greeting_variant or '未记'}）。[/dim]"
+    )
+    if result.was_sent:
+        # ★ 库内文本换了、但"我确实发过话术"这个事实不变（#37：生成 ≠ 已发出）。
+        #   必须说出来：否则用户会以为重新生成把"已发出"这个记录也一起改掉了。
+        warn(
+            "这条投递之前已标记为「已发出」—— 库内文本换成了这一版，"
+            "但 greeting_sent 保持不变（生成 ≠ 已发出）。"
+        )
 
 
 def _mark_greeting_closure(

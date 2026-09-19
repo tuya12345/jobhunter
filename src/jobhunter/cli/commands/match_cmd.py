@@ -1,8 +1,11 @@
 """`jh match` —— 两级匹配打分（P3：本项目核心，已实现）。
 
-    jh match run [--top 30] [--threshold 60] [--no-llm]
-        ① 规则层（0 成本）：给**所有**岗位打 rule_score，并把
+    jh match run [--top 30] [--threshold 60] [--no-llm] [--all]
+        ① 规则层（0 成本）：给**待处理**的岗位打 rule_score，并把
            jd_keywords / rule_detail / matched_resume_id 一起落库；
+           ★ 默认**跳过已投 / 已跳过的岗位**（ISSUE #27：给不会再投的岗位
+           重算一遍是纯浪费），`--all` 显式要求重算全部；
+           这次算了多少条、跳过了多少条会打在屏幕上（不静默少算）。
         ② LLM 层：只对规则分 Top N 走大模型精评（并发 + 边算边写库 + 成本统计）。
 
     jh match explain <job_id>
@@ -53,6 +56,13 @@ def match_run(
     no_llm: Annotated[
         bool, typer.Option("--no-llm", help="只跑规则层（不花任何钱，秒出）")
     ] = False,
+    all_jobs: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="连已投 / 已跳过的岗位也重算（默认跳过它们：重算纯属浪费钱）",
+        ),
+    ] = False,
 ) -> None:
     """跑两级匹配打分：规则层全量 → LLM 层只精评 Top N。"""
     engine, factory = require_db()
@@ -67,15 +77,21 @@ def match_run(
                 _no_resume_hint()
                 raise typer.Exit(code=1)
 
-            jobs = list(job_svc.list_jobs(session, limit=None))
-            if not jobs:
-                console.print("[yellow]库里还没有岗位。[/yellow]先录一个：")
-                console.print("  [green]jh job add <岗位链接>[/green]")
-                raise typer.Exit(code=1)
+            # ★★ ISSUE #27：默认只算「还没处理过」的岗位 —— 已经投出去 / 我主动跳过的
+            #    再花钱重算一遍是纯浪费，还会让 `jh stats` 的成本看起来更高。
+            #    `--all` 是显式出口（"我想重算全部"是用户对自己数据的正当要求）。
+            #    取数口径与"跳过几条"的分档说明都在 `match_svc.select_scoring_jobs`，
+            #    CLI 不自己写一套筛选（否则两个入口的口径迟早分叉）。
+            scope = _resolve_scope(session, include_all=all_jobs)
 
             # ---- ① 规则层：全量打分 -------------------------------------
-            scored, no_jd = _run_rule_layer(session, jobs, candidates, settings)
+            scored, no_jd = _run_rule_layer(session, scope.jobs, candidates, settings)
             session.commit()
+
+            # ★ 算了多少条、跳过多少条 —— **必须打出来**（不静默少算）。
+            #   注意两种「跳过」不能混成一个数字：这里是"已处理过所以没算"，
+            #   低于分数线是排名表下面那句的另一件事（口径见 ISSUE #27 裁决）。
+            _print_scope(scope, include_all=all_jobs)
 
             if no_jd:
                 warn(f"有 {len(no_jd)} 个岗位没有 JD 正文，规则层只能按已有字段打分：")
@@ -132,13 +148,45 @@ def match_run(
         engine.dispose()
 
 
+def _resolve_scope(session: Session, *, include_all: bool) -> match_svc.ScoringScope:
+    """取本次要打分的岗位；一条都算不了时**说清原因**并退出（ISSUE #27）。
+
+    ★ 为什么单独抽出来：`match_run` 本身的决策点已经够多（top/threshold/no-llm/
+      LLM 降级…），这段"选不出来"的三种结局塞进去只会让主流程更难读，
+      也会撞上 ruff 的语句数上限（PLR0915）。
+    """
+    scope = match_svc.select_scoring_jobs(session, include_all=include_all)
+    if scope.jobs:
+        return scope
+    if scope.skipped:
+        # 库里有岗位、但全都被处理过 —— 这**不是**"库里没岗位"，
+        # 报错时必须说清是哪种，否则用户会去 `jh job add` 一个已经存在的岗位。
+        console.print(
+            f"[yellow]库里 {scope.total} 个岗位都已经处理过了"
+            f"（{scope.reason_text()}），默认不再重算。[/yellow]"
+        )
+        console.print(
+            "  [dim]要连它们一起重算：[green]jh match run --all[/green]"
+            "（重算会重新花 LLM 的钱）[/dim]"
+        )
+        raise typer.Exit(code=1)
+    console.print("[yellow]库里还没有岗位。[/yellow]先录一个：")
+    console.print("  [green]jh job add <岗位链接>[/green]")
+    raise typer.Exit(code=1)
+
+
 def _run_rule_layer(
     session: Session,
     jobs: list[Job],
     candidates: list[match_svc.ResumeCandidate],
     settings: AppSettings,
 ) -> tuple[list[Job], list[Job]]:
-    """给所有岗位算规则分并落库，返回 (打过分的岗位, 没有 JD 的岗位)。"""
+    """给**传进来的这些**岗位算规则分并落库，返回 (打过分的岗位, 没有 JD 的岗位)。
+
+    ★ 注意"全量"的含义变了（ISSUE #27）：以前传的就是库里全部岗位，
+      现在是 `select_scoring_jobs()` 筛过的那一批（默认不含已投/已跳过）。
+      筛选口径只在那一个地方定义，这里不做二次判断。
+    """
     scored: list[Job] = []
     no_jd: list[Job] = []
     # 词表与方向画像**只加载一次**：几十个岗位各自重复加载会让命令明显变慢，
@@ -162,6 +210,40 @@ def _run_rule_layer(
         scored.append(job)
     session.flush()
     return scored, no_jd
+
+
+def _print_scope(scope: match_svc.ScoringScope, *, include_all: bool) -> None:
+    """把「这次算了多少条 / 跳过多少条」写清楚（ISSUE #27 的硬要求）。
+
+    ★ 为什么值得单独一行：原来的行为是**静默地**给所有岗位重算 ——
+      用户看到的只有一张表，既不知道算了多少条，也不知道有 8 条已投的岗位
+      刚刚又花了一次钱。现在少算了就必须说明白为什么少。
+
+    ★ 为什么跳过原因要分档（已投 / 已跳过 / 有投递记录但状态没同步）：
+      "跳过 3 条"这种数字没法自解释，用户会怀疑是不是漏算了。
+      分档之后他能一眼对上自己做过的事。
+
+    ★ 与「低于分数线」的关系：那句在排名表下面（`_print_ranking`），
+      两者是**不同**的过滤，所以这里绝不把它们加在一起说。
+    """
+    console.print()
+    if include_all:
+        console.print(
+            f"  [dim]--all：本次重算全部 [bold]{len(scope.jobs)}[/bold] 个岗位"
+            "（含已投 / 已跳过 —— 分数会被覆盖成这次算的）[/dim]"
+        )
+        return
+
+    line = f"  [dim]本次打分 [bold]{len(scope.jobs)}[/bold] 条"
+    if scope.skipped:
+        line += (
+            f"，跳过 [bold]{scope.skipped_count}[/bold] 条已处理过的（{scope.reason_text()}）"
+            "—— 跳过 ≠ 没分：它们的分数还是上次算的那个[/dim]"
+        )
+        line += "\n  [dim]↳ 要连它们一起重算：[green]jh match run --all[/green][/dim]"
+    else:
+        line += "（库里没有已投 / 已跳过的岗位，全都算了）[/dim]"
+    console.print(line)
 
 
 def _print_ranking(jobs: list[Job], threshold: int, *, title: str) -> None:
@@ -217,7 +299,17 @@ def _progress_printer(total: int) -> object:
 
 
 def _print_llm_summary(stats: match_llm_svc.LLMRunStats, threshold: int) -> None:
-    """打印 LLM 层的用量与成本（**每次都打**：花了钱就要让用户看到）。"""
+    """打印 LLM 层的用量与成本（**每次都打**：花了钱就要让用户看到）。
+
+    ★★ ISSUE #26：**"本次花了"与"命中缓存省下"必须分开显示**
+
+      老行为把命中缓存那一行（历史值）的 cost 加进"本次成本"，
+      于是同一份缓存命中 10 次，这里就报 10 倍的钱 —— 用户会以为
+      这工具很贵，而实际上它很便宜。那种错**不报错、数字看着也合理**，
+      所以修法不只是改累加，还要让两笔账在屏幕上各占一行：
+      这次真的花了多少、以及因为缓存少花了多少（省下的口径与
+      `jh cache stats` 是同一个乘积，见 `services/cache_stats_svc.py`）。
+    """
     console.print()
     pieces = [f"调用 {stats.calls} 次"]
     if stats.cached:
@@ -227,8 +319,18 @@ def _print_llm_summary(stats: match_llm_svc.LLMRunStats, threshold: int) -> None
     if stats.tokens_in or stats.tokens_out:
         pieces.append(f"tokens {stats.tokens_in}→{stats.tokens_out}")
     if stats.cost:
-        pieces.append(f"约 ¥{stats.cost:.4f}")
+        pieces.append(f"本次约 ¥{stats.cost:.4f}")
     success("LLM 精评完成：" + "　".join(pieces))
+
+    saved = stats.saved_stats
+    if saved.hits:
+        line = (
+            f"  命中缓存省下约 ¥{saved.saved_cost:.4f}（{saved.hits} 条结果直接复用，没有重复付费）"
+        )
+        if saved.unknown_cost_hits:
+            line += f"　[dim]（其中 {saved.unknown_cost_hits} 条没记成本，未计入）[/dim]"
+        console.print(line)
+        console.print("  [dim]「本次花了」与「省下」是两笔账，别相加；细节见 jh cache stats[/dim]")
 
     if stats.errors:
         console.print("  [dim]降级原因（前几条）：[/dim]")
