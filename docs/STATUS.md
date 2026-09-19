@@ -73,7 +73,7 @@
 
 | 套件 | 读数 | 说明 |
 |---|---|---|
-| `pytest tests/unit` | **664 passed / 0 failed** | 我自己那套（含本轮新增的 8 个文件） |
+| `pytest tests/unit` | **704 passed / 0 failed** | 我自己那套（含本轮新增的 8 个文件） |
 | `pytest tests/verify` | **282 passed / 30 xpassed / 0 xfailed / 0 failed** | ★ 验证会话为缺陷写的 30 条独立用例**全部转成 XPASS** —— 也就是说这一轮把"有可证伪用例的缺陷"清空了 |
 | `ruff check .` | 只剩 `tests/verify/test_v_p9.py` 两行 E501 | ⚠️ **那是验证会话的文件**（且尚未提交），我不动它；已请其修（否则 `ruff check .` 在 CI 里会红） |
 | `ruff format --check .` / `uv lock --check` | 全绿 | |
@@ -90,6 +90,16 @@
 | `tests/unit/test_demo.py` | #53：预设 `JH_DATA_DIR` 时 demo 必须退出码 0；配置单例先缓存再改环境变量也要成立；打印并真的删掉临时目录 |
 | `tests/unit/test_tailor_svc.py` | #51：6 种"结构不对的合法 JSON"都必须给 `TailorError`（含版本号） |
 | `tests/unit/test_job_file_guard.py` / `test_match_stale_llm.py` / `test_deepseek_provider.py` / `test_issue_fixes_round_p4.py` / `test_followup.py`（扩写） | #13/#14、#17、#10、#31/#34/#35/#37/#38/#39/#42/#48/#49/#50、#46 的回归 |
+
+### 6.5 #37 的收尾（我自己补的，因为原改法有两个缺口）
+
+修复轮里 #37 的做法是"标 applied 且有开场白 → 推定 `greeting_sent=True`"。推定合理
+（走到 applied 只可能是人点过投递按钮），但**推定必须可见、且可纠正**，否则就是另一种静默失真：
+
+- `jh apply … --status applied` 现在会打一行「已推定「开场白已发出」…」并给出纠正命令；
+- `--sent` 改成 `--sent/--no-sent`（默认 None = 不表态），纠正生效时也打一行说明；
+- 实现坑（记下来）：`greeting_corrected` 必须用**改字段之前**的快照判断 ——
+  `set_status` 会先把 False 写进列，之后读就永远 False（实测：纠正生效了但提示打不出来）。
 
 ---
 
