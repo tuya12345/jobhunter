@@ -35,6 +35,7 @@ DeepSeek 的接口就是 OpenAI 的 `/chat/completions`，请求/响应结构非
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
@@ -196,6 +197,20 @@ class DeepSeekProvider(LLMProvider):
           （空 content 会导致降级到规则分）。保留原始响应才能事后看清
           到底是 `finish_reason=length`（被截断）还是内容过滤。
           ⚠️ 但**不要整体打进日志** —— raw 里含 JD 全文，日志只打长度与状态。
+
+        ★★ 200 + 非 JSON 必须变成**可读的错误**（ISSUES #10）
+
+          真实常见：网关/代理返回 200，响应体却是一页 HTML
+          （"502 Bad Gateway"、Cloudflare 的错误页、公司网络的拦截页…）。
+          原来的写法直接 `response.json()`，于是冲出去的是
+          `JSONDecodeError: Expecting value: line 1 column 1 (char 0)` ——
+          它既没说"哪个状态码"、也没说"响应体长什么样"，
+          用户（和三个月后的我）只能瞎猜是密钥错、网络错还是模型错。
+
+          这里转成 `DeepSeekError` 并带上：状态码 + **截断并脱敏**的响应体开头。
+          为什么截断：错误页动辄几十 KB，全文塞进异常会淹没真正有用的信息。
+          为什么脱敏：万一某个代理把请求头回显进错误页，`sk-...` 就会顺着
+          异常消息进日志/终端 —— 密钥泄露的代价远大于多留几个字符的排查价值。
         """
         if response.status_code >= 400:
             # 让 httpx 抛，交由上层统一处理（4xx 不重试的判定在 _is_retryable）
@@ -205,7 +220,24 @@ class DeepSeekProvider(LLMProvider):
                 response=response,
             )
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:  # json.JSONDecodeError 是 ValueError 的子类
+            raise DeepSeekError(
+                f"DeepSeek 返回了 HTTP {response.status_code}，但响应体不是 JSON"
+                f"（多半是网关/代理插进来的错误页，而不是模型的回答）。\n"
+                f"响应体开头：{_body_preview(response)}"
+            ) from exc
+
+        if not isinstance(data, dict):
+            # 合法 JSON 但不是对象（比如网关返回了 `[]`）：同样是"响应体不对"，
+            # 直接 .get 会抛裸 AttributeError —— 那又是一句没法排查的错误。
+            raise DeepSeekError(
+                f"DeepSeek 返回了 HTTP {response.status_code}，响应体是合法 JSON，"
+                f"但顶层不是对象而是 {type(data).__name__}。\n"
+                f"响应体开头：{_body_preview(response)}"
+            )
+
         choices = data.get("choices") or []
         content = ""
         finish_reason = None
@@ -234,3 +266,29 @@ class DeepSeekProvider(LLMProvider):
             cost=estimate_cost(self.model, tokens_in, tokens_out),
             raw=data,
         )
+
+
+#: 响应体预览的长度上限（字符）。
+_BODY_PREVIEW_LIMIT = 200
+
+
+def _body_preview(response: httpx.Response, *, limit: int = _BODY_PREVIEW_LIMIT) -> str:
+    """把响应体压成一行**可安全展示**的预览：压空白 → 脱敏 → 截断。
+
+    ★ 三个动作都必要：
+      · 压空白：HTML 错误页大量换行缩进，不压掉的话 200 字符里看不到几个字；
+      · 脱敏：`sk-` 开头的密钥一旦被回显，不能让它进异常消息（进而进日志）；
+      · 截断：留个标记，免得读者误以为"响应体就这么长"。
+    """
+    try:
+        text = response.text
+    except Exception:  # noqa: BLE001 - charset 声明损坏时连 text 都可能抛
+        return "（响应体无法解码）"
+    text = re.sub(r"\s+", " ", text or "").strip()
+    # 脱敏：任何形如密钥的串一律打码（宁可多打码，也不要漏一个）
+    text = re.sub(r"sk-[A-Za-z0-9_\-]{3,}", "sk-****", text)
+    if not text:
+        return "（空响应体）"
+    if len(text) > limit:
+        return text[:limit] + f"…（已截断，共 {len(text)} 字符）"
+    return text

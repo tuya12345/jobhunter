@@ -41,6 +41,7 @@ __all__ = [
     "TodayItem",
     "TodayList",
     "build_today_list",
+    "copy_target",
     "ensure_item",
     "load_snapshot",
     "resolve_index",
@@ -87,7 +88,14 @@ class TodayList:
     """一次清单的完整结果。"""
 
     items: list[TodayItem] = field(default_factory=list)
-    #: 过滤前有多少岗位达到分数线（用来说明"为什么只有这几条"）
+    #: **过滤前**有多少岗位达到分数线（用来说明"为什么只有这几条"）。
+    #: ★★ ISSUE #35：这个数字必须在"排掉已投递"**之前**统计 —— 它就是
+    #:   CLI 上那句「过滤前达线 N 条」的来源，而原实现在
+    #:   "排掉已有非 pending 投递"之后才 `len(rows)`，于是那个数字实际上是
+    #:   "排掉已投之后"的。用户会拿它判断"今天还有多少机会"，口径不符就是误判。
+    #:   现在的定义（写死，别再含糊）：**达线** = `match_score >= threshold`
+    #:   且岗位状态不在 `(applied, skipped)` 里 —— 即"库里够分、还没被我处理掉"的量；
+    #:   同公司去重与 `--limit` 都发生在它之后，不影响它。
     candidates: int = 0
     #: 因"同公司去重"被挤掉的条数
     dropped_same_company: int = 0
@@ -109,29 +117,44 @@ def select_candidates(
     """选出今天的候选岗位。
 
     Returns:
-        (岗位列表, 过滤前达到分数线的数量, 因同公司被挤掉的数量)
+        (岗位列表, **过滤前**达到分数线的数量, 因同公司被挤掉的数量)
+        —— 第二个数的口径见 `TodayList.candidates` 的说明（在"排掉已投递"
+        与"同公司去重"**之前**统计）。
     """
     settings = settings or get_settings()
     threshold = settings.threshold if min_score is None else min_score
 
-    statement = (
+    # ★★ ISSUE #35：这个数字是 UI 上「过滤前达线 N 条」的来源，所以它必须在
+    #   **两道过滤之前**统计：
+    #     ① 排掉已有非 pending 投递的岗位（而且 `jobs.status` 会被 `set_status`
+    #        同步成 applied —— 所以连"已投"这个状态本身都不能提前排除，
+    #        否则投一条这个数字就少一）；
+    #     ② 同公司去重。
+    #   它的**定义**（写死，别再含糊）：`match_score >= threshold`
+    #   且岗位没有被**我主动跳过**（`skipped` 是人工决策，不该算进"机会"）。
+    #   "已投递"不算被过滤掉的机会 —— 那正是用户想知道"今天本来有多少条够分"的地方。
+    before_filter = (
         select(Job)
         .where(
             Job.match_score.is_not(None),
             Job.match_score >= threshold,
-            Job.status.not_in(_EXCLUDED_JOB_STATUSES),
+            Job.status != "skipped",
         )
         # ★ 排序必须完全确定：分数降序 + id 升序（同分时不会每次顺序不同）
         .order_by(Job.match_score.desc(), Job.id.asc())
     )
-    rows = list(session.scalars(statement))
+    rows = list(session.scalars(before_filter))
+    total = len(rows)
 
     # 已经有"真的投出去"的记录 → 不再推（状态列与投递记录可能不同步，两道都要查）
     applied_job_ids = set(
         session.scalars(select(Application.job_id).where(Application.status != "pending"))
     )
-    rows = [job for job in rows if job.id not in applied_job_ids]
-    total = len(rows)
+    rows = [
+        job
+        for job in rows
+        if job.id not in applied_job_ids and job.status not in _EXCLUDED_JOB_STATUSES
+    ]
 
     # 同公司去重：保留分数最高的那一条（列表已按分数排序，第一次出现即最高）
     seen: set[str] = set()
@@ -317,6 +340,60 @@ def load_snapshot(settings: AppSettings, *, now: datetime | None = None) -> list
     if not isinstance(job_ids, list):
         return None
     return [int(value) for value in job_ids if isinstance(value, int)]
+
+
+def copy_target(
+    session: Session,
+    index: int,
+    *,
+    min_score: int | None = None,
+    limit: int | None = None,
+    settings: AppSettings,
+) -> tuple[Job | None, str]:
+    """`jh today --copy N` 的序号解析：**筛选选项必须真的生效**（ISSUE #34）。
+
+    Returns:
+        `(岗位或 None, 说明)` —— 岗位为 None 时说明里写清了为什么取不到
+        （序号超范围 / 被 `--min-score` 或 `--limit` 筛掉了）。
+
+    ★★ 为什么单独抽出来（ISSUE #34）：`--copy N` 与 `--min-score` / `--limit`
+      是同一条命令的选项，用户给 `--copy 2 --min-score 999` 时的合理预期是
+      "在我限定的范围里取第 2 条"（范围为空 → 报错/提示无此条）。
+      原实现里 `_copy_nth` 收了 `min_score` 形参却**从不使用**，于是照常复制第 2 条 ——
+      静默忽略选项比报错更糟：用户以为筛选生效了，拿到的是别的岗位的话术。
+
+    ★ 序号仍然先按**今天的快照**解析（`resolve_index` 的承诺：当天内序号不漂移），
+      但解析出来的岗位**必须**落在当前清单里，且序号不能超过 `--limit`。
+      这样"序号含义"与"筛选选项"两件事都成立。
+
+    ★ 只在显式给了 `--min-score` 时才用它卡（`min_score is not None`）：
+      不给的时候 `select_candidates` 会退回 `config.threshold` ——
+      这是"这条序号当前还在不在清单里"的固有口径（`resolve_index` 也是同一套），
+      不是我们额外加的收缩。
+    """
+    job, from_snapshot = resolve_index(session, index, settings=settings)
+    if job is None:
+        return None, (
+            f"清单里没有第 {index} 条"
+            + ("（今天还没有清单快照，先跑一次 `jh today`）" if from_snapshot else "")
+        )
+
+    # 筛选选项不给 → 只看"这一条还在不在清单里"，不额外收缩范围（见 docstring）
+    jobs, _total, _dropped = select_candidates(session, min_score=min_score, settings=settings)
+    if job not in jobs:
+        return None, (
+            f"第 {index} 条（{job.company or '—'} · {job.title or '（未写职位）'}）"
+            f"不在当前筛选范围内（--min-score={min_score}）"
+            if min_score is not None
+            else f"第 {index} 条已经被处理掉了（不在当前待投清单里）"
+        )
+    position = jobs.index(job) + 1
+    if limit is not None and position > limit:
+        return None, (
+            f"第 {index} 条在 --limit {limit} 之外"
+            f"（它在当前筛选里排第 {position}）—— 去掉 --limit 或用 --copy {position}"
+        )
+    return job, ""
 
 
 def resolve_index(

@@ -58,8 +58,18 @@ jobs:
         #   （其余 extra 不用装：browser/emulator 的测试带 marker，默认排除。）
         run: uv sync --locked --python ${{ matrix.python-version }} --extra docx
 
-      - name: ruff 检查（含 PLW1514：强制显式 encoding）
+      - name: ruff 检查（默认规则集）
         run: uv run ruff check .
+
+      - name: ruff 编码守卫（PLW1514：裸 open 必须显式 encoding）
+        # ★ 为什么它是**单独一条**命令（ISSUE #7）：
+        #   PLW1514 是 ruff 的 preview 规则，不开 `--preview` 就完全不会生效
+        #   （只在 select 里列出来，ruff 只会给一句 "has no effect" 的提示）。
+        #   而全局打开 preview 会一次性引入 9 条与本项目无关的 preview 规则（实测 65 处），
+        #   且 preview 规则本身不稳定 → CI 会为"与本次改动无关的原因"变红。
+        #   所以这里按规则精确开；完整取舍写在 pyproject.toml 的 [tool.ruff.lint] 上方。
+        #   ⚠️ 这条步骤不能被删：tests/unit/test_encoding_lint_guard.py 会断言它还在。
+        run: uv run ruff check --preview --select PLW1514 src/ tests/
 
       - name: ruff 格式检查（本地和 CI 用同一套格式规则）
         # 不自动改文件，只检查 —— CI 只负责发现问题，"格式化"是开发者本地的事
@@ -86,6 +96,21 @@ jobs:
           name: coverage-${{ matrix.os }}
           path: coverage.xml
           if-no-files-found: ignore
+
+      - name: 隐私扫描（工作区里不许有真实身份标识）
+        # 依据：ISSUES #54 —— 把"仓库里没有真实姓名/学校/手机号"从"靠人记得跑"
+        # 变成 CI 保证，并且**扫描样本本身不进仓库**。
+        #   · 样本来源：repository secret `JH_PII_SAMPLES`（逗号分隔），
+        #     或本机 `state/pii-samples.txt`（`state/` 已 gitignore）。
+        #   · **没配样本时用例会 skip**（不是 pass）—— `-rs` 让它出现在摘要里，
+        #     所以"没扫"这件事永远看得见，不会伪装成"扫过了没问题"。
+        #   · 报的是命中**位置**，不回显命中内容（内容本身就是隐私）。
+        env:
+          JH_PII_SAMPLES: ${{ secrets.JH_PII_SAMPLES }}
+        run: >-
+          uv run pytest
+          tests/verify/test_v_p9.py::test_working_tree_has_no_real_identifiers
+          -rs -v
 
       - name: 报告 SQLite 版本（排查"外键/WAL 行为差异"时有用）
         # SQLite 版本会影响 PRAGMA 与 batch 迁移行为，出问题时第一个要看的就是它

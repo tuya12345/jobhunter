@@ -1,0 +1,116 @@
+# ============================================================================
+# JobHunter nightly —— 跑那些"不够稳定、不该阻塞主 CI"的测试（ISSUES #22）
+# ----------------------------------------------------------------------------
+# ★ 为什么必须有这个文件
+#
+#   `pyproject.toml` 注册了 `live` / `emulator` 两个 marker 并默认排除，注释写着
+#   "只在 nightly 跑" —— 但仓库里**从来没有 nightly workflow**。
+#   于是那些被排除的用例（真模型抽样、模拟器环境）实际上一次都没跑过：
+#   `pytest -m live` 在这台机器上跑出来的东西没有任何人看，
+#   "分层测试"只发生在文档里。
+#
+# ★ 它**绝不**影响主 CI
+#
+#   · 只由 `schedule`（每天一次）和 `workflow_dispatch`（手动）触发，
+#     不在 push / pull_request 上跑 —— 主 CI 的红绿与它无关；
+#   · job 级 `continue-on-error: true`：真模型抖动、额度用尽、provider 抽风
+#     都只让这个 job 标黄，不会让"main 分支坏了"这种假信号传出去。
+#     要判定"这次抽样到底过没过"，看 job 的 conclusion 与日志，不要看仓库的状态灯。
+#
+# ★ 关于 Secret `DEEPSEEK_API_KEY`（没有它时会 skip，而不是 fail）
+#
+#   用例（`tests/unit/test_tailor_live.py`）在拿不到 key 时调用 `pytest.skip(...)`，
+#   所以**没有配 Secret 的仓库**（fork、别人的 clone、刚建的仓库）跑这个 workflow
+#   会是"1 skipped"、退出码 0 —— 这正是要的行为：
+#       没验证 ≠ 验证通过，但也不该把"我还没配 key"报成"代码坏了"。
+#   为了让这件事在日志里**看得见**（而不是伪装成绿色通过），
+#   下面所有 pytest 命令都带 `-rs`：skip 的原因会出现在摘要里。
+#
+#   要真的跑起来：仓库 Settings → Secrets and variables → Actions →
+#   新建 repository secret `DEEPSEEK_API_KEY`（本项目的 key 从 platform.deepseek.com 取）。
+#   ⚠️ 只放在 Secret 里，**不要**写进 workflow / .env / 任何提交进仓库的文件。
+# ============================================================================
+name: Nightly
+
+on:
+  schedule:
+    # 每天 18:00 UTC = 次日 02:00 北京时间（本地深夜跑，不占白天的机器）
+    - cron: "0 18 * * *"
+  workflow_dispatch: # 手动触发：改完提示词/模型配置想立刻抽一次样
+
+# 同一分支的 nightly 不并发（真模型调用要花钱，没必要叠着跑）
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: live（真模型抽样）
+    runs-on: ubuntu-latest
+    # ★ 允许失败：真模型的不确定性不该把仓库变红（理由见文件头）
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安装依赖
+        # dev 组（pytest）必须有；`--extra docx` 与主 CI 保持一致
+        # （live 抽样用的假简历解析路径依赖它）。
+        run: uv sync --locked --extra docx
+
+      - name: 跑 live 用例（`pytest -m live`）
+        env:
+          # 没配这个 Secret 时它是空串 → 用例自己 skip（见文件头说明）
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: >-
+          uv run pytest -m live
+          -rs -v
+          --junitxml=nightly-live.xml
+
+      - name: 上传结果（失败也传，方便回看"这次模型到底答了什么"）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-live-${{ github.run_id }}
+          path: nightly-live.xml
+          if-no-files-found: ignore
+
+  emulator:
+    name: emulator（模拟器环境抽样，P7 用）
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安装依赖（含 emulator extra）
+        # uiautomator2 在 `[emulator]` 里是**钉死版本**的（上游改动频繁）
+        run: uv sync --locked --extra docx --extra emulator
+
+      - name: 跑 emulator 用例（`pytest -m emulator`）
+        env:
+          # 没有设备时用例会 skip（不是 fail）：GitHub 的 runner 上没有安卓设备，
+          # 这一项的意义是"把命令与 skip 原因摆在日志里"，
+          # 真跑模拟器时（本机 / self-hosted runner）导出 ANDROID_SERIAL 即可。
+          ANDROID_SERIAL: ${{ vars.ANDROID_SERIAL }}
+        run: >-
+          uv run pytest -m emulator
+          -rs -v
+
+# ───────────────────────────────────────────────────────────────────────────
+# 为什么没有"动态生成 marker 列表""失败自动开 issue"这类花样
+#
+#   这些用例的产出是**给人看的抽样结论**（模型这次答得怎么样、有多少建议被闸门拦下），
+#   不是"是/否"的闸门。自动开 issue 只会制造一批没人看的通知 ——
+#   真要看结论，点进 job 日志，`-v` 与 `-rs` 已经把每条用例的结果与 skip 原因写全了。
+# ───────────────────────────────────────────────────────────────────────────

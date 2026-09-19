@@ -142,6 +142,13 @@ _POOL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])(?P<tok>[A-Za-z][A-Za-z0-9+#._\-]{
 #: 学习标注：白名单技能必须带这些词之一才允许出现。
 _LEARNING_MARKERS = ("在学习", "正在学", "学习中", "还在学", "刚入门", "初步了解")
 
+#: "把某技术当**工具**用"的中文介词/动词（ISSUES #31 的收尾修正用）。
+#: 场景：`我用 Docker 部署过项目`、`基于 Redis 做了缓存`。
+#: 在这种句子里，技能词是**一个真实动作的工具**，不是一条"我会什么"的声称。
+_TOOL_INTRO_CHARS = "用使用拿靠借助通过基于"
+#: 工具介词与技能词之间允许隔的字符数（"用 Docker" 是 1；留到 6 兜住"使用 Docker"）
+_TOOL_INTRO_MAX_GAP = 6
+
 
 @dataclass
 class Violation:
@@ -307,7 +314,22 @@ def _skill_violations(
                     detail="简历里没有这个技能，属于编造",
                 )
             )
-        if allowed_skills is not None and skill not in allowed_skills and skill in pool:
+        # ★★ ISSUE #31 收尾：第二道（"JD 没要求"）**只针对"技能声称"**。
+        #   为什么：第一道（编造）问的是"这是真的吗"，第二道问的是"这贴不贴 JD"。
+        #   一句 `我用 Docker 部署过项目` 里 Docker 是**动作的工具**，
+        #   它出现在句子里是因为"部署"这个动作真的发生过 —— 把它按
+        #   "你提了一个 JD 没要求的技能"处理，等于把真话降级成模板
+        #   （实测：`test_truthful_greeting_is_not_downgraded_to_template` 变红）。
+        #   而 `我熟悉 JavaScript、Vue、MySQL、Redis 与 Git` 是**并列的技能声称**，
+        #   必须被这条闸门拦住 —— 用户的原痛点就是"写的话跟岗位不沾边"。
+        #   ⚠️ 判据是"工具介词 + 技能"（用/使用/基于…），不是"离某个动作词近"：
+        #      后者会把"我熟悉 MySQL 与 Redis，做过后端部署"整句豁免掉。
+        if (
+            allowed_skills is not None
+            and skill not in allowed_skills
+            and skill in pool
+            and not _is_tool_usage(text, skill, vocabulary)
+        ):
             violations.append(
                 Violation(
                     kind="skill_not_in_jd",
@@ -316,6 +338,26 @@ def _skill_violations(
                 )
             )
     return violations, mentioned
+
+
+def _is_tool_usage(text: str, skill: str, vocabulary: dict[str, list[str]]) -> bool:
+    """这个技能在文案里是不是"某个动作的工具"（`用 Docker 部署`）？
+
+    ★ 与 `CAPABILITY_TERMS` 豁免的**同一个道理**，只是这里被豁免的是技能词本身：
+      "我用 Docker 部署过项目"是一句关于**部署**的真话，Docker 只是工具。
+      把它算成"你提了一个 JD 没要求的技能"会把真话判成跑题。
+    ★ 保守：只有当技能的所有写法前面紧跟着工具介词（用/使用/拿/靠/借助/通过/基于）时才算。
+      不加这个限制的话，"我熟悉 A、B，做过后端部署"会把 A、B 一起豁免掉。
+    """
+    aliases = vocabulary.get(skill) or [skill]
+    for alias in aliases:
+        start = 0
+        while (index := text.find(alias, start)) != -1:
+            window = text[max(0, index - _TOOL_INTRO_MAX_GAP) : index]
+            if any(char in window for char in _TOOL_INTRO_CHARS):
+                return True
+            start = index + len(alias)
+    return False
 
 
 def check_text(

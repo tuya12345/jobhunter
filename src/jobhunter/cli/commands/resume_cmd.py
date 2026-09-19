@@ -48,6 +48,7 @@ from jobhunter.cli.common import (
 )
 from jobhunter.config.settings import get_settings
 from jobhunter.services import resume_svc
+from jobhunter.utils.docx import DocumentReadError
 from jobhunter.utils.io import write_text
 
 app = typer.Typer(name="resume", help="简历：导入解析 / 列表 / 拆分方向（P1）")
@@ -111,10 +112,20 @@ def resume_add(
                     settings=settings,
                 )
             except resume_svc.ResumeParseError as exc:
+                # ★ 必须回滚：解析失败时**绝不能留下一条半成品简历**
+                #   （ISSUES #15）。库里第一份简历会自动成为默认简历，
+                #   一条"0 技能 / 无姓名"的空记录会悄悄成为之后所有匹配的参照物，
+                #   分数全错而用户毫无察觉 —— 比直接报错糟得多。
                 session.rollback()
                 err_console.print(f"[red]解析失败：{exc}[/red]")
                 raise typer.Exit(code=1) from exc
-            except Exception as exc:  # noqa: BLE001 - 文件损坏/格式不支持等
+            except DocumentReadError as exc:
+                # 文件读不出来（非 UTF-8 的 txt / 损坏的 docx）是**预期内的输入问题**，
+                # 消息里已经写了中文原因与下一步，这里只负责别让 Traceback 冲到用户面前。
+                session.rollback()
+                err_console.print(f"[red]导入失败：{exc}[/red]")
+                raise typer.Exit(code=1) from exc
+            except Exception as exc:  # noqa: BLE001 - 兜底：任何意外都不该打印堆栈
                 session.rollback()
                 err_console.print(f"[red]导入失败：{exc}[/red]")
                 raise typer.Exit(code=1) from exc

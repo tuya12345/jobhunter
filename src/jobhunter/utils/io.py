@@ -15,7 +15,14 @@ Windows 上 `open("简历.txt")` 用的是**系统区域编码**（中文系统�
 
 三层防护：
     1. 本模块：所有读写都写死 `encoding="utf-8"`（调用方**无法**忘记）；
-    2. ruff 规则 `PLW1514`（在 pyproject 里开启）：任何裸 `open()` 调用直接 lint 报错；
+    2. lint：ruff 的 `PLW1514`（裸 `open()` 必须显式 encoding）。
+       ★ **它是 preview 规则** —— 只在 `pyproject.toml` 的 `select` 里列出来
+       **不会生效**（ruff 只给一句 "has no effect because preview is not enabled" 的提示）。
+       所以它由一条**单独的 CI 步骤** `ruff check --preview --select PLW1514` 守着
+       （见 `.github/workflows/ci.yml` 与 `pyproject.toml` 里那段说明：不开全局 preview
+       是因为会一次性引入 9 条无关规则、65 处误报）。
+       `tests/unit/test_encoding_lint_guard.py` 同时用 AST 自查一遍 `src/`，
+       免得"这条 CI 步骤被谁删掉"之后又变成"注释说有效、实际无效"。
     3. CI 跑 windows-latest：真在中文 Windows 上验证。
 
 另外两个细节：

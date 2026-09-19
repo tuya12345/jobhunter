@@ -27,12 +27,22 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, String, Text
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from jobhunter.models.base import BaseModel, UTCDateTime, json_text, utc_now_default
+from jobhunter.models.constants import EVENT_TYPES
 
-__all__ = ["Application", "ApplicationEvent"]
+__all__ = ["Application", "ApplicationEvent", "EVENT_TYPE_CHECK"]
+
+#: `application_events.event_type` 的 CHECK 表达式（**单一来源**）。
+#: 迁移 `0003_event_type_check.py` 里那一份是**逐字相同**的副本：
+#: 迁移是历史，不能 import 会变的常量；两份不一致时
+#: `tests/unit/test_event_type_constraint.py` 会立刻变红。
+#: ★ 命名说明：命名约定里的 ck 模板是 `ck_%(table_name)s_%(constraint_name)s`，
+#:   所以这个名字会被渲染成 `ck_application_events_event_type` ——
+#:   与迁移里显式写的约束名**完全一致**（批量重建表时两边必须同名）。
+EVENT_TYPE_CHECK = "event_type IN ({})".format(", ".join(f"'{t}'" for t in EVENT_TYPES))
 
 
 class Application(BaseModel):
@@ -135,6 +145,12 @@ class ApplicationEvent(BaseModel):
         Index("ix_application_events_application_id", "application_id"),
         # 时间轴按发生时间排序
         Index("ix_application_events_occurred_at", "occurred_at"),
+        # ★ ISSUE #42：event_type 收紧成 EVENT_TYPES 八取一。
+        #   没有它，`status_chnage` 这种拼写错误会**静默入库**，
+        #   而 P6 的时间轴/统计按 event_type 分类 → 出现永远对不上的分类。
+        #   服务层（`apply_svc.record_event`）会先给一句中文报错，
+        #   所以用户看到的是"可用取值"而不是 SQLite 的约束报错。
+        CheckConstraint(EVENT_TYPE_CHECK, name="event_type"),
     )
 
     def __repr__(self) -> str:

@@ -11,6 +11,10 @@
     jh job add --html page.html   从本地保存的网页解析（不想联网 / 抓取被拦）
     jh job add --text "…"         直接给一段文本（脚本化调用）
 
+★ `--file` 的三道闸门（都在**读取阶段**，见 `_read_url_file`）：
+  只收 http/https、按归一化 URL 去重、一次最多 20 条 —— 跳过的每一类都会打印出来。
+  理由：抓取之间要等 2~5 秒随机延时，"重复行/几千行清单"会直接变成对外连发。
+
 另外两个查询/操作命令：
 
     jh job list [--status] [--platform]   看录入结果
@@ -28,9 +32,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 import sys
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import typer
 from rich.panel import Panel
@@ -46,6 +52,20 @@ from jobhunter.utils.io import read_text
 app = typer.Typer(name="job", help="岗位：给链接抓详情 / 批量 / 手动粘贴 / 列表（P2）")
 
 
+#: `--file` 一次最多处理多少条 URL。
+#:
+#: ★ 为什么写成常量、而不是 config.yaml 里的一项：
+#:   这个数字是**防手滑的护栏**，不是个人偏好 —— 它挡的是"一次喂几千行，
+#:   工具以 2~5 秒/条的节奏连续对外请求几小时"。让用户去配置它，
+#:   等于把这个护栏变成"看起来可以关掉的东西"（关掉它的那一刻，
+#:   频率克制的承诺就没了）。真抓得更多时，拆成几个文件分批跑是更清楚的表达：
+#:   每一批的结果、失败原因都单独看得到。
+#:
+#: ★ 为什么是 20：与 config.yaml 的 `daily_limit: 20` 同量级 ——
+#:   一天要投的岗位本来就是这个数量级。给太多等于没有上限。
+URL_FILE_MAX_ITEMS = 20
+
+
 # ---------------------------------------------------------------------------
 # add
 # ---------------------------------------------------------------------------
@@ -57,7 +77,14 @@ def job_add(
     ] = None,
     file: Annotated[
         Path | None,
-        typer.Option("--file", "-f", help="批量文件：一行一个 URL（# 开头是注释）"),
+        typer.Option(
+            "--file",
+            "-f",
+            help=(
+                "批量文件：一行一个 URL（# 开头是注释）。"
+                f"只收 http/https、按归一化链接去重、一次最多 {URL_FILE_MAX_ITEMS} 条"
+            ),
+        ),
     ] = None,
     manual: Annotated[
         bool,
@@ -374,17 +401,159 @@ def _collect_details(
 
 
 def _read_url_file(path: Path) -> list[str]:
-    """读批量 URL 文件（一行一个；`#` 开头是注释；忽略空行）。"""
+    """读批量 URL 文件（一行一个；`#` 开头是注释；忽略空行）。
+
+    ═══════════════════════════════════════════════════════════════════════
+    ★★ 三道闸门，全部在**读取阶段**做（不是丢给后面的抓取循环）
+    ═══════════════════════════════════════════════════════════════════════
+
+        ① scheme 白名单：只收 `http` / `https`
+        ② 按 URL 归一化去重（复用 `job_svc.url_dedup_key`，不另写一套规则）
+        ③ 条数上限（见 `URL_FILE_MAX_ITEMS`）
+
+    为什么必须在读取阶段做：抓取循环里每一条都要等 2~5 秒的随机延时
+    （设计文档 §七.7「频率克制」）。一次喂 5000 行、或同一个链接喂两遍，
+    都会变成"连着对外请求几小时"与"对同一页面重复请求"——
+    这两种行为都不该由"用户手滑写重了一行"来触发。
+
+    ★ 为什么跳过的东西必须**报出来**：`--file` 是唯一"用户没法一眼看全"的入口
+      （清单可能有几百行）。静默少抓几条，用户第二天才发现清单里少了一半岗位，
+      而那时已经不知道是哪一步丢的。所以重复 / 非法 / 超限三类都明确打印。
+
+    ★ 签名保持不变（返回 `list[str]`）：这是 `_collect_details` 与验证用例
+      （`tests/verify/test_v_adversarial.py`）都在用的契约；跳过原因通过
+      终端输出交代，不塞进返回值里改变形状。
+    """
     if not path.is_file():
         err_console.print(f"[red]找不到文件：{path}[/red]")
         raise typer.Exit(code=1)
-    urls: list[str] = []
-    for line in read_text(path).splitlines():
-        stripped = line.strip()
+
+    accepted: list[str] = []
+    # 归一化 key → 第一次出现的行号（留着是为了提示"和哪一行重复"）
+    seen: dict[str, int] = {}
+    rejected: list[str] = []
+    duplicates: list[str] = []
+    overflow: list[str] = []
+
+    for line_no, line in enumerate(read_text(path).splitlines(), start=1):
+        # ★ 去掉 BOM（`\ufeff`）：Windows 上 `Out-File` / 记事本默认写 BOM，
+        #   于是**第一行**会变成 `\ufeff# 注释`（注释判断失效）或 `\ufeffhttps://…`
+        #   （链接被判成"没有 scheme"而丢弃）。同一个坑在 `_read_stdin` 那里踩过一次
+        #   （见它的注释），这里是文件版：BOM 不该让用户少抓一条岗位。
+        stripped = line.replace("\ufeff", "").strip()
         if not stripped or stripped.startswith("#"):
             continue
-        urls.append(stripped)
-    return urls
+
+        reason = _url_reject_reason(stripped)
+        if reason is not None:
+            rejected.append(f"第 {line_no} 行 {stripped}（{reason}）")
+            continue
+
+        key = job_svc.url_dedup_key(stripped)
+        if key and key in seen:
+            duplicates.append(f"第 {line_no} 行 {stripped}（与第 {seen[key]} 行是同一个链接）")
+            continue
+        if key:
+            seen[key] = line_no
+
+        if len(accepted) >= URL_FILE_MAX_ITEMS:
+            overflow.append(stripped)
+            continue
+
+        accepted.append(stripped)
+
+    _report_url_file_skips(path, rejected=rejected, duplicates=duplicates, overflow=overflow)
+    return accepted
+
+
+#: 允许的 scheme（招聘页只可能是这两个）。
+_ALLOWED_SCHEMES = ("http", "https")
+
+#: 明确指向本机的域名（IP 字面量另有 `ipaddress` 判定）。
+_LOCAL_HOSTS = ("localhost", "localhost.localdomain", "127.0.0.1", "::1", "0.0.0.0")
+
+
+def _url_reject_reason(raw: str) -> str | None:
+    """这一行为什么不能进抓取队列（返回 None = 通过）。
+
+    ★ 为什么要挡非 http(s) 与内网地址：
+
+        `jh job add --file` 会把每一行**真的交给浏览器打开**。
+        `file:///C:/Windows/win.ini`、`javascript:…`、`http://192.168.1.1/`
+        既不是招聘页，也让一个"只抓岗位"的工具去读本机文件 / 探测内网 ——
+        设计文档 §七.2 写明不做任何绕过与越界的事，这是同一条纪律的延伸。
+
+    ★ 为什么用 `urlsplit` 而不是自己切字符串：
+        大小写 scheme（`HTTP://`）、带用户名密码、`//host` 省略 scheme 等写法
+        都得处理；标准库已经把这些边界写对了，手写正则只会漏。
+    """
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return "不是合法链接"
+    scheme = parts.scheme.lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        shown = scheme or "没有 scheme"
+        return f"只接受 http/https 链接（这里是 {shown}）"
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        return "链接里没有域名"
+    if _is_private_host(host):
+        return "指向本机/内网地址（这里只抓公开招聘页）"
+    return None
+
+
+def _is_private_host(host: str) -> bool:
+    """host 是不是本机 / 内网（含 IP 字面量的私有段与内网后缀域名）。"""
+    if host in _LOCAL_HOSTS:
+        return True
+    if host.endswith((".local", ".localhost", ".internal", ".lan")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # is_private 覆盖 10/8、172.16/12、192.168/16；其余几个是回环/链路本地/保留段
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified
+    )
+
+
+def _report_url_file_skips(
+    path: Path,
+    *,
+    rejected: list[str],
+    duplicates: list[str],
+    overflow: list[str],
+) -> None:
+    """把三类"跳过"打印给用户（每类最多列 3 条，其余只报数量）。
+
+    ★ 为什么不一整批全列出来：清单文件有几百行时，把 200 条非法行全打出来
+      会把真正的结论（"只有前 20 条会被处理"）顶出屏幕。数量 + 前几条足够定位。
+    """
+    if rejected:
+        warn(f"{path.name}：{len(rejected)} 条被跳过（不是能抓的岗位链接）")
+        for item in rejected[:3]:
+            console.print(f"  [dim]· {item}[/dim]")
+        if len(rejected) > 3:
+            console.print(f"  [dim]· …还有 {len(rejected) - 3} 条同类[/dim]")
+    if duplicates:
+        # ★ 重复也要报：这说明用户的清单来源本身有重复（比如两次导出拼在一起），
+        #   只报"跳过 N 条"会让他以为工具漏抓了。
+        warn(f"{path.name}：跳过 {len(duplicates)} 条重复链接（同一个岗位抓一次就够）")
+        for item in duplicates[:3]:
+            console.print(f"  [dim]· {item}[/dim]")
+        if len(duplicates) > 3:
+            console.print(f"  [dim]· …还有 {len(duplicates) - 3} 条重复[/dim]")
+    if overflow:
+        warn(
+            f"{path.name}：只处理前 {URL_FILE_MAX_ITEMS} 条，"
+            f"其余 {len(overflow)} 条**没有抓取**（不是抓失败，是根本没进队列）"
+        )
+        console.print(
+            "  [dim]为什么有上限：抓取之间有 2~5 秒随机延时，几千条会连发几小时，"
+            "与「频率克制」冲突。要全抓请拆成多个文件分批跑。[/dim]"
+        )
 
 
 def _read_stdin() -> str:

@@ -23,7 +23,12 @@ from pathlib import Path
 
 import pytest
 
-from jobhunter.utils.docx import UnsupportedDocumentError, read_document, read_docx
+from jobhunter.utils.docx import (
+    DocumentReadError,
+    UnsupportedDocumentError,
+    read_document,
+    read_docx,
+)
 from tests._fixture_loader import load_fixture_module
 
 pytest.importorskip("docx", reason="需要 [docx] extra：uv sync --extra docx")
@@ -132,6 +137,55 @@ def test_empty_docx_logs_warning_but_does_not_crash(tmp_path: Path) -> None:
     docx.Document().save(str(target))
     result = read_docx(target)
     assert result.lines == []
+
+
+# ---------------------------------------------------------------------------
+# 读不出来的文件：必须是**中文可操作**的错误（ISSUES #12）
+#
+# ★ 这两条为什么不能用"关键词碰巧命中"的方式写：
+#   `UnicodeDecodeError` 的消息里恰好含 `utf-8`、
+#   `PackageNotFoundError` 的消息里恰好含文件名 —— 只断言这些词，
+#   裸异常会**蒙混过关**（验证会话第一版就这么误判过一次）。
+#   所以断言的是"中文原因 + 下一步动作"，而不是异常类的名字。
+# ---------------------------------------------------------------------------
+def test_gbk_text_file_gives_actionable_error(tmp_path: Path) -> None:
+    """GBK 编码的 .txt（中文 Windows 上极常见）要给"另存为 UTF-8"的指引。
+
+    ★ 为什么不静默兜底成 GBK 解码：猜错编码不会报错，只会把内容解成乱码，
+      而简历解析会"看似成功"地读进一堆错字 —— 那比直接失败糟得多。
+    """
+    target = tmp_path / "resume.txt"  # 文件名刻意中性，避免污染断言
+    target.write_bytes("姓名：林小满\n技能：Python".encode("gbk"))
+
+    with pytest.raises(DocumentReadError) as excinfo:
+        read_document(target)
+    message = str(excinfo.value)
+    assert "编码" in message, f"没指出真正的原因（编码）：{message}"
+    assert "UTF-8" in message, f"没给出下一步（另存为 UTF-8）：{message}"
+
+
+def test_corrupted_docx_gives_actionable_error(tmp_path: Path) -> None:
+    """损坏的 docx 要说"文件坏了"，而不是丢一句 `Package not found at ...`。"""
+    target = tmp_path / "broken.docx"  # 文件名刻意中性（"损坏"两个字不能出现在这里）
+    target.write_bytes(b"\x00\x01\x02 not a real docx at all \xff\xfe")
+
+    with pytest.raises(DocumentReadError) as excinfo:
+        read_document(target)
+    message = str(excinfo.value)
+    assert any(word in message for word in ("损坏", "无法打开", "不是有效", "打不开")), (
+        f"没告诉用户「文件本身有问题」：{message}"
+    )
+
+
+def test_missing_docx_is_reported_as_missing_not_as_corrupt(tmp_path: Path) -> None:
+    """ "文件不存在"与"文件坏了"是两种下一步，不能被混成同一句提示。
+
+    ★ python-docx 对两种情况都可能抛 `PackageNotFoundError`，
+      所以必须在读之前先判存在 —— 否则用户拿着"文件已损坏"去修一个
+      其实只是路径写错了的文件。
+    """
+    with pytest.raises(FileNotFoundError):
+        read_docx(tmp_path / "没有这个文件.docx")
 
 
 # ---------------------------------------------------------------------------

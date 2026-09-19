@@ -166,15 +166,23 @@ def test_resume_pool_ignores_raw_text(settings):
 # 权重再分配
 # ---------------------------------------------------------------------------
 def test_skill_dimension_dropped_when_no_keywords(settings, profiles, vocabulary):
-    """JD 里没有词表内技能 → 技能维度判不出来，权重让给其余维度。"""
+    """JD 里没有词表内技能 → 技能维度判不出来，权重让给其余维度。
+
+    ★ 这段 JD 刻意**要能判出方向**（"前端"在方向词表里）、但一个词表技能都没有 ——
+      这是真实存在的情况：岗位方向很清楚，但它用的技术词不在我们的词表里。
+      ⚠️ 如果 JD 连方向都判不出来，它会被"信息不足"闸门按 0 分处理（ISSUES #9），
+      那测的就不是"权重再分配"了 —— 见 `test_match_info_gap.py`。
+    """
     resume = make_resume()
     result = match(
-        "我们是一家有活力的公司，欢迎加入我们。",
+        "我们在招前端工程师，负责页面交互与视觉实现，欢迎加入我们。",
         resume,
         settings=settings,
         profiles=profiles,
         vocabulary=vocabulary,
     )
+    assert result.jd_keywords == [], "前提：这段 JD 里不该有词表内的技能"
+    assert result.direction, "前提：这段 JD 应当能判出方向（否则会走 #9 的信息不足闸门）"
     skill = result.rule_detail["parts"]["skill"]
     assert skill["ratio"] is None
     assert skill["points"] == 0

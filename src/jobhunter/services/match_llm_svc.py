@@ -44,13 +44,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.orm import Session
 
 from jobhunter.config.settings import AppSettings, get_settings
@@ -113,6 +114,34 @@ class LLMMatchVerdict(BaseModel):
     #: LLM 认为该用哪份简历（多份简历时才有意义；只作参考，不覆盖规则层的结论）
     recommended_resume: str | None = None
     reason: str = ""
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _score_must_be_a_number(cls, value: Any) -> Any:
+        """在 pydantic 强转**之前**拦掉布尔与字符串（ISSUES #11）。
+
+        ★ 这个校验挡住的是哪一种静默失真
+
+          pydantic 默认是**非严格（lax）模式**：`{"score": true}` 会被安静地
+          强转成 `1`、`{"score": "85"}` 会被强转成 `85`。对一个"分数要可信"的
+          工具来说这是最坏的一类错——用户会在清单里看到一个 **1 分**的岗位，
+          而真实原因是"模型没按 schema 输出"。这个信号被抹掉之后，
+          提示词写坏了也没人会知道（分数看起来只是"有点低"）。
+
+        ★ 为什么用 `mode="before"` 而不是 `StrictInt`
+
+          `StrictInt` 会把 `77.0` 也拒掉，而 JSON 里的 `77.0` 是**数字**
+          （模型或某些网关把整数写成浮点是常见的），为此降级到规则分不值得。
+          这里只拒"类型就不对"的两种：布尔（`true`/`false` 根本不是分数）
+          与字符串（字符串→数字属于"替模型猜它想说什么"）。
+          越界（150 / -20）仍由 `Field(ge=0, le=100)` 负责，且**不截断** ——
+          截断会把"模型开始乱答"这个信号一起抹掉。
+        """
+        if isinstance(value, bool):
+            raise ValueError("score 必须是数字，收到布尔值（true/false 不是分数，不能当成 1/0）")
+        if isinstance(value, str):
+            raise ValueError("score 必须是数字，收到字符串（不做字符串→数字的静默转换）")
+        return value
 
     def to_reason_dict(self) -> dict[str, Any]:
         """转成落进 `jobs.reason_json` 的结构（带版本号，便于日后追溯口径）。"""
@@ -234,6 +263,28 @@ def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n…（已截断）"
+
+
+def _prompt_fingerprint(payload: PromptPayload) -> str:
+    """对**真正送出去的提示词**取指纹，作为缓存 key 的第五个成分（ISSUES #24）。
+
+    ★ 为什么是"整份提示词"而不是"逐字段枚举"：
+
+      #24 的成因就是"提示词里有东西，而 key 里没有"。逐个把字段补进 key
+      只能修好这一次；下次谁再往提示词里加一行（比如给规则层锚点加个字段），
+      同样的静默失真会再来一次，而且没人会记得回来改 key。
+
+      取整份提示词的指纹之后，**"key 与输入不一致"在结构上不可能发生**：
+      只要发给模型的字变了一个，key 就变。
+
+    ★ 为什么不用 `hash()`：Python 的字符串 hash 带进程级随机盐，
+      换个进程就算不出同一个值 —— 缓存必须跨进程稳定，所以用 sha256。
+
+    ★ 为什么把 role 也一起算进去：同一段文字放在 system 还是 user 里，
+      对模型的含义完全不同，属于"输入变了"。
+    """
+    raw = "\x00".join(f"{message.role}\x01{message.content}" for message in payload.messages)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _resume_digest(candidate: ResumeCandidate, rule_result: MatchResult | None) -> str:
@@ -413,6 +464,35 @@ async def _evaluate_job(
         stats.add_error("岗位缺少简历信息（先跑一次规则层）")
         return _Outcome(job_id=job.id, error="缺少简历信息")
 
+    # ★★ 先把提示词造出来，再算缓存 key —— key 必须覆盖**真正发出去的输入**（ISSUES #24）
+    #
+    #   原来的 key 只有四个成分（prompt_version|model|jd_hash|resume_hash），
+    #   而提示词里还有两类**会变但不在这四个成分里**的内容：
+    #     · `rule_hint`：规则分与命中/缺失关键词，它随 `match_weights`、
+    #       `skill_aliases`（词表）变化；
+    #     · 表头五字段：company/title/city/experience/education，
+    #       以及"可用简历"名单（多一份简历就会多一行）。
+    #
+    #   后果是**改权重后静默复用旧分**：用户按配置文档调了 match_weights、
+    #   重跑 `jh match run`，看到的却是按旧权重算出来的 LLM 分 ——
+    #   他会得出"调权重没用"的结论，而这个结论是错的（比不缓存糟得多）。
+    #   表头同理：HR 把"1-3 年"改成"3-5 年"，提示词变了、key 没变，旧结论照用。
+    #
+    #   ★ 取舍（为什么选"把提示词纳入 key"而不是"从提示词里删掉这些内容"）：
+    #     表头字段（经验/学历/城市）与规则层锚点都是**模型判断真正需要的输入**，
+    #     删掉会直接降低精评质量；而把提示词纳入 key 只是让"输入变了就重算"，
+    #     代价是改配置/改表头后那几条缓存失效（几毛钱），换来的是"分数一定对得上
+    #     当前配置"。对一个"要对分数有信心"的工具，这个交换是划算的。
+    #   ★ 实现上直接用**整份提示词**的指纹（而不是逐个字段枚举）：
+    #     将来往提示词里加任何东西都不必再记得来改 key —— 这类"忘了同步"
+    #     正是 #24 的成因（PROMPT_VERSION 靠人手动 +1 也是同一个坑）。
+    payload = build_payload(
+        job,
+        candidate,
+        rule_result=_rule_result_of(job),
+        resume_names=resume_names,
+        settings=settings,
+    )
     cache_key = llm_cache.compute_cache_key(
         prompt_version=PROMPT_VERSION,
         model=provider.model,
@@ -420,6 +500,7 @@ async def _evaluate_job(
         resume_content_hash=candidate.content_hash,
         # ★ task 参与 key：否则同一岗位的 match 与 greeting 可能撞成同一条缓存
         task="match",
+        prompt_fingerprint=_prompt_fingerprint(payload),
     )
 
     if cache_key:
@@ -437,14 +518,6 @@ async def _evaluate_job(
                 stats.tokens_out += hit.tokens_out or 0
                 stats.cost += hit.cost or 0.0
                 return _Outcome(job_id=job.id, verdict=verdict, from_cache=True)
-
-    payload = build_payload(
-        job,
-        candidate,
-        rule_result=_rule_result_of(job),
-        resume_names=resume_names,
-        settings=settings,
-    )
 
     last_error = ""
     for attempt in range(settings.llm_max_retries + 1):

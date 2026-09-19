@@ -246,6 +246,68 @@ def _statuses() -> dict[int, str]:
     return rows
 
 
+def _events() -> list[dict[str, Any]]:
+    """把事件表读成字典列表（按写入顺序）。
+
+    ★ 为什么要看事件、不只状态：状态只能说明"最后是什么"，
+      而"重复打标有没有写重复事件""from→to 记得对不对"只有事件流能回答 ——
+      时间轴（`jh apply --timeline`）读的就是它。
+    """
+    settings = get_settings()
+    from jobhunter.storage.db import get_session_factory
+
+    engine, factory = get_session_factory(settings.database_url)
+    with factory() as live:
+        job_of = {app.id: app.job_id for app in live.scalars(select(Application))}
+        rows = [
+            {
+                "application_id": event.application_id,
+                "job_id": job_of.get(event.application_id),
+                "event_type": event.event_type,
+                "from_status": event.from_status,
+                "to_status": event.to_status,
+                "payload": event.payload_json,
+            }
+            for event in sorted(live.scalars(select(ApplicationEvent)), key=lambda row: row.id)
+        ]
+    engine.dispose()
+    return rows
+
+
+def _add_pending_job(**overrides: Any) -> int:
+    """直接往库里加一个"开场白已生成"（pending）的岗位，不经过 `jh today`。
+
+    用途：需要造一个**模糊匹配能命中**的岗位，而又不想让测试依赖
+    `jh today` 的排序/截断行为。
+    """
+    settings = get_settings()
+    from jobhunter.storage.db import get_session_factory
+
+    engine, factory = get_session_factory(settings.database_url)
+    with factory() as live:
+        job = make_job(**overrides)
+        live.add(job)
+        live.flush()
+        apply_svc.ensure_pending_application(live, job)
+        live.commit()
+        job_id = job.id
+    engine.dispose()
+    assert job_id is not None
+    return job_id
+
+
+def _use_mock_llm(monkeypatch) -> None:
+    """`jh today` 会生成开场白：用 mock provider，别让测试真的联网。"""
+    monkeypatch.setenv("JH_LLM_PROVIDER", "mock")
+    from jobhunter.config.settings import reset_settings
+
+    reset_settings()
+
+
+def _today(limit: int = 3) -> None:
+    runner.invoke(app, ["--no-remind", "today", "--limit", str(limit)])
+
+
 def test_cli_batch_by_job_id(cli_world, monkeypatch):
     monkeypatch.setenv("JH_LLM_PROVIDER", "mock")
     from jobhunter.config.settings import reset_settings
@@ -374,6 +436,187 @@ def test_cli_keyword_invalid_status_is_actionable(cli_world):
     assert result.exit_code == 2
     assert "不认识" in result.output
     assert "可用" in result.output
+
+
+# ===========================================================================
+# ③b 批量打标的功能覆盖（ISSUE #46）
+#
+# 上面那批用例盯的是"整批不动"这类护栏；这一批补的是**真的改了没有**：
+# 混写两种定位符、两种定位符各自的前提、事件流里记了什么、重复敲会不会写重复事件。
+# ===========================================================================
+def test_cli_batch_accepts_mixed_target_forms_in_one_command(cli_world, monkeypatch):
+    """★ 一条命令里混用 `#job_id` 与 `today 序号`：两种定位符都要真的生效。
+
+    用法示例（`jh apply --pending` 的提示里就是这么写的）：
+        jh apply "#1=applied" "2=viewed"
+    序号来自 `jh today`，job_id 来自 `jh apply --pending` —— 用户会按手边方便的那个敲。
+    """
+    _use_mock_llm(monkeypatch)
+    _today()
+
+    result = runner.invoke(app, ["--no-remind", "apply", "#1=applied", "2=viewed"])
+    assert result.exit_code == 0, result.output
+    # 1 号走 job_id（#1 就是 job_id=1）；序号 2 = jh today 清单里的第 2 条（同样是 2 号岗位）
+    assert _statuses() == {1: "applied", 2: "viewed", 3: "pending"}
+    # 只看状态变更事件：标 applied 时还会额外写一条 greeting_sent（话术闭环），不在此列
+    changes = [event for event in _events() if event["event_type"] == "status_change"]
+    assert [(event["job_id"], event["to_status"]) for event in changes] == [
+        (1, "applied"),
+        (2, "viewed"),
+    ]
+
+
+def test_cli_batch_by_job_id_needs_no_today_snapshot(cli_world):
+    """★ `#job_id` 不依赖 `jh today`：没跑过清单也能直接打标。
+
+    这条差异是真实用法：`jh apply --pending` 打出来的就是 job_id，
+    用户不需要为了打标先去跑一遍 `jh today`（也就不会产生一份当天快照）。
+    序号（裸数字）则相反 —— 它必须有个清单可参照。
+    """
+    assert _statuses() == {}, "前提：此刻一条投递记录都没有"
+
+    result = runner.invoke(app, ["--no-remind", "apply", "#3=applied"])
+    assert result.exit_code == 0, result.output
+    assert _statuses() == {3: "applied"}, "job_id 打标不该要求先跑 jh today"
+    # 还没投过就直接标 applied 是合法操作（用户可能在线下投了）→ 会自动补一条记录
+    assert [event["event_type"] for event in _events()] == ["status_change"]
+
+
+def test_cli_batch_events_record_from_and_to(cli_world, monkeypatch):
+    """事件流要记全 from→to 与来源 —— 时间轴（`--timeline`）读的就是它。"""
+    _use_mock_llm(monkeypatch)
+    _today()
+
+    runner.invoke(app, ["--no-remind", "apply", "#1=viewed"])
+
+    events = [event for event in _events() if event["event_type"] == "status_change"]
+    assert len(events) == 1
+    assert events[0]["job_id"] == 1
+    assert (events[0]["from_status"], events[0]["to_status"]) == ("pending", "viewed")
+    assert "jh apply" in (events[0]["payload"] or ""), f"事件没记来源：{events[0]['payload']}"
+
+
+def test_cli_batch_format_error_changes_nothing(cli_world, monkeypatch):
+    """`3=`（少了状态）这类格式错误 → 整批不动。"""
+    _use_mock_llm(monkeypatch)
+    _today()
+    before = _statuses()
+
+    result = runner.invoke(app, ["--no-remind", "apply", "#1=applied", "2="])
+    assert result.exit_code == 2
+    assert "格式不对" in result.output
+    assert _statuses() == before, "格式错误的那一批竟然改了一部分"
+    assert _events() == [], "没改动却写了事件"
+
+
+def test_cli_batch_out_of_range_today_index_changes_nothing(cli_world, monkeypatch):
+    """★ 序号超出 `jh today` 清单（`99=applied`）→ 整批不动。
+
+    与 `#999`（job_id 不存在）走的是**两条不同的解析路径**：
+    序号要经过当天快照，越界时快照里根本没有这一条。
+    """
+    _use_mock_llm(monkeypatch)
+    _today()
+    before = _statuses()
+
+    result = runner.invoke(app, ["--no-remind", "apply", "99=applied", "#1=applied"])
+    assert result.exit_code == 2
+    assert "找不到" in result.output
+    assert _statuses() == before, "有越界序号时却改动了一部分"
+
+
+def test_cli_batch_marks_a_single_job_by_today_index(cli_world, monkeypatch):
+    """裸序号 + `--status`（`jh apply 3 --status viewed`）也要能用。
+
+    它不是批量语法，但用户看到清单后最自然的动作就是"按第几条 + 目标状态"。
+    """
+    _use_mock_llm(monkeypatch)
+    _today()
+
+    result = runner.invoke(app, ["--no-remind", "apply", "3", "--status", "viewed"])
+    assert result.exit_code == 0, result.output
+    assert _statuses()[3] == "viewed"
+
+
+def test_cli_repeating_the_same_mark_writes_no_duplicate_event(cli_world, monkeypatch):
+    """★ 重复敲同一条命令：状态不变，**事件也不重复写**。
+
+    为什么较真：时间轴会把重复事件原样画出来，几天后根本分不清哪条是真的
+    （`apply_svc.set_status` 的注释里记着这个 bug 是 P4 验收时数事件数数出来的）。
+    """
+    _use_mock_llm(monkeypatch)
+    _today()
+
+    first = runner.invoke(app, ["--no-remind", "apply", "#1=applied"])
+    assert first.exit_code == 0, first.output
+    assert "1 条有变化" in first.output
+
+    second = runner.invoke(app, ["--no-remind", "apply", "#1=applied"])
+    assert second.exit_code == 0, second.output
+    assert "已经是 applied" in second.output, "重复打标时没说清'本来就已是这个状态'"
+    assert "0 条有变化" in second.output
+
+    assert _statuses()[1] == "applied"
+    changes = [event for event in _events() if event["event_type"] == "status_change"]
+    assert len(changes) == 1, f"重复打标写了重复的状态变更事件：{changes}"
+
+
+# ===========================================================================
+# ④b 模糊匹配的功能覆盖（ISSUE #46）
+# ===========================================================================
+def test_cli_keyword_multi_match_writes_no_events(cli_world, monkeypatch):
+    """命中多条且没给 `--yes` → **一条都不改**（连事件也不写）。
+
+    比"状态没变"更严：如果实现是"先改再回滚"，事件可能已经写进去了。
+    """
+    _use_mock_llm(monkeypatch)
+    _today()
+    before = _statuses()
+
+    result = runner.invoke(app, ["--no-remind", "apply", "公司", "--status", "applied"])
+    assert result.exit_code == 1
+    assert "没有替你猜" in result.output
+    assert _statuses() == before
+    assert _events() == [], "多命中时不该留下任何事件"
+
+
+def test_cli_keyword_yes_applies_all_and_writes_one_event_each(cli_world, monkeypatch):
+    """`--yes` 之后才全改，且**每条各写一条事件**（不是一条汇总）。"""
+    _use_mock_llm(monkeypatch)
+    _today()
+
+    result = runner.invoke(app, ["--no-remind", "apply", "公司", "--status", "viewed", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert _statuses() == {1: "viewed", 2: "viewed", 3: "viewed"}
+
+    events = [event for event in _events() if event["event_type"] == "status_change"]
+    assert sorted(event["job_id"] for event in events) == [1, 2, 3]
+    assert all(
+        (event["from_status"], event["to_status"]) == ("pending", "viewed") for event in events
+    )
+
+
+def test_cli_keyword_match_is_case_insensitive(cli_world):
+    """公司名大小写不该影响匹配（`acmeai` 要能命中 `AcmeAI`）。"""
+    job_id = _add_pending_job(company="AcmeAI 科技", title="Agent 工程师", match_score=95)
+
+    result = runner.invoke(app, ["--no-remind", "apply", "acmeai", "--status", "applied"])
+    assert result.exit_code == 0, result.output
+    assert _statuses() == {job_id: "applied"}, f"大小写把匹配挡住了：{_statuses()}"
+    assert [event["to_status"] for event in _events()] == ["applied"]
+
+
+def test_cli_keyword_status_typo_changes_nothing(cli_world, monkeypatch):
+    """状态拼错时：在碰数据库之前就报错，且**零改动、零事件**。"""
+    _use_mock_llm(monkeypatch)
+    _today()
+    before = _statuses()
+
+    result = runner.invoke(app, ["--no-remind", "apply", "公司", "--status", "appliedd"])
+    assert result.exit_code == 2
+    assert "不认识" in result.output
+    assert _statuses() == before
+    assert _events() == [], "状态拼错却动了数据"
 
 
 # ===========================================================================

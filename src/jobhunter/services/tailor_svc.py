@@ -884,22 +884,51 @@ def load_version(session: Session, version_id: int) -> ResumeVersion:
     return version
 
 
-def suggestions_of(version: ResumeVersion) -> list[dict[str, Any]]:
-    """取版本里的建议列表（原样返回 dict，附带 `id`）。"""
+def _payload_of(version: ResumeVersion) -> dict[str, Any]:
+    """把 `suggestions_json` 解析成**顶层的对象**，坏了就给一句人话。
+
+    ★ 这里守的是"库里的数据被手工改过"这条路径（ISSUES #51）：
+      第一版只 guard 了 `JSONDecodeError`（"不是合法 JSON"），于是
+      **合法 JSON 但结构不对**时会甩出裸的 Python 错误 ——
+            f"实际是 {type(data).__name__}。"
+            "手工改过 resume_versions.suggestions_json 的话，"
+            "请对照 `jh tailor analyze` 写入的结构。"
+    """
     try:
         data = json.loads(version.suggestions_json or "{}")
-    except json.JSONDecodeError:  # pragma: no cover - 只有手工改库才会遇到
-        raise TailorError(f"版本 #{version.id} 的建议数据损坏（不是合法 JSON）") from None
-    items = data.get("suggestions") or []
-    return [item for item in items if isinstance(item, dict)]
+    except json.JSONDecodeError as exc:
+        raise TailorError(
+            f"版本 #{version.id} 的建议数据损坏（不是合法 JSON：{exc.msg}，位置 {exc.pos}）"
+        ) from None
+    if not isinstance(data, dict):
+        raise TailorError(
+            f"版本 #{version.id} 的建议数据格式不对：顶层应当是对象（{{...}}），"
+            f"实际是 {type(data).__name__}。"
+            "如果你手工改过 resume_versions.suggestions_json，"
+            "请对照 `jh tailor analyze` 写入的结构。"
+        )
+    items = data.get("suggestions")
+    if items is not None and not isinstance(items, list):
+        raise TailorError(
+            f"版本 #{version.id} 的建议数据格式不对：`suggestions` 应当是数组，"
+            f"实际是 {type(items).__name__}"
+        )
+    return data
+
+
+def suggestions_of(version: ResumeVersion) -> list[dict[str, Any]]:
+    """取版本里的建议列表（原样返回 dict，附带 `id`）。
+
+    Raises:
+        TailorError: 库里的数据不是合法 JSON、或结构不对（见 `_payload_of`）。
+    """
+    data = _payload_of(version)
+    return [item for item in (data.get("suggestions") or []) if isinstance(item, dict)]
 
 
 def analysis_of(version: ResumeVersion) -> MatchAnalysis:
-    """取版本里的匹配分析（缺了就返回默认值）。"""
-    try:
-        data = json.loads(version.suggestions_json or "{}")
-    except json.JSONDecodeError:  # pragma: no cover
-        return MatchAnalysis()
+    """取版本里的匹配分析（缺了就返回默认值；结构坏了抛 `TailorError`）。"""
+    data = _payload_of(version)
     raw = data.get("match_analysis") or {}
     try:
         return MatchAnalysis.model_validate(raw)

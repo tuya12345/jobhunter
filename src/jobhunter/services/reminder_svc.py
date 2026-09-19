@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 
 from jobhunter.config.settings import AppSettings, get_settings
 from jobhunter.models import Application, Assessment, Interview, Job, Offer
+from jobhunter.services import apply_svc
 from jobhunter.utils.logging import get_logger
 from jobhunter.utils.time import days_since, now_utc, to_local
 
@@ -59,8 +60,12 @@ ASSESSMENT_LOOKAHEAD_DAYS = 3
 #: Offer 签约的"即将截止"窗口（天）
 OFFER_LOOKAHEAD_DAYS = 3
 
-#: 还算"在等对方回应"的投递状态（进了 interview/offer 就不该再催了）
-_WAITING_STATUSES = ("applied", "viewed")
+#: 还算"在等对方回应"的投递状态（进了 interview/offer 就不该再催了）。
+#: ★★ ISSUE #49：这里**不再自己写一份字面量**，直接引用
+#:   `apply_svc.WAITING_STATUSES` —— 顶部提醒与 `jh apply --pending` 必须
+#:   用**同一个定义**判定"该催谁"。两处各写一份的结果是：
+#:   刚约上面试的岗位在提醒里被正确地跳过，却在待处理清单里被建议"放弃"。
+_WAITING_STATUSES = apply_svc.WAITING_STATUSES
 
 
 @dataclass

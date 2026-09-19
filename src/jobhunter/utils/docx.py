@@ -47,6 +47,7 @@ from jobhunter.utils.io import read_text, write_text
 __all__ = [
     "DocLine",
     "DocxReadResult",
+    "DocumentReadError",
     "UnsupportedDocumentError",
     "lines_to_markdown",
     "read_document",
@@ -65,6 +66,49 @@ _PLAIN_TEXT_SUFFIXES = {".txt", ".md", ".markdown"}
 
 class UnsupportedDocumentError(ValueError):
     """文件格式不支持（且没有可用的降级路径）。"""
+
+
+class DocumentReadError(ValueError):
+    """文件读不出来：编码不是 UTF-8、文件损坏、或者根本不是有效的 docx（ISSUES #12）。
+
+    ★ 为什么要有这样一个类型，而不是让原始异常冲上去
+
+      非 UTF-8（中文 Windows 上极常见的 GBK）的 `.txt` 与损坏的 `.docx`
+      原本会分别抛 `UnicodeDecodeError: 'utf-8' codec can't decode byte ...`
+      和 `PackageNotFoundError: Package not found at '...'`。这两句话对用户
+      完全不可操作：既没说"这是编码问题"，也没给出下一步该做什么
+      （"另存为 UTF-8"/"另存为新的 docx"）。
+
+      更隐蔽的是它**看起来像通过**：`UnicodeDecodeError` 的消息里恰好含
+      `utf-8` 字样，只按关键词判定的自测会被它蒙混过去 —— 所以这里的消息
+      必须用**中文说清原因 + 给出动作**，而不是翻译一遍异常名。
+
+    ★ 与 `UnsupportedDocumentError` 的分工：
+      那个是"格式我们不打算支持"（.pdf/.doc，用户换格式就有救）；
+      这个是"格式支持，但**这个文件本身是坏的/编码不对**"（用户要修文件）。
+      两者都不该让 Traceback 冲到用户面前。
+    """
+
+
+def _encoding_hint() -> str:
+    """非 UTF-8 文本文件的提示语（中文、可操作）。"""
+    return (
+        "它不是 UTF-8 编码的文本（中文 Windows 上常见的是 GBK/GB18030，\n"
+        "而本项目的读写一律强制 UTF-8，不做静默的编码猜测 ——\n"
+        "猜错一个字就会把简历内容解成乱码，比直接报错糟得多）。\n"
+        "  · 用记事本打开它 →「另存为」→ 编码选 UTF-8 → 再导入；\n"
+        "  · 或者用 Word / WPS 打开后另存为 .docx（推荐，解析更准）。"
+    )
+
+
+def _docx_corrupt_message(name: str) -> str:
+    """损坏 docx 的提示语（中文、可操作）。"""
+    return (
+        f"打不开 {name}：文件已损坏，或者它不是一个有效的 .docx（扩展名对、内容不对）。\n"
+        "  · 先用 Word / WPS 打开确认能不能正常显示；\n"
+        "  · 能打开的话请「另存为」一份**新的** .docx 再导入；\n"
+        "  · 或者把内容复制成 .txt 导入。"
+    )
 
 
 @dataclass
@@ -99,6 +143,11 @@ def read_document(path: str | Path) -> DocxReadResult:
     - `.txt` / `.md` → 直接读文本（强制 UTF-8）
     - 其他（含 `.doc`、`.pdf`）→ 抛 `UnsupportedDocumentError`，
       并给出"另存为 docx"的明确指引（而不是一句 unsupported format）
+
+    Raises:
+        FileNotFoundError: 路径不存在（提示语里带具体路径，便于核对拼写）。
+        DocumentReadError: 文件存在但读不出来（非 UTF-8 文本 / 损坏的 docx）。
+        UnsupportedDocumentError: 扩展名不在支持列表里。
     """
     target = Path(path)
     if not target.is_file():
@@ -108,9 +157,7 @@ def read_document(path: str | Path) -> DocxReadResult:
     if suffix == ".docx":
         return read_docx(target)
     if suffix in _PLAIN_TEXT_SUFFIXES:
-        text = read_text(target)
-        lines = [line.rstrip() for line in text.splitlines()]
-        return DocxReadResult(lines=lines, paragraphs=lines)
+        return _read_plain_text(target)
 
     raise UnsupportedDocumentError(
         f"不支持的文件格式：{suffix or '（无扩展名）'}\n"
@@ -123,7 +170,55 @@ def read_document(path: str | Path) -> DocxReadResult:
     )
 
 
+def _read_plain_text(target: Path) -> DocxReadResult:
+    """读 `.txt` / `.md`：编码不对时给出**中文可操作**的错误（ISSUES #12）。
+
+    ★ 为什么不能"试一下 GBK 兜底"：
+      猜测编码是典型的静默失真来源 —— 猜错时不会报错，
+      只会把内容解成一堆乱码（简历解析结果看起来"有内容"，但全是错的）。
+      本项目在 `utils/io.py` 里已经把编码写死成 UTF-8，
+      所以这里正确的做法是**明确拒绝 + 告诉用户怎么转**，而不是替用户猜。
+    """
+    try:
+        text = read_text(target)
+    except UnicodeDecodeError as exc:
+        raise DocumentReadError(
+            f"打不开 {target.name}：它的编码不是 UTF-8，读出来是乱码级的错误。\n"
+            f"{_encoding_hint()}\n"
+            f"（原始错误：{exc}）"
+        ) from exc
+    lines = [line.rstrip() for line in text.splitlines()]
+    return DocxReadResult(lines=lines, paragraphs=lines)
+
+
 def read_docx(path: str | Path) -> DocxReadResult:
+    """读取 docx，返回按文档顺序摊平的文本块（**打不开时给中文提示**）。
+
+    ★ 为什么包一层：`python-docx` 对损坏文件抛的是
+      `PackageNotFoundError: Package not found at '...'` —— 文件名不在话里，
+      用户根本看不出"是文件坏了"还是"是我路径写错了"（ISSUES #12）。
+      把这一层异常统一转成 `DocumentReadError`，提示语里说清"文件坏了"与下一步。
+
+    ★ 为什么要先判存在："文件不存在"与"文件坏了"是**两种完全不同的下一步**
+      （改路径 vs 修文件）。不能因为 python-docx 把两者都报成
+      `PackageNotFoundError` 就把它们混成一句"文件损坏"。
+    """
+    target = Path(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"找不到文件：{target}")
+    try:
+        return _read_docx_impl(target)
+    except (
+        DocumentReadError,
+        UnsupportedDocumentError,
+        FileNotFoundError,
+    ):
+        raise  # 已经是给人看的错误（含"没装 python-docx"的安装指引），不要再包一层
+    except Exception as exc:  # noqa: BLE001 - 损坏的 zip/XML 会抛各种底层异常
+        raise DocumentReadError(_docx_corrupt_message(target.name)) from exc
+
+
+def _read_docx_impl(path: str | Path) -> DocxReadResult:
     """读取 docx，返回按文档顺序摊平的文本块。
 
     ★ 不用 `Document.paragraphs` + `Document.tables` 简单拼接的原因见模块 docstring：

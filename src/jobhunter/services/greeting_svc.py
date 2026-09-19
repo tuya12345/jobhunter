@@ -362,8 +362,17 @@ def _gate_reasons(
     candidate: ResumeCandidate,
     settings: AppSettings,
     vocabulary: dict[str, list[str]],
+    allowed_extra: set[str] | None = None,
 ) -> list[str]:
-    """返回这条文案违反的硬约束（空列表 = 通过）。"""
+    """返回这条文案违反的硬约束（空列表 = 通过）。
+
+    Args:
+        allowed_extra: 闸门 ③（"只提 JD 关键词 ∩ 简历技能"）的**额外**允许项。
+            用途：调用方已经确认"这些词这个 JD 真的要"（例如 JD 正文里抽到的
+            交集词、或动作类通用词 `CAPABILITY_TERMS`），但受 `_MAX_KEYWORDS`
+            截断没能进提示词列表 —— 不许因为截断就把真话判成"不贴 JD"。
+            ⚠️ 默认 None = 只允许 `keywords`（保持闸门 ③ 的严格性）。
+    """
     # ★ 字数这一道**复用** `_length_problems()`，不在这里另写一遍：
     #   两套措辞会让 `is_length_only_failure()` 判错（我第一版就是这么错的）。
     reasons: list[str] = _length_problems(text, version=version, settings=settings)
@@ -381,11 +390,35 @@ def _gate_reasons(
     # ★ 方向词不是技能声称：开场白必然要说"我是 AI Agent 方向的应届生"，
     #   而词表会把里面的 "Agent" 抽成一个技能 → 不排除就会误报成编造。
     direction_tokens = set(resume_svc.extract_skills(candidate.direction or "", vocabulary))
+    # ★★ ISSUE #31：`allowed_skills` 必须是 **JD 关键词**，不能带上 `candidate.pool`。
+    #   原实现传 `set(keywords) | set(candidate.pool)`，而 `pool ⊇ keywords`，
+    #   于是 `fidelity._skill_violations` 里的
+    #       `skill not in allowed_skills and skill in pool`
+    #   **永远为假** —— `skill_not_in_jd` 成了死代码，闸门 ③ 只兑现了
+    #   "不许提简历外的技能"这一半。
+    #   为什么这一半重要：用户的原痛点就是"写的话跟岗位根本不沾边"。
+    #   简历里有 Vue/Redis，但这个 JD 只要 Python/FastAPI —— 开场白里堆一堆
+    #   JD 没要求的技能，就是又一次"不沾边"。
+    #   ⚠️ 别再用 `| set(candidate.pool)` 把它"修回去"：
+    #   `tests/verify/test_v_p4_greeting.py::test_greeting_skill_not_in_jd_is_flagged`
+    #   会立刻变红；而"真话不被误报"由同一文件的
+    #   `test_fidelity_does_not_flag_a_truthful_greeting` 守住。
+    #
+    #   ★ 唯一要豁免的一类是 `resume_svc.CAPABILITY_TERMS`（动作/通用实践词：
+    #   部署 / 性能优化 / 单元测试 …）。它们**不是技术栈名字**，不该被"JD 要不要求"
+    #   这道尺子量 —— 否则"我用 Docker 把服务部署到服务器上"会因为「部署」不在 JD 里
+    #   被判成"不贴 JD"，真话再次被降级成模板（这正是 P4 修过的 ISSUES #30 的同类
+    #   误报，只是换了一道闸门冒出来）。技术栈名字（Vue/Redis/Git…）仍然严格。
+    capability_terms = set(candidate.pool) & set(resume_svc.CAPABILITY_TERMS)
+    allowed_skills = set(keywords) | capability_terms | set(allowed_extra or ())
     report = fidelity.check_text(
         text,
         resume=candidate.content,
         vocabulary=vocabulary,
-        allowed_skills=set(keywords) | set(candidate.pool),
+        # ★ 一个关键词都没抽到时 `keywords` 是空的 —— 此时"只提 JD 关键词"无从谈起，
+        #   传 `None` 表示"不限制"，而不是传空集合（空集合 = 任何技能都不许提，
+        #   那会让"JD 没关键词"的岗位永远只能出模板）。但 `allowed_extra` 仍然生效。
+        allowed_skills=allowed_skills if (keywords or allowed_extra) else None,
         learning_whitelist=set(settings.learning_whitelist),
         extra_evidence=direction_tokens,
     )
@@ -403,11 +436,18 @@ def _template_greeting(
     keywords: list[str],
     variant: str,
     settings: AppSettings,
+    gate_keywords: set[str] | None = None,
 ) -> Greeting:
     """确定性模板：**只用真话拼**，字数可控，一定过四道闸门。
 
     它是"模型写砸了"的兜底，所以它自己必须先满足全部硬约束 ——
     否则兜底本身就成了漏洞。`tests/unit/test_greeting_svc.py` 对它做了断言。
+
+    Args:
+        gate_keywords: 闸门 ③ 的额外允许项（见 `_gate_reasons`）。
+            模板**自己**拼出来的词必须都在闸门的允许集合里，否则兜底就成了
+            "一段永远过不了闸门的文本"（实测踩到：`jd_keywords_json` 里的词
+            比 JD 正文多时，模板会被自己的闸门判成"不贴 JD"）。
     """
     greeting = settings.greeting
     direction = candidate.direction or "开发"
@@ -464,6 +504,7 @@ def _template_greeting(
             candidate=candidate,
             settings=settings,
             vocabulary=resume_svc.load_skill_vocabulary(settings),
+            allowed_extra=gate_keywords,
         )
         issues.extend(f"模板-{version}：{reason}" for reason in reasons)
     return Greeting(
@@ -503,9 +544,29 @@ def generate_greeting(
         jd_keywords = match_svc.extract_jd_keywords(job.jd_text, settings, vocabulary=vocabulary)
     keywords = [word for word in jd_keywords if word in candidate.pool][:_MAX_KEYWORDS]
 
+    # ★★ ISSUE #31 的另一半：`keywords` 既是"提示词的取材范围"，也是闸门 ③ 的尺子。
+    #   两者必须是**同一个集合**，否则会出现"模板/提示词允许提，闸门却判它不贴 JD"
+    #   的自相矛盾（实测：岗位的 `jd_keywords_json` 里多出一个正文已不存在的词，
+    #   模板照它拼出来 → 闸门把模板自己判成违规 → 一句真话被降级成模板）。
+    #   所以：
+    #     · 提示词/模板用 `keywords`（受 `_MAX_KEYWORDS` 截断）；
+    #     · 闸门用 `gate_keywords` = 提示词集合 **∪ 当前 JD 正文里真实出现的交集词**，
+    #       再 ∪ `CAPABILITY_TERMS`（动作词，见 `_gate_reasons` 里的说明）。
+    #   ★ 这样既不会误报真话，也没有把 #31 放宽回去：
+    #     简历里有、但 JD 正文**和**已抽关键词里都没有的技术栈（Vue/Redis/Git…）
+    #     照样会被判"JD 没要求"。
+    jd_text_keywords = set(
+        match_svc.extract_jd_keywords(job.jd_text, settings, vocabulary=vocabulary)
+    ) & set(candidate.pool)
+
     if provider is None or not provider.is_configured():
         return _template_greeting(
-            job, candidate, keywords=keywords, variant=variant, settings=settings
+            job,
+            candidate,
+            keywords=keywords,
+            variant=variant,
+            settings=settings,
+            gate_keywords=jd_text_keywords,
         )
 
     cache_key = llm_cache.compute_cache_key(
@@ -554,7 +615,12 @@ def generate_greeting(
         parsed = parse_greeting(content)
     except ValueError as exc:
         fallback = _template_greeting(
-            job, candidate, keywords=keywords, variant=variant, settings=settings
+            job,
+            candidate,
+            keywords=keywords,
+            variant=variant,
+            settings=settings,
+            gate_keywords=jd_text_keywords,
         )
         fallback.issues.append(f"模型输出解析失败：{exc}")
         return fallback
@@ -568,6 +634,7 @@ def generate_greeting(
         settings=settings,
         vocabulary=vocabulary,
         provider=provider,
+        gate_keywords=jd_text_keywords,
         # 命中缓存时没有本次的 payload → 不做修复调用（省一次钱；缓存里的文本
         # 上次已经过闸门，要么合格要么就是当时判定的结果）
         previous_message=None if content_from_cache or payload is None else payload.messages[-1],
@@ -585,15 +652,21 @@ def _settle_versions(
     vocabulary: dict[str, list[str]],
     provider: LLMProvider | None,
     previous_message: LLMMessage | None,
+    gate_keywords: set[str] | None = None,
 ) -> Greeting:
     """把模型输出"落定"成最终两个版本：过闸门 → 字数可修则修 → 仍不过则用模板。
 
     ★ 为什么单独抽出来：这段有 4 个决策点（哪版不合格、是否纯字数问题、
-      修复后是否合格、是否降级），藏在 `generate_greeting` 里既难读也难测。
-      抽出来后可以单独喂"模型输出"进来看结论（见 test_greeting_svc.py）。
+       修复后是否合格、是否降级），藏在 `generate_greeting` 里既难读也难测。
+       抽出来后可以单独喂"模型输出"进来看结论（见 test_greeting_svc.py）。
     """
     template = _template_greeting(
-        job, candidate, keywords=keywords, variant=variant, settings=settings
+        job,
+        candidate,
+        keywords=keywords,
+        variant=variant,
+        settings=settings,
+        gate_keywords=gate_keywords,
     )
     final = {"full": parsed.full.strip(), "short": parsed.short.strip()}
     failures: dict[str, list[str]] = {}
@@ -610,6 +683,7 @@ def _settle_versions(
             candidate=candidate,
             settings=settings,
             vocabulary=vocabulary,
+            allowed_extra=gate_keywords,
         )
 
     for version in ("full", "short"):

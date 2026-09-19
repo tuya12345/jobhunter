@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -354,17 +355,28 @@ def load_skill_vocabulary(settings: AppSettings | None = None) -> dict[str, list
     合并规则：
         · 内置词表的每个技能名，写法集合初始为 `[技能名]`；
         · config 的 `skill_aliases` 里的每个 key 追加进写法集合
-          （key 本身也可能是内置词表里没有的新技能，那就新建一条）。
+          （key 本身也可能是内置词表里没有的新技能，那就新建一条）；
+        · 最后过一遍 `_resolve_alias_collisions()`：**一个写法只允许属于一个规范名**。
 
     为什么返回的是"写法表"而不是"技能名列表"：
         抽取时要按**所有写法**去文本里找，但汇报给用户时只报**规范名**，
         这样 `大模型 / LLM / 大语言模型` 不会在统计里被算成三个技能。
+
+    ★ 最后那一步（ISSUES #5）不是可选的收尾，而是这份词表的**自洽性约束**：
+      内置词表里 `大模型` 是一个规范名，而 config 又把 `大模型` 写成 `LLM` 的别名
+      —— 不去重的话，同一句 JD 会同时抽出 `LLM` 与 `大模型` 两个关键词。
     """
     settings = settings or get_settings()
     vocabulary: dict[str, list[str]] = {name: [name] for name in _BUILTIN_SKILLS}
 
+    # ★ 先把 config 里显式声明的规范名都建出来（哪怕是内置词表里没有的新技能）。
+    #   分两步写（先建 key 再灌别名）是为了让"规范名的先后顺序"稳定：
+    #   config 声明的名字排在后面、内置名字保持原位置 —— 顺序稳定 = 抽取结果可复现。
+    for canonical in settings.skill_aliases:
+        vocabulary.setdefault(canonical, [])
+
     for canonical, aliases in settings.skill_aliases.items():
-        bucket = vocabulary.setdefault(canonical, [])
+        bucket = vocabulary[canonical]
         for alias in aliases:
             if alias and alias not in bucket:
                 bucket.append(alias)
@@ -374,7 +386,76 @@ def load_skill_vocabulary(settings: AppSettings | None = None) -> dict[str, list
     for name in settings.learning_whitelist:
         vocabulary.setdefault(name, [name])
 
-    return vocabulary
+    return _resolve_alias_collisions(vocabulary, prefer=list(settings.skill_aliases))
+
+
+def _resolve_alias_collisions(
+    vocabulary: dict[str, list[str]],
+    *,
+    prefer: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """让"写法 → 规范名"变成**一对一**映射（ISSUES #5）。
+
+    ★ 这个修复挡住的是哪一种静默失真
+
+      内置词表里 `大模型` 是规范名，config 的 `skill_aliases` 又把 `大模型`
+      写成 `LLM` 的别名 —— 于是"岗位要求：熟悉大模型应用开发"一句会抽出
+      **两个**关键词（`LLM` 与 `大模型`）。后果有两层，而且都不报错：
+
+        · **分母灌水**：技能覆盖率 = 命中数 / 关键词数，
+          同一个技能写成两个关键词就等于凭空多一个分母，覆盖率被稀释；
+        · **假缺口**：简历里写了 `LLM`，`jh gap` 却报"缺 大模型"，
+          用户会去学一个自己已经会的东西 —— 这比不报更糟。
+
+      所以别名的归属必须唯一：一个写法只归一个规范名。
+
+    ★ 合并，而不是删除
+
+      被折叠的规范名 B 的**其余写法**要一起搬给赢家，否则会吞掉真实存在的技能
+      （B 自己可能还有别的别名，比如 `LLM` 折叠后 `大语言模型` 仍必须能被抽到）。
+
+    ★ 谁赢：config 里显式声明的规范名优先（用户说了算），
+      同优先级时按词表顺序取先出现者 —— 两者都是确定的，结果可复现。
+
+    Args:
+        vocabulary: `规范名 → 写法列表`（含自指写法）。
+        prefer: 优先当赢家的名字（config 的 `skill_aliases` 的 key，按 config 顺序）。
+
+    Returns:
+        新的 `规范名 → 写法列表`：每个写法只出现在一个规范名下，顺序稳定。
+    """
+    parent: dict[str, str] = {name: name for name in vocabulary}
+
+    def find(name: str) -> str:
+        """并查集找根（带路径压缩；词表很小，但别让将来扩容后退化）。"""
+        root = name
+        while parent[root] != root:
+            root = parent[root]
+        while parent[name] != root:
+            parent[name], name = root, parent[name]
+        return root
+
+    preferred = [name for name in (prefer or []) if name in vocabulary]
+    preferred_set = set(preferred)
+    ordered = preferred + [name for name in vocabulary if name not in preferred_set]
+
+    for canonical in ordered:
+        for alias in vocabulary[canonical]:
+            if alias == canonical or alias not in parent:
+                continue  # 自指（规范名自己）不算冲突；新写法不在规范名表里
+            root_canonical, root_alias = find(canonical), find(alias)
+            if root_canonical != root_alias:
+                # 正在处理的这个规范名当根：它的名字成为该技能唯一的规范名
+                parent[root_alias] = root_canonical
+
+    resolved: dict[str, list[str]] = {name: [] for name in vocabulary if find(name) == name}
+    for name, declared in vocabulary.items():
+        bucket = resolved[find(name)]
+        # 把"这个名字自己"和"它声明的所有写法"一起归到根名下
+        for written in (name, *declared):
+            if written not in bucket:
+                bucket.append(written)
+    return resolved
 
 
 def _has_cjk(text: str) -> bool:
@@ -393,6 +474,36 @@ def _has_cjk(text: str) -> bool:
         or "\uac00" <= ch <= "\ud7af"  # 韩文
         for ch in text
     )
+
+
+#: 匹配"ASCII 字母 / 数字 / 下划线"。
+#: 用它（而不是 `\w`）做边界：`\w` 是 Unicode 语义、**包含汉字**（见 `_has_cjk`）。
+_ASCII_WORD_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
+
+
+def _contains_ascii_word_char(text: str) -> bool:
+    """写法里是否含 ASCII 字母数字下划线（决定要不要加左侧边界，见 `_alias_pattern`）。"""
+    return bool(_ASCII_WORD_CHAR_RE.search(text))
+
+
+def _normalize_for_match(text: str) -> str:
+    """**只用于匹配**的归一化：NFKC 把全角折成半角（`Ｐｙｔｈｏｎ` → `Python`）。
+
+    ★ 这个修复挡住的是哪种静默失真（ISSUES #6）
+
+      中文输入法下很容易打出全角英文（`Ｐｙｔｈｏｎ`、`ＭｙＳＱＬ`），
+      而全角写法与词表里的半角写法是**两个不同的字符序列** ——
+      正则会安静地匹配不到，于是"简历里明明写了 Python"却被判成没有。
+      技能漏抽会一路传导到技能覆盖率、方向判定与 `jh gap`，全程没有任何报错。
+
+    ★★ 只归一化**送去匹配的那份副本**：绝不写回 `raw_text` / `content_json`。
+      用户的原文是资产（P5 定制、防编造校验都依赖它），
+      悄悄把 `Ｐｙｔｈｏｎ` 改成 `Python` 属于"静默改写用户数据"，
+      而且会改变 `content_hash` 的口径。
+    """
+    if not text:
+        return text
+    return unicodedata.normalize("NFKC", text)
 
 
 def _alias_pattern(alias: str) -> re.Pattern[str] | None:
@@ -415,10 +526,12 @@ def _alias_pattern(alias: str) -> re.Pattern[str] | None:
         · **含中文的写法**（大模型 / 响应式布局）
           → `\\b` 完全不可用（见 `_has_cjk` 的说明）；边界只排除 ASCII 字母数字，
             即"接触过大模型"能命中（"过"是合法边界），"大模型X"不会命中。
+            ★ **左侧边界还要再分一层**（ISSUES #4）：纯中文写法（内部一个 ASCII
+              字母数字都没有）**不加左边界** —— 见下面的详细说明。
 
     大小写统一忽略（`Python` = `python`），因为简历里两种写法都常见。
     """
-    alias = alias.strip()
+    alias = _normalize_for_match(alias.strip())
     if not alias:
         return None
 
@@ -433,7 +546,24 @@ def _alias_pattern(alias: str) -> re.Pattern[str] | None:
         #   因为"过"被当成了单词字符，lookbehind 判定失败。
         #   正确做法：边界只排除 **ASCII 字母数字下划线**，
         #   这样"过"（非 ASCII）算合法边界，而 "大模型X"（X 是 ASCII 字母）仍被正确拒绝。
-        return re.compile(rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])", re.IGNORECASE)
+        #
+        # ★★ 左边界再按"写法里有没有 ASCII 字母数字"分两半（ISSUES #4）
+        #
+        #   `AI大模型` / `LLM大模型` 是中文 JD 里最常见的连写，
+        #   而"大"前面恰好是 ASCII 字母（I / M）——
+        #   原来的 `(?<![A-Za-z0-9_])` 会把整个 `大模型` 否掉，
+        #   表现为"这份 JD 一个字都没提到大模型"（静默漏抽，影响技能匹配、
+        #   方向判定与 jh gap 三处）。右边界当时修对了、左边界的这一半没修。
+        #
+        #   为什么**只有纯中文写法**可以去掉左边界：
+        #     左边界原本防的是"半截词"——`Java` 命中 `JavaScript`、`Go` 命中 `Google`。
+        #     那类误命中只可能发生在**写法自身含 ASCII** 时（`XJava`、`AIGo`）。
+        #     纯中文写法不存在"被 ASCII 前缀吃进另一个词"的情形：
+        #     `大模型` 前面无论是 `AI`、`LLM` 还是汉字，指的都确实是同一个技能。
+        #     而含 ASCII 的中文写法（如 `AI大模型`）仍保留左边界，精确性不受影响。
+        #   右边界两侧都保留：`大模型X框架` 照样被拒绝。
+        left = r"(?<![A-Za-z0-9_])" if _contains_ascii_word_char(alias) else ""
+        return re.compile(rf"{left}{escaped}(?![A-Za-z0-9_])", re.IGNORECASE)
 
     # ASCII 写法：按两侧字符类型分别决定边界策略
     #
@@ -498,10 +628,22 @@ def extract_skills(
 
 
 def _match_any(text: str, aliases: list[str]) -> bool:
-    """文本里是否出现了该技能的任意一种写法。"""
+    """文本里是否出现了该技能的任意一种写法。
+
+    ★ 匹配前先做 NFKC（ISSUES #6）：全角 `Ｐｙｔｈｏｎ` 折成半角 `Python`。
+      归一化只作用在**这份用于匹配的副本**上，调用方的原文一个字都不动
+      （详见 `_normalize_for_match`）。
+
+    ★ 这里是全项目技能匹配的**唯一收口**：`extract_skills`、`extract_jd_keywords`、
+      方向判定、`jh gap` 全都走它 —— 所以"边界 / 归一化"的修复放这里，
+      所有下游一起受益，不会出现"某条路径修了、另一条没修"的半吊子状态。
+    """
     if not text:
         return False
-    return any(pattern.search(text) for pattern in (_alias_pattern(a) for a in aliases) if pattern)
+    normalized = _normalize_for_match(text)
+    return any(
+        pattern.search(normalized) for pattern in (_alias_pattern(a) for a in aliases) if pattern
+    )
 
 
 # ===========================================================================
@@ -2045,17 +2187,37 @@ def parse_resume_file(
     *,
     settings: AppSettings | None = None,
 ) -> ResumeContent:
-    """读文件 + 解析，一步到位（add 与测试都用它）。"""
+    """读文件 + 解析，一步到位（add 与测试都用它）。
+
+    ★★ 为什么"只有空白行"也必须报错（ISSUES #15）
+
+      读文件成功 ≠ 里面有人写的东西。一个只存了空格/换行的 `.txt`
+      （编辑器里"另存为"、或者复制粘贴时只带过来排版空白）会**成功导入**
+      成一份 0 技能 / 0 项目 / 无姓名的简历 —— 而且因为
+      "库里第一份自动成为默认简历"，它还会成为后续所有匹配的参照物。
+      用户不会察觉，分数却全是基于一份空简历算的。
+
+      所以这里的判定不是"文件能不能读"，而是"**有没有可解析的内容**"：
+      只要没有任何一个非空白文本块，就必须友好失败，绝不落一条空简历。
+
+    Raises:
+        DocumentReadError: 文件读不出来（编码不是 UTF-8 / 文件损坏）——
+            由 `utils.docx` 给出中文的可操作提示，原样往上抛。
+        ResumeParseError: 文件读得出来，但里面没有任何可解析的文字。
+    """
     from jobhunter.utils.docx import read_document
 
     settings = settings or get_settings()
     target = Path(path)
     read_result = read_document(target)
-    if not read_result.lines:
+    if not any(line.strip() for line in read_result.lines):
         raise ResumeParseError(
-            f"没能从 {target.name} 里读到任何文字。\n"
-            "常见原因：① 简历是纯图片/扫描件；② 内容全在图片或 SmartArt 里。\n"
-            "建议：把内容复制成 .txt 再导入，或换成文字版 docx。"
+            f"没能从 {target.name} 里读到任何文字（只有空白）。\n"
+            "常见原因：① 简历是纯图片/扫描件，文字读不出来；"
+            "② 内容全在图片、SmartArt 或图形里；\n"
+            "　　　　　③ 文件本身就是空的（只存了空格/换行）。\n"
+            "建议：先打开确认里面真的有文字，再把内容复制成 .txt 导入，"
+            "或换一份文字版 docx。"
         )
     return parse_resume_text(read_result.lines, settings=settings, source_name=target.name)
 

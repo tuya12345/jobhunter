@@ -172,6 +172,19 @@ git push --force --all; git push --force --tags
 `.ics` 为什么是例外：它是**幂等快照**。若按"只写新文件"生成 `jobhunter-2.ics`、`jobhunter-3.ics`，
 用户每次导入日历都会多出一份**重复事件** —— 那是更坏的结果。取舍写在 `cal_svc.export_ics` 的 docstring 里。
 
+**独立验证（P9 复查时补做的，ISSUES #52）**：除了仓库内的文本级断言（CRLF / 75 字节折行 /
+转义 / UID 稳定），我还用**第三方库** `icalendar` 解析了真实的导出产物：
+
+```powershell
+uv run --with icalendar python <scratch>/check_ics.py   # 脚本在仓库外
+```
+
+结果：`PRODID` / `VERSION` 正确、**3 个 VEVENT 全部读出**、UID 唯一、
+`DTSTART/DTEND` 解析成 UTC aware datetime、会议链接（含 `?a=1&b=2`）与
+**含分号/逗号的公司名**都能原样读回（说明转义是对的）、无 BOM、33 行 CRLF。
+⚠️ 但"能不能导入手机日历/Outlook"这一步**仍然需要人来做** —— 第三方解析通过
+只证明它符合 RFC，不等于某个具体日历应用会接受它。
+
 ---
 
 ## 6. 依赖、迁移与工程底座
@@ -201,7 +214,17 @@ git push --force --all; git push --force --tags
 
 # ③ 合规守卫（验证会话的 AST 扫描 + 仓库单测）
 cd "D:\deep seek harness\projects\jobhunter"; .\.venv\Scripts\python.exe -m pytest -q
+
+# ④ 隐私扫描（ISSUES #54）：工作区里不许有真实身份标识
+#    样本来源：环境变量 JH_PII_SAMPLES，或本机 state/pii-samples.txt（已 gitignore）
+#    ★ 没配样本时用例会 **skip**（不是 pass）—— "没扫" 这件事必须看得见
+$env:JH_PII_SAMPLES = "<真名>,<学校>,<打码手机号>"
+.\.venv\Scripts\python.exe -m pytest tests/verify/test_v_p9.py::test_working_tree_has_no_real_identifiers -rs -v
 ```
+
+> CI 里同样有这一步（`.github/workflows/ci.yml`），样本来自 **repository secret
+> `JH_PII_SAMPLES`**（逗号分隔）—— secret 不进仓库，正好满足"检测器不能携带它要检测的秘密"。
+> 公开仓库前请在 Settings → Secrets 里加上它；不加也不会红，但会在 CI 摘要里显示为 skipped。
 
 > 两个脚本刻意**放在仓库外**：扫描器本身不该进版本库（它会读真实标识）。
 

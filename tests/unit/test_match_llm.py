@@ -355,6 +355,113 @@ def test_parse_verdict_optional_fields_default():
 
 
 # ---------------------------------------------------------------------------
+# 分数校验：只接受**数字**（ISSUES #11）
+#
+# ★ 为什么布尔必须被拒绝，而不是"顺手转成 1"：
+#   pydantic 默认非严格模式会把 `true` 强转成 1 —— 于是"模型没按 schema 输出"
+#   这个信号被抹成"这个岗位 1 分"。用户看到的是一个低分岗位，
+#   而不是"模型答错了"，提示词写坏了也永远发现不了。
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("raw", ['{"score": true}', '{"score": false}'])
+def test_boolean_score_is_rejected(raw: str) -> None:
+    with pytest.raises(match_llm_svc.VerdictParseError):
+        match_llm_svc.parse_verdict(raw)
+
+
+@pytest.mark.parametrize("raw", ['{"score": "85"}', '{"score": "abc"}', '{"score": null}'])
+def test_string_or_null_score_is_rejected(raw: str) -> None:
+    """字符串→数字属于"替模型猜它想说什么"，一律判失败。"""
+    with pytest.raises(match_llm_svc.VerdictParseError):
+        match_llm_svc.parse_verdict(raw)
+
+
+@pytest.mark.parametrize("score", [0, 77, 100])
+def test_integer_score_is_accepted(score: int) -> None:
+    assert match_llm_svc.parse_verdict(f'{{"score": {score}}}').score == score
+
+
+def test_integral_float_score_is_accepted_but_fraction_is_not() -> None:
+    """`77.0` 是**数字**（模型/网关把整数写成浮点很常见），`77.5` 不是分数。
+
+    ★ 这正是没用 `StrictInt` 的理由：那会连 `77.0` 一起拒掉，
+      为了一件"类型洁癖"丢掉一次已经花过钱的精评。
+    """
+    assert match_llm_svc.parse_verdict('{"score": 77.0}').score == 77
+    with pytest.raises(match_llm_svc.VerdictParseError):
+        match_llm_svc.parse_verdict('{"score": 77.5}')
+
+
+# ---------------------------------------------------------------------------
+# 缓存 key 必须覆盖**真正发出去的提示词**（ISSUES #24）
+#
+# ★ 原来的四成分 key（prompt_version|model|jd_hash|resume_hash）漏掉了
+#   两类会进提示词、也会变的东西：
+#     · `rule_hint`：规则分与命中/缺失关键词 → 随 match_weights / skill_aliases 变；
+#     · JD 表头字段（城市/经验/学历…）与"可用简历"名单。
+#   漏掉的后果是**改权重后静默复用旧分**：用户按文档调了权重、重跑，
+#   看到的还是旧结论，于是得出"调权重没用"——而这是错的。
+# ---------------------------------------------------------------------------
+def _reevaluate(session, job, provider) -> match_llm_svc.LLMRunStats:
+    """再跑一次 LLM 层（复用同一份简历候选）。"""
+    settings = get_settings()
+    candidates = match_svc.load_resume_candidates(session, settings)
+    return asyncio.run(
+        match_llm_svc.run_llm_layer(
+            session, [job], candidates, provider=provider, settings=settings
+        )
+    )
+
+
+def test_cache_key_changes_when_rule_hint_changes(session, resume_row, job_row):
+    """规则层锚点变了（= 权重/词表变了）→ 不许复用旧的精评结果。"""
+    rule_score_first(session, job_row)
+    provider = MockProvider({"match": VERDICT_JSON})
+    first = _reevaluate(session, job_row, provider)
+    assert first.calls == 1
+
+    # 模拟"用户在 config.yaml 里调了权重后重跑规则层"：规则分与命中词都变了
+    # （`jobs.jd_keywords_json` 存的就是一个 JSON 字符串数组）
+    job_row.rule_score = (job_row.rule_score or 0) - 15
+    job_row.jd_keywords_json = '["RAG", "Docker"]'
+    session.flush()
+
+    second = _reevaluate(session, job_row, provider)
+    assert second.calls == 1, "改了权重（rule_hint 变了）却命中了旧缓存 —— 用户会以为调权重没用"
+    assert second.cached == 0
+    assert len(provider.calls) == 2
+
+
+def test_cache_key_changes_when_job_header_changes(session, resume_row, job_row):
+    """表头字段（城市/经验/学历…）也拼进了提示词 → 改了就必须重算。"""
+    rule_score_first(session, job_row)
+    provider = MockProvider({"match": VERDICT_JSON})
+    assert _reevaluate(session, job_row, provider).calls == 1
+
+    job_row.experience = "5-10年"
+    job_row.education = "硕士"
+    session.flush()
+
+    stats = _reevaluate(session, job_row, provider)
+    assert stats.calls == 1, "改了岗位的表头字段（它们在提示词里）却命中了旧缓存"
+    assert len(provider.calls) == 2
+
+
+def test_cache_still_hits_when_nothing_changed(session, resume_row, job_row):
+    """★ #24 的守卫：不能为了正确性把缓存整个废掉（那是另一个极端）。
+
+    什么都没变 → 必须命中缓存、0 次调用、1 次 cached。
+    """
+    rule_score_first(session, job_row)
+    provider = MockProvider({"match": VERDICT_JSON})
+    assert _reevaluate(session, job_row, provider).calls == 1
+
+    again = _reevaluate(session, job_row, provider)
+    assert again.calls == 0
+    assert again.cached == 1
+    assert len(provider.calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # 命令层
 # ---------------------------------------------------------------------------
 @pytest.fixture

@@ -245,6 +245,12 @@ class MatchResult:
     #:   顶层三个数字是"折算后的分数"，`parts` 里是每个维度的完整明细。
     rule_detail: dict[str, Any] = field(default_factory=dict)
     matched_resume_id: int | None = None
+    #: 算这个分时用的是**哪一版**简历（`resumes.content_hash`）。
+    #: ★ 为什么必须跟着结果一起传（ISSUE #17）：规则层每次重算都会把当次用的版本
+    #:   写进 `rule_detail_json`，下一次重算时就能对比出"简历是不是被改过了" ——
+    #:   改过的话，上一次针对旧简历算出来的 `llm_score` 必须作废，
+    #:   否则用户看到的是"我改了简历，分数纹丝不动"。
+    resume_content_hash: str = ""
     #: 简历的名字与方向（只为了打印好看，不参与打分）
     resume_name: str = ""
     resume_direction: str = ""
@@ -919,6 +925,33 @@ def _evaluate(
     ]
     rule_score, redistributed = _combine(dimensions)
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # ★★ 信息不足闸门（ISSUES #9）
+    # ═══════════════════════════════════════════════════════════════════════
+    # 权重再分配本身是对的（判不出来的维度让出权重），但当**整份 JD 什么信息都没有**时，
+    # 它会得出一个荒唐结论：技能判不出来（让掉 40）、硬条件判不出来（让掉 30）、
+    # 方向词也没抽到（给中性分）→ 只剩那个中性分，而它恰好落在分数线之上
+    # → "什么都没写的岗位"排进了待投清单，浪费一次投递额度。
+    #
+    # 这和修过的"JD 写得越少技能分越高"是同一类问题的更大尺度复发：
+    # 不是某个维度，而是**整份 JD 的信息量**。所以这里在**整份**层面兜一道：
+    # 技能关键词、方向词、硬条件四项 —— 一个都没抽到，就不给分（而不是给中性分）。
+    #
+    # ★ 判据：**技能关键词与方向，一个都没抽到**。
+    #   为什么不用"表头字段（经验/学历/城市/实习）也全空"当判据：那些字段是 P2 抓列表页
+    #   时就能填上的**元信息**，正文没抓到它们照样存在 —— 实测就是这种情况：
+    #   一个 `jd_text=""` 的岗位带着 experience="1-3年"/education="本科"/city="深圳"，
+    #   于是硬条件维度给了 0.5、方向给了中性分，总分 80 上了清单。
+    #   而"抽不到任何技能、也判不出方向"意味着**这个工具的核心维度（技能，权重 40）
+    #   完全没参与** —— 这时给一个能过线的分数，等于凭元信息把它抬进待投清单。
+    #
+    # ★ 为什么给 0 而不是"slightly below threshold"：分数是要落库、要被排序的，
+    #   让它贴着分数线是"凭阈值构造出来的数字"；0 分 + 一句人话说明才是可行动的
+    #   （用户可以立刻去补 JD 正文，而不用猜为什么它排在中间）。
+    insufficient_info = not jd_keywords and not jd_direction
+    if insufficient_info:
+        rule_score = 0
+
     skill_dim = next(item for item in dimensions if item.name == "skill")
     matched = list(skill_dim.extra.get("matched") or [])
     missing = list(skill_dim.extra.get("missing") or [])
@@ -934,11 +967,27 @@ def _evaluate(
         "parts": {item.name: item.to_dict() for item in dimensions},
         "weights": settings.match_weights.model_dump(),
         "redistributed": redistributed,
+        # ★ 信息不足时**明确标出来**：`jh match explain` 与 `jh today` 都要能显示它。
+        #   只说一句"0 分"用户会以为是 bug；说"JD 里没有任何可判断的信息"才是可行动的。
+        "insufficient_info": insufficient_info,
         "jd_direction": jd_direction,
         "resume_direction": candidate.direction,
         "resume_name": candidate.name,
+        # ★ 落进明细里的是"这次用的是哪一版简历" —— 下一次重算时拿它对比，
+        #   判断上一次的 LLM 分还有没有效（见 apply_result_to_job / ISSUE #17）。
+        #   刻意**不加**进 RULE_DETAIL_VERSION：这是个只增不减的可选字段，
+        #   老明细读出来只是缺这个键（当作"版本无从来证"处理），
+        #   不必让用户重跑一遍规则层。
+        "resume_content_hash": candidate.content_hash,
         "notes": _notes(dimensions, redistributed),
     }
+    if insufficient_info:
+        detail["notes"] = [
+            "⚠️ JD 里没有任何可判断的信息（既没抽到技能关键词、也没判出方向）——"
+            "这个岗位的分数按 0 处理，先去把 JD 正文补全（jh job add --manual）再打分。"
+            "表头字段（经验/学历/城市）不算数：那是列表页的元信息，正文没抓到它们照样在",
+            *detail["notes"],
+        ]
 
     return MatchResult(
         jd_keywords=jd_keywords,
@@ -948,6 +997,7 @@ def _evaluate(
         rule_score=rule_score,
         rule_detail=detail,
         matched_resume_id=candidate.resume_id,
+        resume_content_hash=candidate.content_hash,
         resume_name=candidate.name,
         resume_direction=candidate.direction,
         judged_dimensions=[item.name for item in dimensions if item.judged],
@@ -1055,7 +1105,49 @@ def apply_result_to_job(job: Job, result: MatchResult) -> None:
         match_score       最终分 = 有 LLM 分就用 LLM 分，否则用规则分
         status            new → scored（**只前进不后退**：
                           已 applied/skipped 的岗位重新打分不该把状态改回去）
+
+    ═══════════════════════════════════════════════════════════════════════
+    ★★ 简历变了 → 上一次的 LLM 分必须作废（ISSUE #17）
+    ═══════════════════════════════════════════════════════════════════════
+
+    `match_score` 的合成规则是"有 LLM 分就用它"，所以**只要旧 LLM 分还留着**，
+    规则层重算出来的新 `rule_score` 就永远显示不出来。真实症状：
+
+        改了简历 → 重跑 `jh match run` → 规则分确实变了，
+        但清单里的分数纹丝不动（那是**针对旧简历**算出来的 LLM 分）。
+
+    更糟的是它是静默的：不报错、不提示，只是数字不动 ——
+    而"改简历 → 分数应该变"恰恰是这个工具存在的理由（见 `llm/cache.py` 的说明：
+    缓存层早就是对的，漏的是**库里已经落下的那一份**）。
+
+    判据只有一条：**算那次 LLM 分时用的是哪一版简历**。规则层每次都会把当次的
+    版本写进 `rule_detail_json`，而 LLM 层要求"先跑规则层"，
+    所以那条记录一定早于那次 LLM 调用 —— 于是重算时直接对比即可。
     """
+    previous_detail = from_json(job.rule_detail_json, default=None)
+    previous_resume_id = job.matched_resume_id
+
+    if job.llm_score is not None and _llm_score_is_stale(
+        previous_detail=previous_detail,
+        previous_resume_id=previous_resume_id,
+        result=result,
+    ):
+        logger.info(
+            "岗位 id=%s 的参照简历变了（resume_id %s → %s，hash %s → %s），"
+            "上一次的 LLM 分 %s 作废，本次以规则分 %s 为准",
+            job.id,
+            previous_resume_id,
+            result.matched_resume_id,
+            _detail_resume_hash(previous_detail),
+            result.resume_content_hash,
+            job.llm_score,
+            result.rule_score,
+        )
+        # 连 reason_json 一起清：那份理由同样是"针对旧简历"写的，
+        # 留着会让 `jh match explain` 把旧结论当成新结论讲给用户听。
+        job.llm_score = None
+        job.reason_json = None
+
     job.jd_keywords_json = to_json(result.jd_keywords)
     job.rule_score = result.rule_score
     job.rule_detail_json = to_json(result.rule_detail)
@@ -1066,6 +1158,61 @@ def apply_result_to_job(job: Job, result: MatchResult) -> None:
     # （SQLAlchemy 的 default 只在 INSERT 时生效）。
     if job.status in (None, "new"):
         job.status = "scored"
+
+
+def _detail_resume_hash(detail: Any) -> str:
+    """从落库的 `rule_detail` 里取"当次用的是哪一版简历"（取不到就是空串）。"""
+    if isinstance(detail, dict):
+        raw = detail.get("resume_content_hash")
+        if isinstance(raw, str):
+            return raw
+    return ""
+
+
+def _llm_score_is_stale(
+    *,
+    previous_detail: Any,
+    previous_resume_id: int | None,
+    result: MatchResult,
+) -> bool:
+    """上一次的 LLM 分还能不能代表"当前这份简历"的匹配度？
+
+    三种情况，全部**宁可重算也不留错分**：
+
+        ① 换了参照的简历（`matched_resume_id` 变了）
+           —— 分数是针对另一份简历算的，结论必然不同；
+        ② 两边都记着简历版本（`content_hash`）且不一样
+           —— 用户改了简历内容，这是 #17 报的那个症状；
+        ③ 版本号无从查证（旧版本软件写的明细里没有这个字段、手工造的记录、
+           或是没走规则层就直接打了 LLM 分的岗位）
+           —— 无从证明它还成立，就不当作结论。
+
+    ★ 为什么 ③ 也清、而不是"保守地留着"：
+
+        留着它的代价是**静默显示一个错的分数**（而且用户没有任何办法发现）；
+        清掉它的代价几乎为零 —— `jh match run` 里规则层之后紧接着就是 LLM 层，
+        缓存 key（jd_hash + resume_hash）没变时**直接命中缓存，0 成本**原样写回。
+        本项目已经为这类取舍定过口径（`llm/cache.py`：宁可退回"每次都重新算"，
+        也不要给出一个错的分数），这里沿用同一条。
+
+    ★ 反过来，"没变"时**绝不误清**（本函数的 False 分支）：
+        简历内容一字不差（hash 相同）就保留那份花过钱的 LLM 分 ——
+        重复跑一次 `jh match run` 不该把已有的精评结果烧掉。
+        判定顺序是"先看记录有没有换（①），再看内容版本（②）"，
+        所以 ② 只在"参照的简历记录没变"的前提下才起作用。
+    """
+    # ① 换了参照的简历记录
+    if previous_resume_id is not None and previous_resume_id != result.matched_resume_id:
+        return True
+
+    previous_hash = _detail_resume_hash(previous_detail)
+    current_hash = result.resume_content_hash
+    # ② 两边都知道版本 → 直接比对（相同就保留，不相同就作废）
+    if previous_hash and current_hash:
+        return previous_hash != current_hash
+
+    # ③ 版本无从查证 → 不作结论
+    return True
 
 
 def apply_llm_to_job(job: Job, *, llm_score: int, reason: dict[str, Any]) -> None:

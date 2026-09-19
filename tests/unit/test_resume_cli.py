@@ -131,6 +131,51 @@ def test_add_rejects_unsupported_format(initialized: Path, tmp_path: Path) -> No
     assert "docx" in result.output
 
 
+def test_add_blank_txt_fails_and_leaves_no_resume(initialized: Path, tmp_path: Path) -> None:
+    """★ 纯空白的 .txt 必须**失败**，且不能留下一条空简历（ISSUES #15）。
+
+    ★ 为什么这条要在 CLI 层再测一遍（service 层已经测过抛错）：
+      "库里第一份自动成为默认简历"这条规则是在 `add_resume` 里生效的 ——
+      一条 0 技能 / 无姓名的记录会悄悄成为之后所有匹配的参照物，
+      用户看到的是"分数怪怪的"，而不是"我的简历是空的"。
+      所以这里同时断言三件事：退出码、中文原因、**库里真的没有记录**。
+    """
+    target = tmp_path / "空的.txt"
+    target.write_text("   \n\n   ", encoding="utf-8")
+
+    result = runner.invoke(app, ["--no-remind", "resume", "add", str(target)])
+    assert result.exit_code == 1, f"空简历居然导入成功了：\n{result.output}"
+    assert "解析失败" in result.output or "没能" in result.output
+    assert "Traceback" not in result.output
+
+    listing = runner.invoke(app, ["--no-remind", "resume", "list"])
+    assert "还没有导入任何简历" in listing.output, f"失败后库里有残留：\n{listing.output}"
+
+
+def test_add_gbk_txt_fails_with_encoding_hint(initialized: Path, tmp_path: Path) -> None:
+    """非 UTF-8（GBK）的 txt 要给中文的"另存为 UTF-8"指引（ISSUES #12）。"""
+    target = tmp_path / "gbk-resume.txt"  # 文件名刻意中性：不能靠文件名蒙混过关
+    target.write_bytes("姓名：林小满\n技能：Python".encode("gbk"))
+
+    result = runner.invoke(app, ["--no-remind", "resume", "add", str(target)])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "编码" in result.output and "UTF-8" in result.output
+
+
+def test_add_corrupted_docx_fails_with_readable_reason(initialized: Path, tmp_path: Path) -> None:
+    """损坏的 docx 要说"文件坏了"，而不是丢一句 `Package not found at ...`（ISSUES #12）。"""
+    target = tmp_path / "broken.docx"  # 文件名刻意中性（"损坏"两个字不能出现在这里）
+    target.write_bytes(b"\x00\x01\x02 not a real docx at all \xff\xfe")
+
+    result = runner.invoke(app, ["--no-remind", "resume", "add", str(target)])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert any(word in result.output for word in ("损坏", "无法打开", "不是有效", "打不开")), (
+        f"没告诉用户「文件本身有问题」：\n{result.output}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------

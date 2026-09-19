@@ -450,3 +450,138 @@ def test_strip_volatile_content_keeps_surrounding_text() -> None:
     assert masked.count("\n") == 2
     assert "example.com" in masked  # 域名保留，否则看不出"这是个邮箱"
     assert "13800000000" not in masked
+
+
+# ===========================================================================
+# ⑥ 抽词的三个静默失真（回归用例：ISSUES #4 / #5 / #6）
+#
+# ★ 为什么这三条要单独钉住：它们的共同点是**不报错、只是抽不到或抽重**，
+#   而抽词结果会一路传导到技能匹配 / 方向判定 / jh gap 三处。
+#   这一组按"生产调用路径"断言（`extract_skills` / `extract_jd_keywords`），
+#   而不是只测内部正则 —— 免得出现"函数对了、但调用点没走它"的半吊子修复。
+# ===========================================================================
+@pytest.mark.parametrize(
+    "text", ["负责 AI大模型 相关应用", "做过 LLM大模型 项目", "熟悉大模型应用"]
+)
+def test_cjk_alias_matches_after_ascii_letters(text: str, settings) -> None:
+    """ISSUES #4：中文技能紧跟在 ASCII 字母后面时也要抽得到。
+
+    `AI大模型` / `LLM大模型` 是中文 JD 里最常见的连写，
+    而"大"前面是 ASCII 字母这一事实**不该**否掉整个 `大模型`。
+    """
+    vocabulary = resume_svc.load_skill_vocabulary(settings)
+    assert resume_svc._match_any(text, vocabulary["LLM"]), f"{text!r} 没命中 LLM"
+
+
+def test_relaxed_left_boundary_still_rejects_half_words(settings) -> None:
+    """ISSUES #4 的守卫：放宽中文左边界**不能**把精确性一起放掉。
+
+    `Java` / `Go` 这类含 ASCII 的写法仍然必须遵守左边界 ——
+    否则"写了 JavaScript 的人被认为会 Java"，匹配分虚高（这才是边界的初衷）。
+    """
+    vocabulary = resume_svc.load_skill_vocabulary(settings)
+    assert not resume_svc._match_any("熟悉JavaScript开发", vocabulary["Java"])
+    assert not resume_svc._match_any("在用Google分析", vocabulary["Go"])
+    assert not resume_svc._match_any("大模型X框架", vocabulary["LLM"])  # 右边界照旧
+
+
+def test_vocabulary_maps_every_spelling_to_one_canonical(settings) -> None:
+    """ISSUES #5：一个写法只能属于一个规范名（否则分母被灌水）。
+
+    测试配置把「大模型」挂在 `LLM` 名下，而「大模型」本身也曾是内置规范名
+    —— 修好之后它只应该作为 `LLM` 的一种写法存在。
+    """
+    vocabulary = resume_svc.load_skill_vocabulary(settings)
+
+    owners = [
+        name for name, aliases in vocabulary.items() if any(alias == "大模型" for alias in aliases)
+    ]
+    assert owners == ["LLM"], f"「大模型」被多个规范名认领：{owners}"
+
+
+def test_alias_merge_moves_all_spellings_of_the_folded_name() -> None:
+    """ISSUES #5 的另一半：合并**不能吞技能**。
+
+    ★ 为什么这条必须单独钉住：修 #5 最省事的做法是"把重复的规范名删掉"，
+      那样会顺手把被删条目**自己的别名**也弄丢（`大语言模型` 从此永远抽不到），
+      而且丢得完全静默 —— 用户只会发现"gap 里少统计了一个词"。
+      正确做法是把写法集合整体并给赢家。
+    """
+    merged = resume_svc._resolve_alias_collisions(
+        {"LLM": ["LLM", "大模型"], "大模型": ["大模型", "大语言模型"]},
+        prefer=["LLM"],
+    )
+    assert list(merged) == ["LLM"], f"折叠后还剩多个规范名：{list(merged)}"
+    assert merged["LLM"] == ["LLM", "大模型", "大语言模型"], (
+        f"被折叠条目的写法被吞掉了：{merged['LLM']}"
+    )
+
+
+def test_same_sentence_yields_one_keyword_for_one_spelling(settings) -> None:
+    """ISSUES #5：同一句里同一处只产出一个关键词。
+
+    这是"技能覆盖率分母"的正确性前提：`大模型` 同时是规范名与别名时，
+    一句需求会被抽成 `LLM` + `大模型` 两个关键词，覆盖率被凭空稀释。
+    """
+    hits = resume_svc.extract_skills("岗位要求：熟悉大模型应用开发。", None)
+    overlapping = [word for word in hits if word in {"LLM", "大模型"}]
+    assert len(overlapping) == 1, f"同一句被抽成了多个规范名：{hits}"
+
+
+@pytest.mark.parametrize(
+    ("text", "canonical"),
+    [
+        ("熟悉Ｐｙｔｈｏｎ与ＭｙＳＱＬ", "Python"),
+        ("用过Ｄｏｃｋｅｒ部署", "Docker"),
+    ],
+)
+def test_fullwidth_skills_are_matched(text: str, canonical: str, settings) -> None:
+    """ISSUES #6：全角英文（中文输入法下极易产生）必须被识别成半角技能。"""
+    vocabulary = resume_svc.load_skill_vocabulary(settings)
+    assert resume_svc._match_any(text, vocabulary[canonical]), f"{text!r} 没命中 {canonical}"
+
+
+def test_nfkc_is_only_used_for_matching_not_for_rewriting() -> None:
+    """ISSUES #6 的红线：全角→半角只用于**匹配**，绝不能改写用户原文。
+
+    用户的原文是资产（P5 定制与防编造校验都读它），
+    悄悄把 `Ｐｙｔｈｏｎ` 改成 `Python` 属于静默改写用户数据，
+    而且会改变 `content_hash` 的口径。
+    """
+    original = "技能：熟悉Ｐｙｔｈｏｎ与ＭｙＳＱＬ"
+    parsed = resume_svc.parse_resume_text([original], source_name="（虚构）全角简历.txt")
+    assert parsed.raw_text == original, f"原文被改写了：{parsed.raw_text!r}"
+    assert "Python" in parsed.skills, f"全角写法没被识别成 Python：{parsed.skills}"
+
+
+# ===========================================================================
+# ⑦ "空简历"必须失败（ISSUES #15）
+# ===========================================================================
+def test_blank_text_file_is_rejected_not_imported(tmp_path: Path, settings) -> None:
+    """纯空白的 .txt 必须抛 `ResumeParseError`，且**不能**被当成一份空简历。
+
+    ★ 为什么这条比"报错"更重要：库里第一份简历会自动成为默认简历，
+      一条 0 技能 / 无姓名的空记录会悄悄成为之后所有匹配的参照物 ——
+      用户不会察觉，分数却全是基于一份空简历算的。
+    """
+    target = tmp_path / "空的.txt"
+    target.write_text("   \n\n   ", encoding="utf-8")
+
+    with pytest.raises(resume_svc.ResumeParseError) as excinfo:
+        resume_svc.parse_resume_file(target, settings=settings)
+    # 提示要说清"没读到文字"，而不是一句泛泛的失败
+    assert "没能" in str(excinfo.value)
+
+
+def test_blank_text_file_leaves_no_resume_row(tmp_path: Path, session, settings) -> None:
+    """ISSUES #15 的第二半：失败之后库里**一条简历都不该多**。"""
+    from sqlalchemy import select
+
+    from jobhunter.models import Resume
+
+    target = tmp_path / "空的.txt"
+    target.write_text("\n \n", encoding="utf-8")
+
+    with pytest.raises(resume_svc.ResumeParseError):
+        resume_svc.add_resume(session, target, make_default=True, settings=settings)
+    assert session.scalars(select(Resume)).all() == [], "解析失败却留下了一条空简历"

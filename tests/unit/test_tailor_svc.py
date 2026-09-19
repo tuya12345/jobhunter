@@ -827,3 +827,41 @@ def test_missing_prompt_file_raises_a_clear_error(tmp_path: Path) -> None:
     with pytest.raises(tailor_svc.TailorPromptError) as excinfo:
         tailor_svc.load_prompt(path=tmp_path / "nope.md")
     assert "找不到提示词文件" in str(excinfo.value)
+
+
+# ===========================================================================
+# ⑥ 库里的数据被手工改坏时，要给人话（ISSUES #51）
+# ===========================================================================
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '[{"id": 1}]',  # 顶层是数组 —— 最自然的误写形态
+        '"just a string"',
+        "42",
+        "null",
+        '{"suggestions": "not a list"}',  # `.get` 成功，但后面按列表迭代会崩
+        "{ 这不是合法 JSON",
+    ],
+)
+def test_broken_suggestion_payload_gives_a_readable_error(ready, payload: str) -> None:
+    """依据：ISSUES #51 —— `suggestions_of` 只 guard 了 `JSONDecodeError`，
+    合法 JSON 但**结构不对**时抛裸 `AttributeError: 'list' object has no attribute 'get'`。
+
+    而这条路径本来就是为"数据被手工改过"准备的：那一刻用户需要的是
+    "哪条记录、什么格式"，不是一句 Python 内部错误。
+    """
+    version = _craft_version(
+        ready,
+        suggestions=[
+            {"section": "项目经历", "original": BULLET_PYTHON, "revised": "改一句", "reason": "x"}
+        ],
+    )
+    version.suggestions_json = payload
+    ready.commit()
+
+    with pytest.raises(tailor_svc.TailorError) as excinfo:
+        tailor_svc.suggestions_of(version)
+    assert f"#{version.id}" in str(excinfo.value), "报错要说清是哪一版的数据坏了"
+
+    with pytest.raises(tailor_svc.TailorError):
+        tailor_svc.analysis_of(version)

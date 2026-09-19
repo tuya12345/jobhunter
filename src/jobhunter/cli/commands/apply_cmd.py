@@ -97,6 +97,20 @@ def apply_root(
     yes: Annotated[
         bool, typer.Option("--yes", "-y", help="模糊匹配到多条时不询问，全部应用")
     ] = False,
+    sent: Annotated[
+        bool,
+        typer.Option(
+            "--sent",
+            help="声明开场白**真的发出去了**（闭环字段 greeting_sent；生成 ≠ 发送）",
+        ),
+    ] = False,
+    edited: Annotated[
+        bool,
+        typer.Option(
+            "--edited",
+            help="声明开场白**发之前我改过**（闭环字段 greeting_edited）",
+        ),
+    ] = False,
 ) -> None:
     """零手打跟进入口（P4.5：批量 / 模糊匹配 / 待处理清单；P6：时间轴）。"""
     if timeline is not None:
@@ -112,6 +126,11 @@ def apply_root(
     # ★ 状态值先校验：拼错一个状态是**最常见**的手误，应该在碰数据库之前
     #   就明确报出来。等走到 set_status 才报，用户可能先看到"没有匹配的岗位"
     #   这种与真正错误无关的提示（实测踩到）。
+    # ⚠️ `skipped` 走的是**批量的对语法**（`12=skipped`，设计文档的范例），
+    #    不走 `--status`：`--status` 的第二参数是"投递状态"，
+    #    而 skipped 是**岗位**状态。把它塞进这里会让"投递状态"这个概念再次含糊
+    #    （`tests/unit/test_followup.py::test_cli_keyword_invalid_status_is_actionable`
+    #    明确守着这条边界）。
     if status is not None and status not in APPLICATION_STATUSES:
         err_console.print(
             f"[red]状态 {status!r} 不认识[/red]。可用：{'、'.join(APPLICATION_STATUSES)}"
@@ -120,15 +139,23 @@ def apply_root(
 
     # ---- 批量语法 `3=applied 7=replied`（★ P4.5 的核心：一条命令处理一整轮）----
     pairs = [token for token in tokens if "=" in token]
+    others = [token for token in tokens if "=" not in token]
     if pairs:
+        _reject_ambiguous_batch(pairs, others, status)
         _mark_batch(pairs)
+        if others and status is not None:
+            # 混写：批量对（各自的状态）先落，剩下的序号/关键词走 `--status`
+            if len(others) == 1 and others[0].isdigit():
+                _mark_by_index(int(others[0]), status, sent=sent, edited=edited)
+            else:
+                _mark_by_keyword(" ".join(others), status, yes=yes, sent=sent, edited=edited)
         return
 
     if job is not None:
         if status is None:
             err_console.print("[red]用 --job 时必须同时给 --status（如 --status applied）[/red]")
             raise typer.Exit(code=2)
-        _mark_by_job_id(job, status)
+        _mark_by_job_id(job, status, sent=sent, edited=edited)
         return
 
     if not tokens and status is None:
@@ -144,11 +171,11 @@ def apply_root(
 
     # ---- 单个序号：映射到岗位（序号 = `jh today` 里那个序号）----------------
     if len(tokens) == 1 and tokens[0].isdigit():
-        _mark_by_index(int(tokens[0]), status)
+        _mark_by_index(int(tokens[0]), status, sent=sent, edited=edited)
         return
 
     # ---- 模糊匹配（★ P4.5）：按公司名/职位名找，命中多条**列出来让我选** ------
-    _mark_by_keyword(" ".join(tokens), status, yes=yes)
+    _mark_by_keyword(" ".join(tokens), status, yes=yes, sent=sent, edited=edited)
 
 
 # ===========================================================================
@@ -251,14 +278,68 @@ def _print_pending() -> None:
     console.print('  [green]jh apply "字节" --status viewed[/green]   按公司/职位名模糊匹配')
 
 
+def _reject_ambiguous_batch(pairs: list[str], others: list[str], status: str | None) -> None:
+    """批量对与其它 token 混在一起时的歧义拦截（ISSUE #50）。
+
+    ★★ 为什么必须拦（**每一个 token 都要有明确归属**：要么被打标、要么报错）：
+      原实现是 `pairs = [t for t in tokens if "=" in t]`，其余 token
+      既不进 pairs 也不报错 —— **静默丢弃**。实测：
+
+          jh apply 1=applied 复检公司   → 退出码 0，只标了第 1 条，
+          "复检公司"被无声忽略，而用户以为两家都处理了。
+
+      静默忽略输入比报错危险，因为用户不会知道自己少了什么
+      （与 ISSUE #34「`--copy` 静默忽略 `--min-score`」是同一类失效模式）。
+
+    ★ 两种歧义：
+      ① 既有批量对、又有别的 token，却**没有** `--status`
+         → 那些 token 要按什么状态打标？无从推断 → 报错。
+      ② **只有**批量对、同时又给了 `--status`
+         → 两处都表达了状态，静默二选一会让用户不知道最终状态是什么，
+           而"状态"正是这个工具的核心数据 → 报错。
+    ★ 但"序号/关键词 + 批量对 + `--status`"是**合法**的混写（模块 docstring 的承诺：
+      `jh apply 3 7=replied "腾讯" --status viewed`）——
+      此时 `--status` 管的是**非批量对**那些 token，批量对自带的状态优先。
+    """
+    if others and status is None:
+        err_console.print(
+            "[red]这条命令里既有批量对、又有别的东西，我无法确定你想做什么：[/red]\n"
+            f"  批量对：{'、'.join(pairs)}\n"
+            f"  其余：{'、'.join(others)}\n"
+            "  [dim]要么只写批量对（`jh apply 1=applied 2=replied`），"
+            "要么给它们一个状态（`jh apply 1 复检公司 --status applied`）。[/dim]"
+        )
+        raise typer.Exit(code=2)
+    if status is not None and not others:
+        err_console.print(
+            "[red]状态给了两遍，而且可能不一致：[/red]\n"
+            f"  批量对里：{'、'.join(pairs)}\n"
+            f"  --status：{status}\n"
+            "  [dim]批量对自带状态，不要再给 --status；"
+            '要按关键词批量打标就直接用 `jh apply "公司" --status applied`。[/dim]'
+        )
+        raise typer.Exit(code=2)
+
+
 def _parse_pairs(pairs: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
-    """把 `3=applied` / `#12=replied` 拆成 (定位符, 目标状态)。
+    """把 `3=applied` / `#12=replied` / `12=skipped` 拆成 (定位符, 目标状态)。
 
     Returns:
         (parsed, errors) —— 只要有错就**整批不执行**（见 `_mark_batch` 的说明）。
+
+    ★ ISSUE #48：`skipped` 是**唯一**额外的合法取值，它是**岗位**状态
+      （"这个岗我不投了"，`JOB_STATUSES` 里那一个），不是投递状态。
+      设计文档【提示词 6】把 `jh apply 3=applied 7=replied 12=skipped`
+      当成零手打范例写死 —— 照着文档敲的第一条命令就报错，伤害的正是
+      "一条命令处理一整轮"这个卖点。
+      落地方式见 `apply_svc.skip_job`：岗位标 skipped，
+      已有投递记录则置 rejected + 记一条 `note` 事件（**不写 status_change**，
+      那会声称一次没发生过的投递状态流转，时间轴不许说谎）。
     """
     parsed: list[tuple[str, str]] = []
     errors: list[str] = []
+    #: 批量对里允许的状态 = 投递状态 + 岗位状态 skipped
+    allowed = (*APPLICATION_STATUSES, apply_svc.SKIP_TOKEN)
     for token in pairs:
         target, _, status = token.partition("=")
         target = target.strip()
@@ -266,10 +347,8 @@ def _parse_pairs(pairs: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
         if not target or not status:
             errors.append(f"`{token}` 格式不对，应写成 `3=applied` 或 `#12=replied`")
             continue
-        if status not in APPLICATION_STATUSES:
-            errors.append(
-                f"`{token}` 里的状态 `{status}` 不认识（可用：{'、'.join(APPLICATION_STATUSES)}）"
-            )
+        if status not in allowed:
+            errors.append(f"`{token}` 里的状态 `{status}` 不认识（可用：{'、'.join(allowed)}）")
             continue
         parsed.append((target, status))
     return parsed, errors
@@ -321,17 +400,37 @@ def _mark_batch(pairs: list[str]) -> None:
 
             results = []
             for job, target_status in resolved:
-                results.append(
-                    (
-                        job,
-                        apply_svc.set_status(
+                try:
+                    # `12=skipped` 走岗位侧（ISSUE #48），其余走投递状态机
+                    result = (
+                        apply_svc.skip_job(
+                            session, job.id, source=f"jh apply {job.id}={target_status}"
+                        )
+                        if target_status == apply_svc.SKIP_TOKEN
+                        else apply_svc.set_status(
                             session,
                             job.id,
                             target_status,
                             source=f"jh apply {job.id}={target_status}",
-                        ),
+                        )
                     )
-                )
+                except apply_svc.ApplicationError as exc:
+                    errors.append(f"`{job.id}={target_status}`：{exc}")
+                    continue
+                results.append((job, result))
+
+            if errors:
+                # 解析过了但执行前被服务层拒绝（例如"已投过的岗位不能再标 skipped"）
+                # → 同样整批不动，保持"全对才执行"的语义。
+                # ★ 必须显式 rollback：前面几条可能已经改了状态但**还没 commit**，
+                #   不回滚的话它们会留在 session 里被一起提交（半成功半失败，
+                #   正是这个函数最不想看到的语义）。
+                session.rollback()
+                err_console.print("[red]这批打标没有执行（有错就整批不动）：[/red]")
+                for item in errors:
+                    err_console.print(f"  [red]·[/red] {item}")
+                raise typer.Exit(code=2)
+
             session.commit()
     finally:
         engine.dispose()
@@ -353,7 +452,9 @@ def _mark_batch(pairs: list[str]) -> None:
     success(f"批量打标完成：{len(results)} 条，其中 {changed} 条有变化（每条都写了事件）")
 
 
-def _mark_by_keyword(keyword: str, status: str, *, yes: bool) -> None:
+def _mark_by_keyword(
+    keyword: str, status: str, *, yes: bool, sent: bool = False, edited: bool = False
+) -> None:
     """模糊匹配公司名/职位名，然后打标。
 
     ★ 命中多条时**绝不猜**：列出来让用户用 job_id 或序号重跑。
@@ -399,7 +500,13 @@ def _mark_by_keyword(keyword: str, status: str, *, yes: bool) -> None:
             for row in matched:
                 try:
                     result = apply_svc.set_status(
-                        session, row.job_id, status, source=f"jh apply {keyword!r}"
+                        session,
+                        row.job_id,
+                        status,
+                        source=f"jh apply {keyword!r}",
+                        # ★ ISSUE #37：闭环字段只由**真实动作**置位（人给了 --sent/--edited）
+                        greeting_sent=True if sent else None,
+                        greeting_edited=True if edited else None,
                     )
                 except apply_svc.ApplicationError as exc:
                     # 状态非法之类的错误要给一句人话，而不是让 Python 堆栈冲出来
@@ -433,6 +540,11 @@ def _pull_options_out_of_tokens(
 
     这里做**最小修补**：`--status X` / `-s X` / `--status=X` / `--yes` / `-y`
     写在任意位置都认。
+
+    ★ `--sent` / `--edited` 也在这里被摘掉（ISSUE #37）：它们同样是布尔选项，
+      落在位置参数后面会被吞进关键词里 —— 而"我以为声明了已发送、其实没有"
+      与"关键词被吞掉"是同一类静默失真，不该让用户去猜语序。
+      ⚠️ 摘掉的 token **不回传**（布尔标志没有"值"），所以这里只做清理。
     """
     cleaned: list[str] = []
     found_status = status
@@ -454,19 +566,27 @@ def _pull_options_out_of_tokens(
             found_yes = True
             index += 1
             continue
+        if token in ("--sent", "--edited"):
+            index += 1
+            continue
         cleaned.append(token)
         index += 1
     return cleaned, found_status, found_yes
 
 
-def _mark_by_job_id(job_id: int, status: str) -> None:
+def _mark_by_job_id(job_id: int, status: str, *, sent: bool = False, edited: bool = False) -> None:
     """按岗位 ID 打标（最直接、最不会打错的一种）。"""
     engine, factory = require_db()
     try:
         with factory() as session:
             try:
                 result = apply_svc.set_status(
-                    session, job_id, status, source=f"jh apply --job {job_id}"
+                    session,
+                    job_id,
+                    status,
+                    source=f"jh apply --job {job_id}",
+                    greeting_sent=True if sent else None,
+                    greeting_edited=True if edited else None,
                 )
             except apply_svc.ApplicationError as exc:
                 err_console.print(f"[red]{exc}[/red]")
@@ -477,7 +597,7 @@ def _mark_by_job_id(job_id: int, status: str) -> None:
     _report(result, status)
 
 
-def _mark_by_index(index: int, status: str) -> None:
+def _mark_by_index(index: int, status: str, *, sent: bool = False, edited: bool = False) -> None:
     """按 `jh today` 的序号打标。
 
     ★ 序号走 `today_svc.resolve_index()`：优先用**今天的清单快照**，
@@ -499,7 +619,14 @@ def _mark_by_index(index: int, status: str) -> None:
                 raise typer.Exit(code=1)
             try:
                 result = apply_svc.set_status(
-                    session, job.id, status, source=f"jh apply {index}={status}"
+                    session,
+                    job.id,
+                    status,
+                    source=f"jh apply {index}={status}",
+                    # ★ ISSUE #37：--sent / --edited 是**人声明的事实**，
+                    #   生成 ≠ 发送（不传时保持"未发送"）
+                    greeting_sent=True if sent else None,
+                    greeting_edited=True if edited else None,
                 )
             except apply_svc.ApplicationError as exc:
                 err_console.print(f"[red]{exc}[/red]")
@@ -523,6 +650,13 @@ def _report(result: apply_svc.ApplyResult, status: str) -> None:
         warn(f"岗位 #{result.job_id} 本来就是 {status}，没有改动（也没有重复写事件）")
         return
     success(f"岗位 #{result.job_id}：{result.from_status} → [bold]{result.to_status}[/bold]")
+    if result.to_status == apply_svc.SKIP_TOKEN:
+        # ISSUE #48：skipped 是**岗位**状态，语义要说清楚（它不是一次投递）
+        console.print(
+            "  [dim]这个岗位已标为「不投」（jobs.status=skipped）。"
+            "有投递记录的话还写了一条备注事件 —— 时间轴不会声称发生过一次投递。[/dim]"
+        )
+        return
     if status == "applied":
         console.print(
             "  [dim]已记进 applications 并写了一条事件（时间轴与日额度都从它聚合）。[/dim]"

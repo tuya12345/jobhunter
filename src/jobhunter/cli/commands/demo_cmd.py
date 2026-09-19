@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -228,6 +229,9 @@ def demo(
     keep: Annotated[bool, typer.Option("--keep", help="保留演示库与产物（默认用完即删）")] = False,
 ) -> None:
     """跑一遍完整流程演示（P9）。"""
+    # ★ 取"当前配置的库"之前先重建配置单例：调用方（尤其测试）可能刚设过
+    #   JH_DATA_DIR 却还没清缓存，那样取到的是旧值，会让后面的隔离断言误判。
+    reset_settings()
     real_url = get_settings().database_url
     scratch = Path(tempfile.mkdtemp(prefix="jh-demo-"))
     for name in ("data", "output", "state"):
@@ -255,12 +259,17 @@ def demo(
         _step_review(settings)
         _step_export(settings, provider)
     finally:
-        _restore(real_url)
+        _restore()
         if keep:
             console.print()
             console.print(f"[dim]演示数据保留在：{scratch}[/dim]")
         else:
             shutil.rmtree(scratch, ignore_errors=True)
+            # ★ 把"删掉的到底是哪个目录"打出来：既让用户确认没碰别的东西，
+            #   也让测试可以**针对这个路径**断言"它确实没了" ——
+            #   而不是去扫系统临时目录里有没有 `jh-demo-*` 残留
+            #   （那种全局扫描在多个进程同时跑 demo 时会互相误伤，实测踩到过）。
+            console.print(f"[dim]演示临时目录已清理：{scratch}[/dim]")
 
 
 # ===========================================================================
@@ -278,8 +287,8 @@ def _isolate(scratch: Path, *, real_url: str) -> AppSettings:
     #   如果用户平时就靠 `JH_DATA_DIR` 把库放在加密盘，pop 会把他的配置弄丢，
     #   下一次 get_settings() 解到默认路径 —— 实测就是这条让 `jh demo` 结束时
     #   报"还原失败：配置单例还指着演示库"（install.md 的第 11 条 FAQ）。
-    for name in _ENV_KEYS:
-        _ORIGINAL_ENV.setdefault(name, os.environ.get(name))
+    _SNAPSHOT.original = {name: os.environ.get(name) for name in _ENV_KEYS}
+    _SNAPSHOT.scratch = scratch
     os.environ["JH_DATA_DIR"] = str(scratch / "data")
     os.environ["JH_OUTPUT_DIR"] = str(scratch / "output")
     os.environ["JH_STATE_DIR"] = str(scratch / "state")
@@ -292,7 +301,7 @@ def _isolate(scratch: Path, *, real_url: str) -> AppSettings:
         #   同进程里后续命令（以及测试里的下一条用例）会继续用那个库 ——
         #   实测踩过：一条"隔离失败"的用例把 JH_LLM_PROVIDER=mock 留在了环境里，
         #   导致后面"没配 key"的用例拿到假 Provider 而失败。
-        _restore(real_url)
+        _restore()
         raise RuntimeError(
             f"演示库的路径不对：{settings.database_url}\n"
             f"（真实库是 {real_url}）—— 继续跑会把假数据写进真实投递记录，已中止。"
@@ -304,30 +313,58 @@ def _isolate(scratch: Path, *, real_url: str) -> AppSettings:
     return settings
 
 
-#: 进入 demo **之前**这些环境变量的原值（`None` = 当时没设）。
-#: 模块级而不是传参：`_isolate` / `_restore` 会被 CLI 与测试分别调用，
-#: 用一个私有容器传原值比给两个函数都加参数更不容易漏。
-_ORIGINAL_ENV: dict[str, str | None] = {}
+@dataclass
+class _Snapshot:
+    """进入 demo 前的环境现场（原值 + 临时目录），`_restore` 用它收尾。
+
+    ★ 用模块级容器而不是给 `_isolate`/`_restore` 都加参数：两个函数会被 CLI 与测试
+      分别调用，"原值"必须跨这两个调用存在。用一个类装起来也顺便让"忘了收尾"这件事
+      变得可见（`original` 空字典就意味着没进过 `_isolate`）。
+    """
+
+    original: dict[str, str | None] = field(default_factory=dict)
+    scratch: Path | None = None
 
 
-def _restore(real_url: str) -> None:
+#: 当前这次 demo 的环境现场（没在跑 demo 时是空的）
+_SNAPSHOT = _Snapshot()
+
+
+def _restore() -> None:
     """还原环境变量与配置单例（否则同进程里后续命令会继续用演示库）。
 
     ★ 还原成**用户原来的值**（可能是"没设"，也可能是他自己设的路径），
       而不是一律删掉 —— 见 `_isolate` 里的说明。
+
+    ★★ 这里**只断言一件事：不再指着演示库**（P9 验收 #53 的教训）。
+      第一版断言的是"还原后的库 URL 必须等于进 demo 前那个 URL" —— 那个比较
+      **假定了环境在 demo 期间不会变**，于是"调用方在进 demo 前刚改过环境变量、
+      但配置单例还是旧的"这种情况下会误报：
+        进 demo 时 real_url 解到 A（旧缓存）→ demo 期间换到临时目录 →
+        还原时环境变量已指向 B（调用方刚设的）→ A ≠ B → 抛异常。
+      而这时"用户的环境配置"其实**已经正确还原**了。
+      正确的断言是**目标属性**：`get_settings()` 解析出来的库不能再落在演示临时目录里。
     """
+    scratch = _SNAPSHOT.scratch
     for name in _ENV_KEYS:
-        original = _ORIGINAL_ENV.pop(name, None)
+        original = _SNAPSHOT.original.get(name)
         if original is None:
             os.environ.pop(name, None)
         else:
             os.environ[name] = original
+    _SNAPSHOT.original = {}
+    _SNAPSHOT.scratch = None
     reset_settings()
-    if get_settings().database_url != real_url:  # pragma: no cover - 只可能是实现写错
+
+    url = get_settings().database_url
+    # ★ 只比对**演示库自己的目录**（`<scratch>/data`）而不是整个 scratch 前缀：
+    #   前缀匹配会在"临时目录恰好是数据目录的祖先"时误报（测试里就踩到过：
+    #   scratch 与测试自己的 data 目录同在一个 tmp_path 下）。
+    demo_marker = (scratch / "data").as_posix() if scratch is not None else None
+    if demo_marker and demo_marker in url:  # pragma: no cover - 只可能是实现写错
         raise RuntimeError(
-            "还原失败：配置单例还指着演示库\n"
-            "（如果你在环境里预设过 JH_DATA_DIR/JH_OUTPUT_DIR/JH_STATE_DIR，"
-            "请把这三个值发我 —— 这是 demo 的隔离逻辑没照顾好你的配置）"
+            f"还原失败：配置单例还指着演示库（{url}）\n"
+            "这是 demo 的隔离逻辑写错了，请把上面这条 URL 发我。"
         )
 
 

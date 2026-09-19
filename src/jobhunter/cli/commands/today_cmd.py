@@ -56,6 +56,20 @@ def today(
         typer.Option("--variant", help="强制开场白变体：with_project / without_project"),
     ] = None,
     short: Annotated[bool, typer.Option("--short", help="--copy 时复制精简版（≤60 字）")] = False,
+    sent: Annotated[
+        bool,
+        typer.Option(
+            "--sent",
+            help="配合 --copy：声明这段话术**真的发出去了**（写 greeting_sent，闭环统计用）",
+        ),
+    ] = False,
+    edited: Annotated[
+        bool,
+        typer.Option(
+            "--edited",
+            help="配合 --copy：声明**发之前我改过**（写 greeting_edited）",
+        ),
+    ] = False,
 ) -> None:
     """输出今日待投清单（P4）。"""
     settings = get_settings()
@@ -64,6 +78,17 @@ def today(
         raise typer.Exit(code=2)
     if export is not None and export not in ("md", "csv"):
         err_console.print("[red]--export 只支持 md 或 csv[/red]")
+        raise typer.Exit(code=2)
+    if (sent or edited) and copy is None:
+        # ★ 不许把"生成"当成"发送"（ISSUE #37 的合规红线）：
+        #   这两个闭环字段只能由**人的真实动作**置位，而 --sent/--edited
+        #   描述的是"我刚刚把哪一条发出去了"，所以必须同时给 --copy N 指明对象。
+        err_console.print(
+            "[red]--sent / --edited 要配合 --copy N 使用[/red]"
+            "（它们声明的是'第 N 条我真的发出去了/改过'）。\n"
+            "  [dim]例：jh today --copy 2 --sent　｜　"
+            "jh apply 2 --status applied --sent[/dim]"
+        )
         raise typer.Exit(code=2)
 
     engine, factory = require_db()
@@ -82,8 +107,11 @@ def today(
                     copy,
                     settings=settings,
                     min_score=min_score,
+                    limit=limit,
                     short=short,
                     variant=variant,
+                    sent=sent,
+                    edited=edited,
                 )
                 return
 
@@ -230,20 +258,30 @@ def _copy_nth(
     *,
     settings: AppSettings,
     min_score: int | None,
+    limit: int | None,
     short: bool,
     variant: str | None,
+    sent: bool = False,
+    edited: bool = False,
 ) -> None:
     """复制第 N 条开场白（序号与 `jh today` 打出来的完全一致）。
 
     ★ 只给这一条生成开场白（不是整张清单）：有 key 时每次调用都要花钱。
     ★ 序号优先按**今天的快照**解析 —— 投完第 1 条之后，"第 3 条"仍然是你
       刚才看到的第 3 条（见 `today_svc.resolve_index` 的说明）。
+    ★★ ISSUE #34：`--min-score` / `--limit` **必须真的生效**。
+      原实现收了 `min_score` 形参却从不使用 ——
+      `jh today --copy 2 --min-score 999` 会照常复制第 2 条，
+      而用户以为自己限定在了"999 分以上"的范围里（拿到的是别的岗位的话术）。
+      静默忽略选项比报错更糟。筛选与序号的判定统一在
+      `today_svc.copy_target()`（它同时保证"序号含义"与"筛选选项"都成立）。
     """
-    job, from_snapshot = today_svc.resolve_index(session, index, settings=settings)
+    job, reason = today_svc.copy_target(
+        session, index, min_score=min_score, limit=limit, settings=settings
+    )
     if job is None:
-        err_console.print(
-            f"[red]清单里没有第 {index} 条[/red]。先跑 [green]jh today[/green] 看序号。"
-        )
+        err_console.print(f"[red]{reason}[/red]")
+        console.print("  [dim]先看清单：[green]jh today[/green][/dim]")
         raise typer.Exit(code=1)
 
     provider = get_provider(settings)
@@ -263,7 +301,37 @@ def _copy_nth(
             f"的{'精简版' if short else '完整版'}开场白（{len(text)} 字）"
         )
         console.print("  [dim]直接去招聘 App 里粘贴即可。[/dim]")
+        # ★ ISSUE #37：闭环字段**只在人声明时**置位（`--sent` / `--edited`）。
+        #   复制不等于发送，所以这里绝不自动写 greeting_sent ——
+        #   "生成话术"与"话术被用上"是两件事，混在一起这个功能就没有意义了
+        #   （P6 的 verify 里有一条 "生成 ≠ 发送" 的红线守着同样的道理）。
+        if sent or edited:
+            _mark_greeting_closure(session, job.id, sent=sent, edited=edited)
+            session.commit()
     else:
         # 剪贴板不可用也不能让用户白跑一趟 —— 直接把文本打出来让他手动选
         warn("复制到剪贴板失败（这个系统上可能没有 clip/pbcopy/xclip），下面是原文：")
         console.print(text)
+
+
+def _mark_greeting_closure(
+    session: Session, job_id: int, *, sent: bool = False, edited: bool = False
+) -> None:
+    """把"这句话术真的用上了 / 发之前我改过"写进闭环字段（ISSUE #37）。
+
+    ★ 只会在这里被调用（`--copy N --sent/--edited`）—— 也就是**人**明确说了
+      "我发出去了"。生成开场白、复制到剪贴板都**不**自动置位：
+      工具不替用户声称一件没发生的事（合规红线，与 P6 "生成 ≠ 发送" 同一条）。
+    """
+    application = apply_svc.mark_greeting(session, job_id, sent=sent or None, edited=edited or None)
+    if application is None:
+        # 还没生成过开场白的投递 → 没有可标记的对象，如实说一句而不是静默
+        warn("这条投递还没有开场白记录，闭环字段没写（先跑 `jh today` 生成）。")
+        return
+    parts: list[str] = []
+    if sent:
+        parts.append("已发出（greeting_sent）")
+    if edited:
+        parts.append("发前改过（greeting_edited）")
+    if parts:
+        console.print(f"  [dim]已记下：{'、'.join(parts)} —— 统计「话术有没有被用上」靠它。[/dim]")

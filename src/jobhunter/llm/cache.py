@@ -24,6 +24,12 @@
         jd_hash         HR 改了 JD 内容 → 重新算
         resume hash     ★ 我改了简历 → 重新算
 
+    ★ 四个成分之外，调用方还可以传 `task`（区分不同任务）与
+      `prompt_fingerprint`（**提示词本身的指纹**，ISSUES #24）——
+      后者的意义见 `compute_cache_key` 的说明：提示词里那些
+      "会变但不在这四个成分里"的内容（规则层锚点、JD 表头字段、简历名单）
+      必须也能让缓存失效。
+
 ★ 为什么把 key 计算放在这里而不是 llm/base.py：
     `llm/base.py` 是**纯粹的"送出去/拿回来"**，它不该知道"简历""JD"是什么。
     让 Provider 层去拼简历的 hash，等于把业务概念漏进基础设施层。
@@ -74,6 +80,7 @@ def compute_cache_key(
     jd_hash: str | None,
     resume_content_hash: str | None,
     task: str | None = None,
+    prompt_fingerprint: str | None = None,
 ) -> str | None:
     """算出缓存 key；**任一成分缺失就返回 None（表示"这次不许用缓存"）**。
 
@@ -89,6 +96,18 @@ def compute_cache_key(
       不加 task 就会**撞成同一条缓存** —— 开场白读到匹配的 JSON。
       为了不破坏已有调用点，它是可选参数：不传时行为与之前完全一致。
 
+    ★ `prompt_fingerprint` 参数（ISSUES #24 加）：**提示词本身**的指纹。
+
+      四个固定成分覆盖不了"进提示词但不在这四个里"的东西：规则层锚点
+      （`rule_hint`，随 `match_weights` / `skill_aliases` 变）、JD 表头字段
+      （城市/经验/学历…）、可用简历名单。改了权重却命中旧缓存，
+      用户会看到"分数纹丝不动"并得出"调权重没用"的错误结论。
+
+      同样是**可选参数**，两种取值有明确语义：
+        · 传了指纹（推荐）→ key 覆盖整份提示词，输入变了就一定重算；
+        · 不传 → 保持原行为（四个成分），适用于"提示词完全由这四个成分决定"
+          的调用点，避免无谓地让既有缓存全部失效。
+
     分隔符用 `|` 而不是直接拼接：直接拼接时
     `("1", "23")` 和 `("12", "3")` 会撞成同一个 key（真实的哈希碰撞来源）。
     """
@@ -97,6 +116,8 @@ def compute_cache_key(
     if not model:
         return None
     raw = f"{task or ''}|{prompt_version}|{model}|{jd_hash}|{resume_content_hash}"
+    if prompt_fingerprint:
+        raw = f"{raw}|{prompt_fingerprint}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

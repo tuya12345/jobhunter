@@ -24,7 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from jobhunter.models import Application, ApplicationEvent, Job
-from jobhunter.models.constants import APPLICATION_STATUSES
+from jobhunter.models.constants import APPLICATION_STATUSES, EVENT_TYPES
 from jobhunter.utils.io import to_json
 from jobhunter.utils.logging import get_logger
 from jobhunter.utils.time import days_since, now_utc, to_local
@@ -35,11 +35,16 @@ __all__ = [
     "ApplicationError",
     "ApplyResult",
     "PendingRow",
+    "SKIP_TOKEN",
+    "WAITING_STATUSES",
     "count_applied_today",
     "ensure_pending_application",
     "get_latest_application",
     "list_actionable",
+    "mark_greeting",
+    "record_event",
     "set_status",
+    "skip_job",
 ]
 
 
@@ -55,6 +60,16 @@ _STATUS_TIMESTAMP: dict[str, str] = {
 }
 #: 打标后同步到 `jobs.status` 的状态（job 的状态机只有 new/scored/queued/applied/skipped）
 _JOB_STATUS_SYNC = {"applied": "applied", "rejected": "applied"}
+
+#: ★ ISSUE #48：`skipped` **不是投递状态**，它是**岗位**状态（`JOB_STATUSES` 里的
+#:  "我主动跳过，不想投"）。设计文档【提示词 6】却把 `jh apply 3=applied 12=skipped`
+#:  当成零手打范例写死 —— 照文档敲得退出码 2，对"一条命令处理一整轮"这个卖点
+#:  是实打实的伤害。所以这里显式接受它：语义 = "这个岗我不投了"。
+#:  · 有投递记录 → 记一条 `note` 事件 + 把 applications.status 置 rejected，
+#:    否则 `jh apply --pending` 会一直催一条我已经决定不投的岗；
+#:    ⚠️ **不写 status_change 事件**（那会声称一次没发生过的投递状态流转，时间轴说谎）
+#:  · 没有投递记录（还没生成开场白）→ 只动 jobs.status，并明确说出来
+SKIP_TOKEN = "skipped"
 
 
 @dataclass
@@ -73,6 +88,42 @@ def get_latest_application(session: Session, job_id: int) -> Application | None:
     return session.scalars(
         select(Application).where(Application.job_id == job_id).order_by(Application.id.desc())
     ).first()
+
+
+def record_event(
+    session: Session,
+    application_id: int,
+    event_type: str,
+    *,
+    from_status: str | None = None,
+    to_status: str | None = None,
+    payload: dict[str, object] | None = None,
+    occurred_at: datetime | None = None,
+) -> ApplicationEvent:
+    """往事件流里追加一条**经过校验**的事件（唯一入口）。
+
+    ★ 服务层也要校验（ISSUE #42），不能只靠数据库的 CHECK：
+      数据库报的是 `IntegrityError: CHECK constraint failed`，对用户来说
+      那是一句"工具坏了"；这里报的是
+      「事件类型 'status_chnage' 不认识。可用：status_change、greeting_sent、…」。
+      两道都要有 —— 数据库那道保证"任何路径都写不进脏数据"（包括将来的新代码
+      和手工 SQL），这一道保证**用户看到的是人话**。
+
+    ★ 字段名用 `payload`（dict）而不是 `payload_json`（str）：
+      调用方不该自己 json.dumps（口径统一在 `utils/io.to_json`）。
+    """
+    if event_type not in EVENT_TYPES:
+        raise ApplicationError(f"事件类型 {event_type!r} 不认识。可用：{'、'.join(EVENT_TYPES)}")
+    event = ApplicationEvent(
+        application_id=application_id,
+        event_type=event_type,
+        from_status=from_status,
+        to_status=to_status,
+        payload_json=to_json(payload) if payload is not None else None,
+        occurred_at=occurred_at or now_utc(),
+    )
+    session.add(event)
+    return event
 
 
 def ensure_pending_application(
@@ -118,6 +169,107 @@ def ensure_pending_application(
     return application, True
 
 
+def mark_greeting(
+    session: Session,
+    job_id: int,
+    *,
+    sent: bool | None = None,
+    edited: bool | None = None,
+) -> Application | None:
+    """只改开场白的闭环字段（不动投递状态）—— `jh today --copy N --sent/--edited` 用。
+
+    ★★ 为什么必须有一个"只置位、不改状态"的入口（ISSUE #37）：
+      `greeting_sent` / `greeting_edited` 两列在原来的代码里**没有任何调用方传参**，
+      于是恒为 0 —— "这个工具生成的话术到底有没有被用上"永远查不出来。
+
+    ★★ 别把"生成"当成"发送"（合规红线）：
+      生成只是产出一段文本，工具**绝不代用户声称发出去了** ——
+      这两个字段只能由人的**真实动作**置位：
+        · `jh today --copy N --sent`   ：我把它复制去粘贴了
+        · `jh today --copy N --edited` ：我复制之后改过再发
+        · `jh apply N --status applied --sent/--edited` ：随打标一起声明
+      没给 `--sent` 时永远是"未发送"（工具不替用户说话）。
+
+    ★ 对应的 `greeting_sent` / `greeting_edited` **事件**也在这里补：
+      统计口径（时间轴 + `applications` 两列）必须同时有，只写一边会得到
+      "列说发过、时间轴说没有"的矛盾数据。
+    """
+    application = get_latest_application(session, job_id)
+    if application is None or not application.greeting_text:
+        # 还没生成过开场白（`jh today` 没跑过）→ 没有可标记的对象，如实返回 None
+        return None
+
+    # ★ 置位与写事件的口径只有一份：`_settle_greeting_closure`
+    #   （`set_status` 与这里共用，免得两处口径分叉）。
+    if sent is True:
+        application.greeting_sent = True
+    if edited is True:
+        application.greeting_edited = True
+    _settle_greeting_closure(session, application, when=now_utc(), sent=sent, edited=edited)
+    session.flush()
+    return application
+
+
+def _has_event(session: Session, application_id: int, event_type: str) -> bool:
+    """这条投递是否已经有某类事件（避免重复写同一条痕迹）。"""
+    count = session.scalar(
+        select(func.count())
+        .select_from(ApplicationEvent)
+        .where(
+            ApplicationEvent.application_id == application_id,
+            ApplicationEvent.event_type == event_type,
+        )
+    )
+    return bool(count)
+
+
+def _settle_greeting_closure(
+    session: Session,
+    application: Application,
+    *,
+    when: datetime,
+    sent: bool | None,
+    edited: bool | None,
+) -> None:
+    """把开场白闭环字段（`greeting_sent` / `greeting_edited`）与事件流对齐。
+
+    ★ 两道口径都要有（ISSUE #37）：
+      · **列**（`applications.greeting_sent`）—— 看板/统计直接读它；
+      · **事件**（`application_events`）—— 时间轴要能回答"什么时候发的"。
+      只写一边会得到"列说发过、时间轴说没有"的矛盾数据。
+
+    ★ 幂等：已有同类事件就不重复写。重复敲同一条命令不该在时间轴上留下两条
+      一模一样的"话术已发"（几天后根本分不清哪条是真的 —— P4 验收时数出来的坑）。
+    """
+    if sent is False and application.greeting_sent:
+        application.greeting_sent = False
+
+    # ★ "补写丢失的痕迹"：先 `jh apply N --status applied` 再生成开场白时，
+    #   之前那次 set_status 没有 greeting_text 可发，于是没有任何 greeting_sent 事件；
+    #   等开场白后来补上（`ensure_pending_application` 补字段），痕迹要在这里落地，
+    #   否则"话术有没有被用上"的统计会安静地漏掉这一类。
+    if application.greeting_sent and not _has_event(session, application.id, "greeting_sent"):
+        record_event(
+            session,
+            application.id,
+            "greeting_sent",
+            payload={"variant": application.greeting_variant},
+            occurred_at=when,
+        )
+
+    if edited is True and application.greeting_text:
+        # "发之前改过"：只在有开场白可改时才有意义
+        application.greeting_edited = True
+        if not _has_event(session, application.id, "greeting_edited"):
+            record_event(
+                session,
+                application.id,
+                "greeting_edited",
+                payload={"variant": application.greeting_variant},
+                occurred_at=when,
+            )
+
+
 def set_status(
     session: Session,
     job_id: int,
@@ -134,13 +286,19 @@ def set_status(
     Args:
         status: 必须是 `APPLICATION_STATUSES` 里的值 —— 写了不认识的状态要报错，
                 而不是静默建一个野状态（那会让看板统计出现永远对不上的分类）。
+                唯一的例外是 `"skipped"`：它是**岗位**状态，见 `skip_job`
+                （设计文档的范例 `jh apply 12=skipped` 要能跑通，ISSUE #48）。
         occurred_at: 业务时间（真实发生时间）。默认现在；补记时传历史时间。
         greeting_sent / greeting_edited: 闭环字段 —— 这个工具生成的话术到底有没有被用上。
+            不传时：标成 `applied` 且有开场白 → 视为已发出（人点过投递才会到这一步）；
+            显式传 `False` 可以纠正（例如只投了简历、没发开场白）。
 
     ★ 为什么 `from_status == to_status` 也算一次操作但不写事件：
       重复敲同一条命令是常见的手误，写一堆重复事件会污染时间轴；
       但返回值里标明 `changed=False`，让 CLI 能说清"本来就已是这个状态"。
     """
+    if status == SKIP_TOKEN:
+        return skip_job(session, job_id, source=source, occurred_at=occurred_at)
     if status not in APPLICATION_STATUSES:
         raise ApplicationError(f"状态 {status!r} 不认识。可用：{'、'.join(APPLICATION_STATUSES)}")
 
@@ -168,30 +326,28 @@ def set_status(
         application.greeting_edited = greeting_edited
 
     if changed:
-        session.add(
-            ApplicationEvent(
-                application_id=application.id,
-                event_type="status_change",
-                from_status=from_status,
-                to_status=status,
-                payload_json=to_json({"source": source}),
-                occurred_at=when,
-            )
+        record_event(
+            session,
+            application.id,
+            "status_change",
+            from_status=from_status,
+            to_status=status,
+            payload={"source": source},
+            occurred_at=when,
         )
-    # 标成"已投"但没有明说"话术发出去了没有" → 记一条 greeting_sent 事件，
-    # 让闭环字段和时间轴都留下痕迹（统计"开场白到底有没有被用上"要靠它）。
-    # ★ 必须挂在 `changed` 上：重复敲同一条命令不该再写一条 ——
-    #   否则时间轴上会出现两条一模一样的"已投 + 话术已发"，几天后根本分不清
-    #   哪条是真的（这个 bug 是 P4 验收时数事件数数出来的）。
-    if changed and status == "applied" and greeting_sent is None and application.greeting_text:
-        session.add(
-            ApplicationEvent(
-                application_id=application.id,
-                event_type="greeting_sent",
-                payload_json=to_json({"variant": application.greeting_variant}),
-                occurred_at=when,
-            )
-        )
+    # ★ 闭环字段与它的事件（ISSUES #37）全部收在 `_settle_greeting_closure` 里：
+    #   `set_status` 的决策点已经够多了（PLR0912），这段单独抽出来才读得清。
+    if greeting_sent is None and changed and status == "applied" and application.greeting_text:
+        # 走到 applied 只可能是人点过投递按钮，而这个工具**只生成、不发送** ——
+        # 所以"标成已投"时默认认为话术确实发出去了（显式传 False 可以纠正）。
+        application.greeting_sent = True
+    _settle_greeting_closure(
+        session,
+        application,
+        when=when,
+        sent=greeting_sent,
+        edited=greeting_edited,
+    )
 
     job = session.get(Job, job_id)
     if job is not None and status in _JOB_STATUS_SYNC:
@@ -205,6 +361,70 @@ def set_status(
         job_id=job_id,
         from_status=from_status,
         to_status=status,
+        changed=changed,
+    )
+
+
+def skip_job(
+    session: Session,
+    job_id: int,
+    *,
+    source: str = "jh apply",
+    occurred_at: datetime | None = None,
+) -> ApplyResult:
+    """把**岗位**标成 skipped（"这个岗我不投了"）—— 设计文档范例 `12=skipped` 的落地。
+
+    ★ 为什么需要它（ISSUE #48）：
+      设计文档【提示词 6】把 `jh apply 3=applied 7=replied 12=skipped` 当范例写死，
+      但 `skipped` 是**岗位**状态（`JOB_STATUSES`），不是投递状态 ——
+      照文档敲会得到"状态 `skipped` 不认识" + 退出码 2。
+      失败是安全的，但**照着文档敲的第一条命令就报错**，伤害的正是
+      "一条命令处理一整轮"这个卖点。
+
+    ★ 语义（写清楚，免得日后含糊）：
+      · `jobs.status = "skipped"` —— 这是"我不投"的**权威**记录；
+      · 如果已经有投递记录 → 同时把 `applications.status` 置 `rejected`
+        （它不该再出现在 `jh apply --pending` 里被催），并追加一条 `note` 事件；
+        ⚠️ **不写 status_change 事件**：那会声称一次"投递状态流转"，
+        而实际上什么都没投过 —— 时间轴不许说谎。
+      · 没有投递记录（还没生成开场白）→ 只动 `jobs.status`。
+        返回的 `application_id` 用 `0` 占位（CLI 靠 `changed` 判断要不要报成功）。
+
+    ★ 已 `applied` 的岗位不在这里改：`set_status` 的注释里写了"岗位状态前进不回退"，
+      但那是针对 `applied` 的。**skip 一个已经投出去的岗位**是不可能的操作
+      （投都投了，"不投"没有意义）→ 明确报错，而不是悄悄改一个假的岗位状态。
+    """
+    job = session.get(Job, job_id)
+    if job is None:
+        raise ApplicationError(f"找不到岗位 id={job_id}")
+
+    application = get_latest_application(session, job_id)
+    if application is not None and application.status != "pending":
+        raise ApplicationError(
+            f"岗位 #{job_id} 已经有过投递动作（当前状态 {application.status} 不是 pending），"
+            "不能再标 skipped —— 已投出去的岗位请改用 "
+            f"`jh apply #{job_id} --status rejected` 表达「对方拒了 / 我不跟了」。"
+        )
+
+    from_status = job.status
+    changed = from_status != SKIP_TOKEN
+    job.status = SKIP_TOKEN
+    if application is not None:
+        # 有 pending 记录：置 rejected 让它退出待处理清单 + 留一条 note（不是 status_change）
+        application.status = "rejected"
+        record_event(
+            session,
+            application.id,
+            "note",
+            payload={"source": source, "job_status": SKIP_TOKEN},
+            occurred_at=occurred_at or now_utc(),
+        )
+    session.flush()
+    return ApplyResult(
+        application_id=application.id if application is not None else 0,
+        job_id=job_id,
+        from_status=from_status,
+        to_status=SKIP_TOKEN,
         changed=changed,
     )
 
@@ -255,11 +475,39 @@ class PendingRow:
         return f"{self.company or '—'} · {self.title or '（未写职位）'}"
 
 
+#: ★★ "该催谁"的**唯一口径**（ISSUE #49）。
+#: 顶部提醒（`reminder_svc._stale_counts`）与待处理清单（`list_actionable`）
+#: **必须**用同一套状态，否则同一份数据在两个入口给出相反建议 ——
+#: 用户刚约上面试，待处理清单却说"投后 30 天没动静，建议放弃或换个渠道"，
+#: 这会直接摧毁他对这个工具的信任（两个入口互相打脸）。
+#:
+#: 判定依据：`applied` / `viewed` 是"**在等对方回应**"，才需要催；
+#:   · `pending`      → 还没投，该催（理由不同："还没投"）
+#:   · `replied`      → 对方回过了，轮到我回话，该催（但理由不是"没动静"）
+#:   · `assessment`   → 流程已经启动（笔试/测评在手），催"放弃"是错的
+#:   · `interview`    → 同上，刚约上面试
+#:   · `offer` / `rejected` → 终态，不该出现
+#: `reminder_svc._WAITING_STATUSES` 与之对应的子集是 `("applied", "viewed")`，
+#: `tests/unit/test_pending_consistency.py` 会把两者放在一起断言（再分叉就变红）。
+WAITING_STATUSES: tuple[str, ...] = ("applied", "viewed")
+#: 清单里还要额外包含这些（理由与"没动静"不同，但同样是"需要我动手"）
+_ACTIONABLE_EXTRA_STATUSES: tuple[str, ...] = ("pending", "replied")
+#: 清单能出现的全部状态
+_ACTIONABLE_STATUSES: tuple[str, ...] = ("pending", *WAITING_STATUSES, *_ACTIONABLE_EXTRA_STATUSES)
+
+
 def list_actionable(session: Session, *, now: datetime | None = None) -> list[PendingRow]:
-    """列出"需要我动手"的投递：还没投的 + 投了 3 天以上没动静的。
+    """列出"需要我动手"的投递：还没投的 + 投了以后在等对方回应的。
 
     ★ 为什么把"还没投的"也算进来：`jh today` 生成了开场白就写了一条 `pending`，
       它代表"简历已经准备好、就差我点投递"。这正是最该被提醒的一类。
+
+    ★★ 为什么 `assessment` / `interview` **不在这里**（ISSUE #49）：
+      它们表示"流程已经启动"，理由句子却只有"投后 N 天没动静，建议放弃"，
+      于是刚约上面试的岗位被建议"放弃"。同一份数据在顶部提醒与待处理清单
+      两个入口给出相反建议，比少提醒一条危险得多。
+      口径统一在 `_ACTIONABLE_STATUSES` / `WAITING_STATUSES`（见常量注释），
+      元测试 `test_pending_and_reminders_agree_on_who_to_nag` 会守住它。
 
     ★ 排序：先按"紧急程度"（超过 14 天 > 7 天 > 3 天 > 还没投），
       再按投出时间从早到晚 —— 最该处理的排最前面，因为这是**行动清单**。
@@ -268,7 +516,7 @@ def list_actionable(session: Session, *, now: datetime | None = None) -> list[Pe
     rows = session.execute(
         select(Application, Job)
         .join(Job, Application.job_id == Job.id)
-        .where(Application.status.not_in(("offer", "rejected")))
+        .where(Application.status.in_(_ACTIONABLE_STATUSES))
         .order_by(Application.applied_at.is_(None).desc(), Application.applied_at)
     ).all()
 
@@ -277,6 +525,9 @@ def list_actionable(session: Session, *, now: datetime | None = None) -> list[Pe
         days = days_since(application.applied_at, now=moment) if application.applied_at else None
         if days is None:
             reason = "还没投（开场白已生成）"
+        elif application.status not in WAITING_STATUSES:
+            # replied：对方回过了，轮到我 —— 理由**不能**说"没动静"（那与事实相反）
+            reason = f"对方已回复 {days} 天，该我回话了"
         elif days >= 14:
             reason = f"投后 {days} 天没动静，建议放弃或换个渠道"
         elif days >= 7:

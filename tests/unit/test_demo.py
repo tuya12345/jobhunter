@@ -145,6 +145,22 @@ def test_demo_keeps_user_preset_data_dirs(
     assert get_settings().database_url == before
 
 
+def test_demo_prints_the_scratch_path_it_removed(settings) -> None:
+    """默认（不带 `--keep`）要把**删掉的那个临时目录**打出来，并且真的删掉。
+
+    ★ 为什么不写成"扫系统临时目录里有没有 `jh-demo-*` 残留"：
+      那种全局扫描在**多个进程同时跑 demo**（比如并行测试、或我一边跑测试一边
+      手敲 `jh demo`）时会互相误伤 —— 实测踩到过一次假失败。
+      打印路径 + 针对该路径断言，既准确又能让用户确认"没碰别的东西"。
+    """
+    result = runner.invoke(app, ["--no-remind", "demo"])
+    assert result.exit_code == 0, result.output
+    marker = "演示临时目录已清理："
+    assert marker in result.output, "默认模式应当打印它删掉的临时目录路径"
+    scratch = Path(result.output.split(marker)[1].splitlines()[0].strip())
+    assert not scratch.exists(), f"说了已清理，但目录还在：{scratch}"
+
+
 def test_demo_aborts_if_isolation_fails(
     settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -165,9 +181,39 @@ def test_demo_aborts_if_isolation_fails(
     # 记下"进入 demo 之前"每个变量的值：中止后必须**逐个回到这个状态**
     # （conftest 会预设 JH_DATA_DIR/OUTPUT/STATE，而 JH_LLM_PROVIDER 本来就没设）
     before = {name: os.environ.get(name) for name in demo_cmd._ENV_KEYS}
+    # ★ scratch 用子目录：`tmp_path` 本身是测试数据目录的父目录，
+    #   直接拿它当 scratch 会让"还原后还在演示库吗"这类前缀判断误报
+    scratch = tmp_path / "scratch"
 
     with pytest.raises(RuntimeError) as excinfo:
-        demo_cmd._isolate(tmp_path, real_url=real.database_url)
+        demo_cmd._isolate(scratch, real_url=real.database_url)
     assert "演示库的路径不对" in str(excinfo.value)
     after = {name: os.environ.get(name) for name in demo_cmd._ENV_KEYS}
     assert after == before, f"中止后环境变量没回到原状：{after} != {before}"
+
+
+def test_demo_survives_a_data_dir_set_after_settings_were_cached(
+    settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """★ #53 的真实场景：**先**让配置单例缓存住，**再**改 `JH_DATA_DIR`。
+
+    验证会话的用例就是这样：它的 `settings`/`engine` 夹具在 `monkeypatch.setenv`
+    之前就把配置解出来了（夹具在测试体之前建立），于是 demo 开头读到的"真实库"
+    是**旧缓存**的值，而收尾时环境变量已经指向新目录。
+
+    第一版 `_restore` 断言的是"还原后的 URL == 进 demo 前那个 URL" —— 这种比较
+    假定了环境在 demo 期间不会变，于是会误报（面板都打出来了、退出码却是 1）。
+    正确的断言是"不再指着演示临时库"。
+    """
+    _ = get_settings()  # 先把单例缓存住（模拟夹具的行为）
+    custom = tmp_path / "加密盘"
+    custom.mkdir()
+    monkeypatch.setenv("JH_DATA_DIR", str(custom))
+
+    result = runner.invoke(app, ["--no-remind", "demo"])
+    assert result.exit_code == 0, f"打印了成功面板却返回非 0：\n{result.output[-1500:]}"
+    assert "演示完成" in result.output
+    from jobhunter.config.settings import reset_settings
+
+    reset_settings()
+    assert get_settings().database_url.startswith(f"sqlite:///{custom.as_posix()}")
