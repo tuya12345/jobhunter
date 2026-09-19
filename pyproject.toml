@@ -104,6 +104,10 @@ ignore = [
 # CLI 命令的参数很多（Typer 的写法天然如此），分支数也随参数增长
 "src/jobhunter/cli/commands/job_cmd.py" = ["PLR0912"]
 "src/jobhunter/cli/commands/resume_cmd.py" = ["PLR0912"]
+# tailor 的"分支多"是刻意的：brief 要把三类结论（讲什么/突出什么/避开什么）都渲染清楚，
+# analyze 要在"有建议 / 没建议 / 整批被闸门拦下"三种结局下都给出下一步。
+# 拆成小函数会让"用户到底看到什么"变难读 —— 这些渲染都有 CLI 测试守着。
+"src/jobhunter/cli/commands/tailor_cmd.py" = ["PLR0912"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

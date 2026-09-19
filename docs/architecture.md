@@ -124,7 +124,10 @@ projects/jobhunter/
 ├── spikes/
 │   └── boss_search_spike.py          [P2] 自动搜索可行性 spike（2h，可选）
 ├── prompts/
-│   ├── match.md / greeting.md / tailor.md / jd_parse.md   [P3+/P4/P5] 七要素提示词
+│   └── tailor.md                     [P5] ★ 七要素提示词（版本号写在文件里，见"提示词版本纪律"）
+│                                     ⚠️ match / greeting 的提示词目前仍内联在各自 svc 里
+│                                        （`match_llm_svc.SYSTEM_PROMPT` / `greeting_svc.SYSTEM_PROMPT`）；
+│                                        要不要一起搬到 prompts/ 记在 P9 收尾清单里
 ├── src/jobhunter/                    ★ src 布局：强制安装后导入，避免"本地目录假通过"
 │   ├── __init__.py
 │   ├── __main__.py                   [P0] python -m jobhunter 入口
@@ -148,9 +151,8 @@ projects/jobhunter/
 │   │       ├── weak_cmd.py           [P0 占位 / P6 实现]
 │   │       ├── stats_cmd.py          [P0 占位 / P6 实现]
 │   │       ├── report_cmd.py         [P0 占位 / P6 实现]
-│   │       ├── followup_cmd.py       [P0 占位 / P6 实现]
 │   │       ├── cal_cmd.py            [P0 占位 / P6 实现]
-│   │       ├── tailor_cmd.py         [P0 占位 / P5 实现]
+│   │       ├── tailor_cmd.py         [P0 占位 / P5 实现] ★ brief/analyze/list/diff/approve/export
 │   │       ├── leads_cmd.py          [P0 占位 / P7 实现]
 │   │       └── demo_cmd.py           [P0 占位 / P9 实现]
 │   ├── services/
@@ -366,11 +368,10 @@ def root(ctx, pairs: list[str] = typer.Argument(None)): ...
 | **P0** | 骨架 + 工程底座 + CI + README | ✅ **已完成**（结束时 107 测试绿；双平台 CI 绿） |
 | **P1** | 简历导入解析 + `jh resume split` | ✅ **已完成**（176 测试绿；双平台 CI 绿） |
 | **P2** | `jh job add <url\|--file\|--manual\|--html>` + 两层去重 | ✅ **已完成**（254 测试绿；抓取链路端到端验证通过） |
-| P3 | 共享层 + 两级匹配 + `jh match explain` + `jh gap` | 未开始（**等确认**） |
-| P3 | 共享层 + 两级匹配 + `jh match explain` + `jh gap` | 未开始 |
-| P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | 未开始 |
-| P4.5 | 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | 未开始 |
-| P5 | AI 定制简历（`tailor brief` → 完整版 + FidelityGuard） | 未开始 |
+| P3 | 共享层 + 两级匹配 + `jh match explain` + `jh gap` | ✅ **已完成** |
+| P4 | 待投清单 + 额度 + 开场白（完整/精简）+ 导出 | ✅ **已完成** |
+| P4.5 | 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | ✅ **已完成** |
+| P5 | AI 定制简历（`tailor brief` → 完整版 + FidelityGuard） | ✅ **已完成**（本轮交付；详见 `STATUS.md`） |
 | P6 | 看板 + 面试 + 问题记录 + 笔试/Offer + 统计 + 报告 + .ics | 未开始 |
 | P7 | App 线索（技术验证：1 平台 + probe + 抓屏 + YAML 降级链） | 未开始 |
 | P8 | Web 界面（移出主线） | 未开始 |

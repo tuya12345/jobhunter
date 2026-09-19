@@ -83,6 +83,8 @@ EXPECTED_COMMANDS = (
 #     按关键词模糊匹配。
 # ★ P4.5 之后仍留在名单里的 `apply` 语法：只有 `--timeline`（P6）。
 #   批量打标 `3=applied` 与 `--pending` 已经是真功能了，由 test_followup.py 覆盖。
+# ★ P5 之后 `tailor brief` 也移出名单（它是真功能了，由 test_tailor_cli.py / test_tailor_svc.py
+#   覆盖）。**移出意味着必须由功能测试接手**，不能两头都不管 —— 这正是这个名单的维护纪律。
 PLACEHOLDER_INVOCATIONS: list[list[str]] = [
     ["weak"],
     ["stats"],
@@ -95,7 +97,6 @@ PLACEHOLDER_INVOCATIONS: list[list[str]] = [
     ["assessment", "list"],
     ["offer", "compare"],
     ["cal", "export"],
-    ["tailor", "brief", "1"],
     ["leads", "export"],
 ]
 
@@ -144,7 +145,6 @@ def test_every_registered_app_has_a_name() -> None:
         ["gap", "--top", "5"],
         ["weak", "--top", "3"],
         ["stats", "--days", "7"],
-        ["tailor", "brief", "1"],
         ["job", "add", "https://example.com/job/1"],
         ["apply", "3=applied", "7=replied"],
     ],

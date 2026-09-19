@@ -6,6 +6,114 @@
 
 ---
 
+## P5 —— AI 定制简历 + FidelityGuard
+
+**状态**：✅ 开发完成 → 待按流程提交平台，**等待复验**
+**测试**：`pytest tests/` **683 passed / 0 failed**（含 `tests/verify/`，24 xfailed 是验证会话已登记的 🟡/🟢）
+　　　　本阶段新增 **51 条**自测：`tests/unit/test_tailor_svc.py`（41）+ `test_tailor_cli.py`（10）
+　　　　`pytest -m live tests/unit/test_tailor_live.py` 单独跑（默认排除，**不进 CI**）
+**阶段标记**：`jh --version` = `phase P5`
+**契约**：提示词 7（plan 737-784）+ 模块③（plan 331-356）
+
+### 1. 做了什么（六个子命令 + 一个代码闸门）
+
+| 命令 | 行为 |
+|---|---|
+| `jh tailor brief <job_id>` | ★ **不调模型**：重点讲哪 3 个项目（按与 JD 关键词的贴合度排序）/ 突出哪 2 个技能 / 要避开什么。零成本、可复现 |
+| `jh tailor analyze <job_id>` | 调模型出字段级建议 `{match_analysis, suggestions[]}`，**逐条过闸门**后落 `resume_versions` |
+| `jh tailor list [--job N]` | 历史版本（新→旧）：建议数 / 已批准数 / 导出文件 |
+| `jh tailor diff <version_id>` | 前后对比（原 → 改 + 理由 + 批准状态 + 当时的闸门报告） |
+| `jh tailor approve <version_id> …` | 逐条 / `--all` 批准；**批准前再校验一遍** |
+| `jh tailor export <job_id>` | 导出 docx（`--format md` 兜底）——**只写新文件**，并校验原简历 sha256 未变 |
+
+**FidelityGuard（`services/fidelity.py`，五项全部确定性、不依赖模型）**
+
+| kind | 拦什么 | 关键实现点 |
+|---|---|---|
+| `entity_not_in_resume` | 公司/学校名（专有名词） | 靠"专有名词后缀 + 逐字回退匹配"识别；**候选必须是某个已知机构名的前缀**（第一版直接判"是不是证据池子串"，被 `科技有限公司` 这种通用候选骗过去了，实测编造的"腾讯科技有限公司"溜过闸门） |
+| `skill_not_in_resume` | 技能词表命中的词 | **与 P4 的 `check_text` 共用同一段判定**（`_skill_violations`），`CAPABILITY_TERMS` 豁免（#30）必须一起生效，否则同一个词在两条路径上给出相反结论 |
+| `number_not_in_resume` | 凭空多出来的数字 | ★ **数字连同单位一起守恒**：简历写"300ms"不能支撑"提升 300%"（只比数字会漏掉最典型的一种夸大） |
+| `date_not_in_resume` | 新增/修改的年份、月份 | 归一化成 `y2026` / `ym2026-03`，`2026.03` 与 `2026年3月` 视为同一时间；只给年份不给月份的写法（"2026 年 3 月"）也拦 |
+| `too_long` | 改写变扩写 | 上限 `max(原文 × 1.5, 原文 + 30)` —— 绝对余量是为了救短句（4 个字的原文 150% 只有 6 个字） |
+
+**三处强制调用**（计划书硬要求）：`analyze`（生成）/ `approve`（再校验）/ `export`（逐条 + **整篇**两道）。
+**违规即拒绝写入**：生成阶段丢掉违规建议并**不写库**（整批被拦时不建版本记录）；
+approve / export 违规时**整批不动**（不做"跳过违规那条"的半成功）。
+
+### 2. 关键设计决定（都有测试守着）
+
+| 决定 | 为什么 |
+|---|---|
+| 提示词放 `prompts/tailor.md`，**版本号写在文件里**（`<!-- prompt-version: 2 -->`） | 缓存 key 必须含版本号；"改了文件忘了改常量"是必然会发生的 → 用**正文指纹测试**把口头纪律变成红灯 |
+| 提示词用 `string.Template`（`$var`）而不是 `str.format` | 提示词里必然有 JSON 示例（`{...}`），format 会把它们当占位符 |
+| `analyze` 没配 key / 模型输出不合法时**直接报错，不降级** | 开场白有确定性模板可用；字段级改写**没有诚实的模板**，硬造只会是假建议 → 指路 `jh tailor brief` |
+| 建议的 `original` 在简历里定位不到 → 丢掉并说明（不是当编造处理） | 那是"没法套用"，不是"说谎"。两类原因分开报，用户才知道该改什么 |
+| 导出按解析出的 `sections`（原文行）拼，而不是按结构化字段重建 | 重建会**静默丢掉**没被建模的小节（荣誉/自我评价/证书）→ 用户拿到"少了半页"的简历，这是这个功能最不能犯的错 |
+| 导出前自校验"原文件 hash 未变"，变了就中止 | 防的是**将来有人把实现改成就地修改**，不是防用户手滑 |
+| `--out` 指向已存在的文件 → 拒绝 | "永远只写新文件"这条红线不能有例外 |
+| `jh tailor approve 3 --all` 里的 `--all` 会被 Click 吞掉 → 自行捞回 | 与 P4.5 的 `jh apply` 同一个坑（可变位置参数吃后续选项），有专门的测试守着 |
+
+### 3. 真实 LLM 抽样（一次性验证，不是 CI 断言）
+
+用**全虚构**的假简历 + 假岗位跑真模型（`try anything/jh-tailor-live-probe.py`，临时库）：
+
+| 轮次 | 结果 |
+|---|---|
+| 提示词 v1 | 4 条建议全部过闸门；但第 3 条把"**参与**订单服务重构"改成了"**负责**……维护与迭代"——闸门不判语义升级 |
+| 提示词 v2（加"程度守恒"规则 + 对应反例） | 5 条建议全部过闸门；同一条建议改成"参与订单服务重构，涉及后端接口的开发与维护"，理由里明确写了"「参与」程度词保留不变" |
+
+**这一条不是"模型很听话"的证明**，而是"提示词能改、闸门能兜"的证据；
+真正的结论在下面"已知边界"第 1 条。
+
+### 4. 那两条因此失效的用例
+
+| 用例 | 归属 | 处理 |
+|---|---|---|
+| `tests/unit/test_cli_skeleton.py::…[invocation11]`（`tailor brief 1` 应报占位） | **我自己的** | 已把 `tailor brief` 移出占位清单（并注明"移出必须由功能测试接手"） |
+| `tests/verify/test_v_checklist12.py::test_unimplemented_features_report_honestly[argv1-定制简历]` | **验证会话的** | ⚠️ **我没有动它**。这条现在会红，请验证会话按老规矩把它移出占位清单（P4.5 时的同样情形见上文 §4） |
+
+### 5. 已知边界 / 未覆盖的地方（请重点看这几条）
+
+1. **程度词的语义升级（参与 → 负责、了解 → 熟练）闸门不判**，只靠提示词约束 + 人工逐条审核。
+   语义蕴含判定是另一个量级的问题（硬做只会做出一个天天误报、最后被关掉的检查），
+   已写进 `fidelity` 模块 docstring 的"刻意不做"。**请把这条当成已知边界，而不是漏测。**
+2. **实体识别是启发式的**：没有后缀的写法（"在字节跳动实习"）抓不到；`_GENERIC_ACRONYMS`
+   里的通用缩写（API/REST/UI…）刻意放行。取舍是"宁可漏一个，也不要把真经历判成编造"。
+3. **`match_analysis` 里的分析文字不校验保真**（它是给我看的分析，不写进导出的文件）；
+   只有 `suggestions[].revised` 才算"写进简历的话"。
+4. **导出的是"解析出来的分段原文 + 已批准替换"**：如果简历解析时漏了内容，
+   导出文件同样会漏。`build_document` 会把"没能套用的已批准建议"列出来，但**不保证排版与原件一致**
+   （python-docx 新建文档 vs 原件的复杂排版）。
+5. **缓存命中时不重跑闸门**：`from_cache` 的文本上次已过闸门，而 approve / export 两处会再校验一次
+   （口径变严时兜得住）。
+6. `jh tailor export` 只处理**已批准**的建议；未批准的一律不写进文件（这是设计的核心，不是缺陷）。
+
+### 6. 建议重点验证的地方（verify hints）
+
+1. **恶意 fixture**：`tests/unit/test_tailor_svc.py::MALICIOUS_CASES` 的四条（Kubernetes / 300% /
+   10 个模块 / 2024 年）+ 实体 + 超长；再自己造几条（比如把"500ms"改成"5ms"、"2027"改成"2028"、
+   把"某某科技有限公司"换成"某某网络有限公司"）。
+2. **三处强制调用是否真的都在**：直接往库里塞一条含编造的建议（`approved_ids` 也写上），
+   然后 `approve` / `export` 各跑一次，断言都被拒且**没有文件产生**。
+3. **原文件 hash 不变**：跑 `jh tailor export`，对原 docx 做 sha256 前后对比。
+4. **真话不许被误报**：`TRUTHFUL_CASES` 里那几条（含"部署"这种通用实践词、真公司名、真学校名）。
+5. **`--out` 指向已存在文件必须拒绝**；`export` 未批准时必须报错并指路 `approve`。
+6. **提示词文件纪律**：改一行 `prompts/tailor.md` 的正文但不改版本号 → `test_prompt_version_matches_body_fingerprint` 必须红。
+
+### 7. 关键文件
+
+| 文件 | 职责 |
+|---|---|
+| `services/tailor_svc.py` | brief / analyze / approve / export 的全部业务逻辑 + 提示词加载（含版本指纹） |
+| `services/fidelity.py` | ★ `FidelityGuard.check(original, generated)` + 五项确定性检查；P4 的 `check_text` 与它共用技能判定 |
+| `cli/commands/tailor_cmd.py` | 六个子命令的渲染与退出码；`_pull_all_out_of_tokens` 修 Click 吞选项 |
+| `utils/docx.py` | 新增 `DocLine` / `write_docx` / `write_markdown`（**只写新文件**） |
+| `prompts/tailor.md` | 七要素系统提示词（v2），硬约束写死 |
+| `config/settings.py` | 新增 `TailorSettings`（长度比例 / 绝对余量 / 建议条数 / brief 条数） |
+| `tests/unit/test_tailor_live.py` | `@pytest.mark.live` 真模型抽样（默认排除；断言与内容无关，只问"路走不走得通"） |
+
+---
+
 ## P4.5 —— 零手打跟进（★ MVP 完成）
 
 **状态**：✅ 开发完成 → 已按流程提交（`start` + 交付声明第 1 轮），**等待复验**

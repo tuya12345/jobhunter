@@ -40,10 +40,19 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
-from jobhunter.utils.io import read_text
+from jobhunter.utils.io import read_text, write_text
 
-__all__ = ["DocxReadResult", "UnsupportedDocumentError", "read_document", "read_docx"]
+__all__ = [
+    "DocLine",
+    "DocxReadResult",
+    "UnsupportedDocumentError",
+    "lines_to_markdown",
+    "read_document",
+    "read_docx",
+    "write_docx",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -460,3 +469,92 @@ def _flatten_container(container: object) -> list[str]:
                 if cells:
                     lines.append(" | ".join(cells))
     return lines
+
+
+# ===========================================================================
+# 写出（P5 导出定制简历用）
+# ===========================================================================
+#: 我们只写这四种"行"。**刻意不做通用排版引擎**：
+#: 一条简历导出只需要"标题/小节/正文/条目"四种角色，
+#: 再多的样式（字号/颜色/分栏）只会让"导出的 docx 排版正常"这件事变得难验证。
+DocKind = Literal["title", "heading", "body", "bullet"]
+
+
+@dataclass(frozen=True)
+class DocLine:
+    """要写进文档的一行。"""
+
+    kind: DocKind
+    text: str
+
+
+def write_docx(path: str | Path, lines: list[DocLine]) -> Path:
+    """把 `DocLine` 列表写成一个**新**的 .docx。
+
+    ★ 为什么是"新建"而不是"改原文件"（P5 的合规红线之一）：
+      原简历是用户的资产，任何"就地修改"都可能在被拒绝的那一版里把原文弄坏。
+      导出永远是**另一个文件**，另有一道 hash 校验守着原文件没被动过。
+
+    Returns:
+        实际写出的路径。
+
+    Raises:
+        UnsupportedDocumentError: 没装 `[docx]` extra（给出安装命令，而不是 ImportError）。
+    """
+    target = Path(path)
+    try:
+        import docx
+        from docx.shared import Pt
+    except ImportError as exc:  # pragma: no cover - 取决于环境
+        raise UnsupportedDocumentError(
+            "导出 docx 需要 python-docx，但当前环境没装。\n"
+            "  · 安装：uv sync --extra docx\n"
+            "  · 或者先用 --format md 导出 Markdown（不需要额外依赖）"
+        ) from exc
+
+    document = docx.Document()
+    # 正文字号：默认的 11pt 在中文简历里偏大，10.5pt（五号）更像正常简历
+    style = document.styles["Normal"]
+    style.font.size = Pt(10.5)
+
+    for line in lines:
+        text = (line.text or "").strip()
+        if not text:
+            continue
+        if line.kind == "title":
+            document.add_heading(text, level=0)
+        elif line.kind == "heading":
+            document.add_heading(text, level=1)
+        elif line.kind == "bullet":
+            # style="List Bullet" 是 python-docx 内置样式，Word/WPS 都能正确渲染
+            document.add_paragraph(text, style="List Bullet")
+        else:
+            document.add_paragraph(text)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    document.save(str(target))
+    return target
+
+
+def lines_to_markdown(lines: list[DocLine]) -> str:
+    """把同样的 `DocLine` 渲染成 Markdown（没装 docx extra 时的降级出口）。"""
+    out: list[str] = []
+    for line in lines:
+        text = (line.text or "").strip()
+        if not text:
+            continue
+        if line.kind == "title":
+            out.append(f"# {text}")
+        elif line.kind == "heading":
+            out.append(f"## {text}")
+        elif line.kind == "bullet":
+            out.append(f"- {text}")
+        else:
+            out.append(text)
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def write_markdown(path: str | Path, lines: list[DocLine]) -> Path:
+    """把 `DocLine` 列表写成 Markdown 文件（同样是**新文件**）。"""
+    return write_text(Path(path), lines_to_markdown(lines))

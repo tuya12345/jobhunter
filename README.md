@@ -168,13 +168,22 @@ jh apply 3=applied 7=replied    # ★ 批量打标：一次搞定一整轮
 jh apply "#12=replied"          # 按 job_id 打标（最不会认错，id 见 --pending）
 jh apply "字节" --status viewed  # ★ 模糊匹配公司/职位名；命中多条会列出来让你选
 jh apply --pending              # 看待处理清单：还没投的 + 投后 3/7/14 天没动静的
+
+# ⑧ 定制简历（P5）—— brief 不花钱；改写建议逐条审核，保真由代码强制
+jh tailor brief 1               # ★ 重点讲哪 3 个项目、突出哪 2 个技能、要避开什么（不调模型）
+jh tailor analyze 1             # 生成字段级改写建议（调模型；逐条过 FidelityGuard）
+jh tailor list                  # 看历史版本
+jh tailor diff 3                # 看某版建议的前后对比（原 → 改 + 理由）
+jh tailor approve 3 --all       # 逐条批准（approve 前会**再校验一遍**）
+jh tailor export 1              # 导出 docx（★ 只写新文件，原简历 hash 不变）
 ```
 
-**MVP 到此完成** —— 从零到能用的完整流程就是上面①~⑦：
+**MVP 到此完成** —— 从零到能用的完整流程就是上面①~⑧：
 
 ```
 jh init → jh resume add → jh job add <链接> → jh match run → jh gap
        → jh today → jh today --copy N → 去招聘 App 粘贴投递 → jh apply N=applied
+       → 想为某个岗位定制简历：jh tailor brief N → analyze N → approve → export
        → 之后每天随便敲任何一条 jh 命令，顶部都会告诉你"有几条该跟进了"
 ```
 
@@ -199,8 +208,34 @@ jh init → jh resume add → jh job add <链接> → jh match run → jh gap
 > ★ 判不出来的维度（比如 JD 太短、一个技能词都没抽到）会把权重**让给**其余维度，
 > 而不是给 0 分；`jh match explain` 里会写明 `redistributed`。
 
-> 当前进度：**P0–P4.5 已完成（★ MVP 完成）**，其余命令仍是**占位**，
+> 当前进度：**P0–P5 已完成（★ MVP 完成）**，其余命令仍是**占位**，
 > 执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
+
+### 定制简历为什么"改了但不编"（P5 的 FidelityGuard）
+
+改写建议**只由模型提出、由代码判定、由人批准**：
+
+```
+模型：这条句子可以改得更好
+代码：这个改法有没有编造？（FidelityGuard.check(原文, 改写)）
+人：  逐条点头（jh tailor approve）
+```
+
+五项检查全部是**确定性的**（不依赖模型，`300%` / `10个模块` / `2024年` / `Kubernetes` 都拦得住）：
+
+| 检查项 | 拦什么 |
+|---|---|
+| 命名实体白名单 | 生成文本里的公司/学校名必须在原简历出现过 |
+| 数字守恒 | 数字**连同单位**要有出处（"从 300ms 降到 80ms"不许改成"提升 300%"）；"3 个模块 → 10 个模块"直接拦 |
+| 时间守恒 | 年份/月份不许新增或修改（`2026.03` 不能变成 `2026 年 3 月-至今`） |
+| 技能词表 | 简历技能表 + `learning_whitelist`（带"在学习"标注）之外的技能词不许出现 |
+| 长度上限 | 改写不是扩写（默认不超过原文 150%，短句另有绝对余量） |
+
+**在【生成】【approve】【export】三处强制调用**，违规即拒绝写入并说明原因；
+被测住的是**恶意 fixture**（手写一段编造文本断言被拦），
+不是"调真实 LLM 再断言它没编"——后者测的是模型心情，只会变成 flaky 测试被删掉。
+
+导出**永远写新文件**，并校验原简历的 sha256 未变 —— 原文件就是你的回滚点。
 
 ### 开场白为什么"沾边且不编造"
 

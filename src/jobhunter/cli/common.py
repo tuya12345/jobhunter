@@ -85,6 +85,8 @@ def not_implemented(feature: str, phase: str) -> NoReturn:
             f"　[green]jh gap[/green]（两级匹配 + 技能缺口）\n"
             f"　　　　　　　[green]jh today[/green]（待投清单 + 开场白）\n"
             f"　　　　　　　[green]jh apply[/green]（打标：单条 / 批量 / 模糊匹配 / --pending）\n"
+            f"　　　　　　　[green]jh tailor brief | analyze | approve | export[/green]"
+            f"（定制简历 + 保真闸门）\n"
             f"查看全部命令：[green]jh --help[/green]\n"
             f"实现计划：[green]docs/roadmap.md[/green]",
             title="🚧 未实现",

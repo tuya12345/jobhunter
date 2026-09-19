@@ -47,6 +47,7 @@ __all__ = [
     "GreetingSettings",
     "MatchWeights",
     "RateLimitSettings",
+    "TailorSettings",
     "get_settings",
     "load_settings",
     "reset_settings",
@@ -126,6 +127,36 @@ class GreetingSettings(BaseModel):
         return self
 
 
+class TailorSettings(BaseModel):
+    """AI 定制简历（P5）的硬约束。
+
+    ★ 为什么长度上限要有"绝对余量"（`length_floor_extra`）：
+      计划书写的是"不超过原文 150%"，但原句只有 4 个字时 150% 就是 6 个字 ——
+      任何通顺的改写都会超，这条检查会退化成"短句一律不许改"。
+      所以真正的上限是 `max(原文 × ratio, 原文 + floor_extra)`。
+      误报会让检查被人关掉，宁可留一点余量。
+
+    ★ `max_suggestions` 是**给模型的提示词参数**（不是代码截断）：
+      一次改 20 处以上，我就没耐心逐条审了；而"逐条审核"正是这个功能的安全边界。
+    """
+
+    max_length_ratio: float = Field(default=1.5, ge=1.0, le=5.0)
+    length_floor_extra: int = Field(default=30, ge=0, le=500)
+    max_suggestions: int = Field(default=12, ge=1, le=100)
+    #: `jh tailor brief` 重点讲几个项目 / 突出几个技能
+    brief_projects: int = Field(default=3, ge=1, le=10)
+    brief_skills: int = Field(default=2, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def _check_ratio(self) -> TailorSettings:
+        if self.max_length_ratio < 1.0:
+            raise ValueError(
+                f"tailor.max_length_ratio({self.max_length_ratio}) 不能小于 1.0："
+                "改写至少要允许和原文一样长"
+            )
+        return self
+
+
 class RateLimitSettings(BaseModel):
     """频率克制（合规红线之一）。
 
@@ -194,6 +225,9 @@ class AppSettings(BaseSettings):
     # ---- 开场白 -------------------------------------------------------------
     greeting_banned_words: list[str] = Field(default_factory=list)
     greeting: GreetingSettings = Field(default_factory=GreetingSettings)
+
+    # ---- 定制简历（P5）-----------------------------------------------------
+    tailor: TailorSettings = Field(default_factory=TailorSettings)
 
     # ---- 频率克制 -----------------------------------------------------------
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
@@ -459,6 +493,10 @@ def settings_snapshot(settings: AppSettings) -> dict[str, Any]:
             settings.greeting.full_max_chars,
             settings.greeting.short_max_chars,
         ),
+        "tailor_limits": {
+            "max_length_ratio": settings.tailor.max_length_ratio,
+            "max_suggestions": settings.tailor.max_suggestions,
+        },
         "llm_enabled": settings.llm_enabled,
         "config_file": str(settings.config_file) if settings.config_file else None,
     }
