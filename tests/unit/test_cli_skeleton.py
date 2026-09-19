@@ -87,9 +87,8 @@ EXPECTED_COMMANDS = (
 #     `interview list` / `question predict` / `assessment list` / `offer compare` / `cal export`
 #     → 分别由 test_p6_tracking.py（状态机/事件流/统计/时间轴/薄弱点/周报/追问）、
 #       test_assessment_offer.py、test_cal.py 覆盖。
-#   仍然留在名单里的只有 P7 的 `leads` 与 P9 的 `demo`。
+#   仍然留在名单里的只有 P7 的 `leads` —— P9 完成 `jh demo` 之后它也移出了。
 PLACEHOLDER_INVOCATIONS: list[list[str]] = [
-    ["demo"],
     ["leads", "export"],
 ]
 

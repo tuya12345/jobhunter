@@ -6,6 +6,96 @@
 
 ---
 
+## P9 —— 开源收尾 + 合规自检
+
+**状态**：✅ 开发完成 → 待按流程提交平台，**等待复验**
+**阶段标记**：`jh --version` = `phase P9`（P9 是收尾阶段，交付后主要版本标记为 `v0.1.0` tag）
+**契约**：提示词 11（plan 862-887）
+
+### 1. 做了什么
+
+| 交付物 | 内容 |
+|---|---|
+| `README.md` 定稿 | 新增**功能一览表**（按阶段列命令）、**`jh demo` 真实终端输出**（替代截图/GIF）、**文档索引**、**常见问题速查表**；安装章补三条实测坑（见 §3）；路线图更新到 P0–P6 + P9 |
+| `docs/install.md`（新，781 行） | 安装与第一次运行：uv / venv 两条路、extras 表、逐步真实输出、数据落在哪、**15 条常见问题**、卸载清理、模拟器（**明确标注 P7 尚未实现**） |
+| `docs/config.md`（新，692 行） | `config.yaml` + `.env` **逐字段说明**（27 个 `AppSettings` 字段 + 15 个嵌套子字段全覆），每条含"默认值/校验/⚠️写错会怎样"，另有 27 行字段索引表可核对覆盖率 |
+| `docs/COMPLIANCE.md`（新） | ⭐ 合规与隐私自检：自动化操作面逐条判定、必须人工的动作、`.gitignore` 覆盖、全仓库扫描、**git 历史痕迹**、频率控制、依赖与迁移、导出安全、复跑命令 |
+| `jh demo`（P9 核心代码） | 11 步全流程演示（建库→录入→匹配→清单+开场白→打标→面试准备→复盘→导出），**临时库 + 假 Provider**，退出即销毁；`--keep` 保留 |
+| `LICENSE` | MIT + 附加说明（不提供自动投递、不绕风控、使用者自担风险）——P8 前就已存在，本轮核对 |
+| CI 覆盖率 | `pytest --cov --cov-fail-under=80`（当前 **84%**）+ 上传 `coverage.xml` 产物 |
+| tag | `v0.1.0`（annotated，说明含哪些阶段、哪些没做） |
+
+### 2. `jh demo` 的三条纪律（都写了测试）
+
+1. **绝不碰真库**：把 `JH_DATA_DIR/OUTPUT_DIR/STATE_DIR` 指到临时目录，并**断言**
+   库路径真的变了且落在临时目录里。测试用三条独立断言钉死：跑完**配置里那个库文件根本不存在**、
+   期间**没有任何真实 Provider 被调用**（monkeypatch 成会炸的实现）、跑完配置被还原。
+2. **绝不联网/花钱**：`JH_LLM_PROVIDER=mock` + `MockProvider`；即使环境里配了真 key 也走假 Provider。
+3. **输出即自证**：每步打印"做了什么 + 关键数字"，README 里直接贴真实输出（不造假截图）。
+
+### 3. 子代理复查揪出的 4 个真问题（都已修/已改文档）
+
+| # | 问题 | 处理 |
+|---|---|---|
+| 1 | **`jh demo` 在用户预设过 `JH_DATA_DIR` 时会崩**：`_restore` 一律 `pop` 环境变量，把用户自己的配置弄丢了 → 结尾报"还原失败：配置单例还指着演示库" | ✅ 改成"记下原值、原样放回"，并加了一条回归用例（`test_demo_keeps_user_preset_data_dirs`） |
+| 2 | README 方式二的 `pip install -e ".[dev]"` **不装任何开发工具**（`dev` 是 PEP 735 依赖组，不是 extra；pip 只发一句 WARNING） | ✅ README 改成 `pip install -e .` + `pip install pytest ruff mypy`，并写明原因 |
+| 3 | README 说 `--extra llm` 是"调用 DeepSeek 需要的" —— 实际 `src/` 里没有 `import openai`（Provider 是 httpx 手写的） | ✅ README 与 `pyproject.toml` 注释都改成"当前运行期用不到，保留给将来换 SDK" |
+| 4 | `.env.example` 把 `JH_LOG_LEVEL` 当 `.env` 开关；但日志模块直接读 `os.environ`，而 pydantic-settings **不会**把 `.env` 写进 `os.environ` → 写了没反应 | ✅ `.env.example` 与 `config.md` 都写明"必须是真的环境变量，或用 `jh -v/--verbose`" |
+
+另外修正两处注释与实现不一致（都只是注释）：`settings.py` 说 `jh resume split` 用
+`default_resume_path`（实际用库里 `resumes.is_default`）；`resume_svc.py` 里举例用的
+"中点分隔"写法原来是真实简历的项目名（P9 隐私清理，见 §4）。
+
+### 4. 隐私：本轮清掉了什么、还剩什么
+
+- **工作区清掉 2 处真实项目名**（P1 时期留下）：`tests/unit/test_match_svc.py` 的夹具名、
+  `tests/unit/test_resume_svc.py` 的 docstring（**逐字引用**了真实项目标题行）、
+  以及 `resume_svc.py` 注释里的同一个名字 —— 全部换成同形状的虚构写法。
+  验证方式：从本机 gitignored 来源取真实标识、回扫全仓库（脚本在仓库外，见 COMPLIANCE §7）。
+- **⚠️ git 历史里仍有真实姓名**：22 个提交 / 2 个文件 + 2 条提交信息；
+  真实项目名另有 26 / 16 个提交。**这是 #47，需要用户决策**（`git filter-repo` 重写 vs 接受），
+  命令已写进 `COMPLIANCE.md` §4。**发布（公开仓库）之前必须定。**
+- 其余扫描命中全部是**占位样例/误报**（脱敏过滤器的测试数据、`uv.lock` 里的哈希数字串、
+  文档里的 `example.com`），逐条判定见 `COMPLIANCE.md` §3.3。
+
+### 5. 已知边界
+
+1. **P7 未实现**：`jh leads *` 仍是占位；`docs/install.md` §9 与 `COMPLIANCE.md` §8 都明确标注，
+   README 也不声称"支持 App 线索采集"。
+2. **`.ics` 覆盖同名文件**是唯一偏离"只写新文件"的地方（幂等快照，理由见 `COMPLIANCE.md` §5.4）。
+3. **覆盖率门槛 80% 是刻意的低门槛**：不追高（追覆盖率会催生"为覆盖率而写"的测试），
+   当前 84%，掉下来会红。
+4. 三个字段在当前代码里**没有消费者**（子代理发现并写进 `config.md`）：
+   `match_dimensions`、`keywords`（除校验外）、`rate_limit.max_pages`（只作为 `search()` 形参存在）。
+   文档按"改它不会影响任何分数/抓取"据实说明 —— 这属于**配置项比实现更超前**，不是 bug。
+5. **`git filter-repo` 我没跑**：它改写历史、需要用户明确授权（见 §4）。
+
+### 6. 建议重点验证的地方
+
+1. **`jh demo` 的隔离**：在自己机器上先 `echo $env:JH_DATA_DIR` 记住值 → 跑 `jh demo` →
+   断言 ①真实库文件没被动过（mtime/hash）②环境变量回到原值 ③临时目录已删除（不加 `--keep`）。
+   ★ 顺手试一下"预设 `JH_DATA_DIR` 再跑 demo"这条（就是我修的那个 bug）。
+2. **`jh demo --keep`**：保留目录里应当有 `data/jobhunter.db` 与 `output/report-*.md`；
+   再跑一次 demo（不加 `--keep`）不应影响它。
+3. **文档与代码一致性**：抽 5 条 `config.md` 的"⚠️ 写错会怎样"，真的改一下 `config.yaml` 看报错是否如文档所说
+   （校验器在 `settings.py`，报错文案应当完全一致）。
+4. **`install.md` 的命令**：按文档从零走一遍（新 clone + uv 路径），看能否一次跑通 `jh demo`。
+5. **覆盖率门槛**：`pytest --cov=jobhunter --cov-fail-under=80` 应通过（当前 84%）；CI 里还多一步上传产物。
+6. **COMPLIANCE.md 的可复跑性**：按它的 §7 跑两个脚本，看结论是否与文档一致
+   （尤其"工作区 0 命中真实标识"这条）。
+
+### 7. 关键文件
+
+| 文件 | 职责 |
+|---|---|
+| `cli/commands/demo_cmd.py` | ⭐ `jh demo`：11 步演示 + 环境隔离（含"记下原值再放回"） |
+| `docs/COMPLIANCE.md` | ⭐ 合规与隐私自检（含"发布前必须决策"的历史痕迹） |
+| `docs/install.md` / `docs/config.md` | 安装教程 / 配置逐字段说明 |
+| `tests/unit/test_demo.py` | 8 条：全流程跑通 + **绝不碰真库**（3 条独立断言）+ 预设环境变量回归 |
+| `.github/workflows/ci.yml` | 覆盖率门槛 + 产物上传 |
+
+---
+
 ## P6 —— 完整跟进体系（看板 + 面试 + 问题 + 笔试/Offer + 统计 + 报告 + 日历）
 
 **状态**：✅ 开发完成 → 待按流程提交平台，**等待复验**

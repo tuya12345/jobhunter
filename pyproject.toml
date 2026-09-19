@@ -37,7 +37,9 @@ dependencies = [
 browser = ["playwright>=1.45"]
 # --extra docx：只有 P1 解析简历 / P5 导出简历才需要
 docx = ["python-docx>=1.1"]
-# --extra llm：DeepSeek 走 OpenAI 兼容协议，所以直接用 openai SDK
+# --extra llm：★ 当前**运行期用不到**（P9 复查结论）：DeepSeek 是用 httpx 手写的，
+# 而 httpx 属主依赖；`import openai` 在 src/ 里一处都没有。保留这个 extra 只是给
+# "将来换官方 SDK"留个位置，README 已写明"不用装它也能跑 LLM 精评"。
 llm = ["openai>=1.30"]
 # --extra emulator：P7 的"技术验证"才用。★ 钉死版本：uiautomator2 上游改动频繁，
 # 不钉版本会导致半年前能跑的脚本突然失灵，而这种环境问题最难排查。

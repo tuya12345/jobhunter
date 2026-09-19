@@ -25,8 +25,10 @@ def make_resume(**overrides: Any) -> ResumeContent:
         ],
         "skills": ["Python", "LangChain", "RAG", "FastAPI", "MySQL", "JavaScript"],
         "projects": [
+            # ★ 项目名刻意用**完全虚构**的占位（P9 隐私自检时把原来的名字换掉了：
+            #   它来自真实简历，而"任何来源是真实简历的文本都不进仓库"是硬规矩）
             ProjectItem(
-                name="AI Agent 全栈学习平台",
+                name="某某学习平台",
                 role="全栈",
                 period="2025.03 - 2025.09",
                 bullets=["用 LangChain + RAG 做了一个问答助手"],

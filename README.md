@@ -47,6 +47,67 @@
 
 ---
 
+## 功能一览
+
+| 阶段 | 能力 | 命令 |
+|---|---|---|
+| P1 | 简历导入解析（docx/txt，含文本框与表格）+ 按方向拆分 | `jh resume add / list / split` |
+| P2 | 岗位录入（**人给链接** → 抓详情 → 两层去重） | `jh job add <url｜--file｜--manual｜--html>` |
+| P3 | **两级匹配**（规则粗筛 + LLM 精评）+ 反向技能缺口 | `jh match run / explain / set`、`jh gap` |
+| P4 | 今日待投清单 + 开场白（完整/精简）+ 导出 | `jh today [--copy N｜--check｜--export md]` |
+| P4.5 | **零手打跟进**：批量打标 / 模糊匹配 / 顶部固定提醒 | `jh apply 3=applied 7=replied`、`jh apply --pending` |
+| P5 | **AI 定制简历** + `FidelityGuard`（代码强制不编造） | `jh tailor brief / analyze / approve / export` |
+| P6 | 看板时间轴 / 面试 / 问题记录 / 笔试 / Offer 比较 / 转化率 / 周报 / 日历 | `jh interview · question · weak · assessment · offer · followup · stats · report · cal` |
+| **P9** | **`jh demo`（离线假数据全流程）+ 合规自检** | `jh demo`、[COMPLIANCE.md](docs/COMPLIANCE.md) |
+| P7 | App 线索（技术验证）—— **尚未实现**，`jh leads *` 仍是占位 | — |
+| P8 | Web 界面 —— 移出主线 | — |
+
+### 先看演示（不需要 API Key、不需要真去投简历）
+
+```bash
+jh demo            # 全部数据都是假的，库建在临时目录，退出即销毁
+jh demo --keep     # 想自己翻着看就保留下来
+```
+
+真实运行输出（节选，`jh demo` 一次跑完 ①~⑪ 全流程）：
+
+```text
+① 建库：sqlite:///C:/Users/.../Temp/jh-demo-xxxx/data/jobhunter.db
+   （临时目录，退出即销毁；真实库一个字节都没动）
+③ 两级匹配（规则层，本地计算，不花钱）
+    66 分　甲公司 · Python 后端开发实习生　(Python 开发)
+    41 分　丙公司 · 大模型应用开发实习生　(AI Agent)
+    30 分　戊公司 · Java 后端开发（3-5 年）　(Python 开发)
+④ 今日待投清单（取分数最高的 2 条）
+   #1　66 分　甲公司 · Python 后端开发实习生　134 字开场白
+      您好，我是 Python 后端方向的应届生。看到岗位要求 Python 与 FastAPI，……
+⑤ 打标跟进（每次状态变更都会写入 append-only 事件流）
+   甲公司 · Python 后端开发实习生 → offer
+   乙公司 · 后端开发工程师（校招） → rejected
+⑦ 薄弱点（按「没答上来次数」排序，实录与预测分列）
+   Redis 缓存　没答上来 1/2　🔴 最先补：反复答不上来
+⑧ 转化率（样本量很小（6 条）——分组之间的差异基本是噪声，别据此下结论）
+   投递 6　已读率 66.7%（4/6）　回复率 50.0%（3/6）　约面率 33.3%（2/6）
+⑪ 周报与产物   已写出：…/Temp/jh-demo-xxxx/output/report-20260919.md
+```
+
+> 这个工具是**纯 CLI**，所以这里用的是**真实终端输出**而不是截图/GIF
+> （造一张假截图比贴真输出更容易骗人）。想自己看全量输出：`jh demo`。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/install.md](docs/install.md) | 安装与第一次运行、常见问题、数据落在哪 |
+| [docs/config.md](docs/config.md) | **config.yaml 与 .env 逐字段说明**（含"写错了会怎样"） |
+| [docs/COMPLIANCE.md](docs/COMPLIANCE.md) | ★ 合规与隐私自检（自动化边界 / 频率控制 / PII 扫描 / 历史痕迹） |
+| [docs/architecture.md](docs/architecture.md) | 分层、目录结构、关键设计取舍 |
+| [docs/data_model.md](docs/data_model.md) | 11 张表 + 迁移说明 |
+| [docs/STATUS.md](docs/STATUS.md) | 分阶段交付说明（做了什么 / 已知边界 / 建议验证点） |
+| [docs/roadmap.md](docs/roadmap.md) | 完整路线图与阶段验收标准 |
+
+---
+
 ## 安装
 
 ### 方式一：uv（推荐，可复现）
@@ -67,9 +128,16 @@ uv run jh --help        # 验证 CLI 可用
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 # source .venv/bin/activate     # macOS / Linux
-pip install -e ".[dev]"
+pip install -e .
+pip install pytest ruff mypy    # ★ 开发工具要单独装，见下面的说明
 jh --help
 ```
+
+> ⚠️ **别写 `pip install -e ".[dev]"`**（P9 实测）：`dev` 是 **PEP 735 依赖组**
+> （`[dependency-groups]`），不是 optional extra。pip 只会打一句
+> `WARNING: jobhunter 0.1.0 does not provide the extra 'dev'` 然后**什么都不装** ——
+> 基础安装是成功的，但 pytest/ruff 一个都没有，之后 `pytest` 会报 command not found。
+> 想要一步到位就用**方式一（uv）**：`uv sync` 会把 dev 组一起装上。
 
 ### 可选依赖（按需装，主依赖保持干净）
 
@@ -77,8 +145,15 @@ jh --help
 |---|---|---|
 | `uv sync --extra browser` | Playwright 抓岗位详情 | P2 |
 | `uv sync --extra docx` | 解析/导出 Word 简历 | P1 / P5 |
-| `uv sync --extra llm` | 调用 DeepSeek | P3+ |
-| `uv sync --extra emulator` | 安卓模拟器抓屏（技术验证） | P7 |
+| `uv sync --extra emulator` | 安卓模拟器抓屏（技术验证） | P7（**尚未实现**） |
+
+> ★ **没有 `llm` extra 要装**：DeepSeek 是用 `httpx` 手写的（`httpx` 是主依赖），
+> 不需要任何额外包就能跑 LLM 精评。（`pyproject.toml` 里保留了一个 `[llm]` extra，
+> 但当前代码路径用不到它，留着是为了将来换 SDK 时有个位置。）
+>
+> ⚠️ **`uv sync` 会卸掉没写进命令行的 extra**（实测：裸 `uv sync` 会把 `python-docx` 卸掉）。
+> 日常用 `uv run jh …` 不会触发这件事；只有你又跑了一次裸 `uv sync` 才会。
+> 所以习惯是：`uv sync --extra docx` 之后一律用 `uv run`。
 
 装完可选依赖后，还需要下载浏览器内核：
 
@@ -313,12 +388,33 @@ jh init → jh resume add → jh job add <链接> → jh match run → jh gap
 | **P3** | ⭐ 共享层 + 两级匹配 + `jh match explain` + `jh gap` 反向缺口分析 | ✅ |
 | **P4** | ⭐ 待投清单 + 额度 + 开场白（完整/精简 + 防编造）+ 导出 + 投递打标 | ✅ |
 | **P4.5** | ⭐ 零手打跟进（批量打标 + 模糊匹配 + 顶部固定提醒）→ **★ MVP 完成** | ✅ |
-| P5 | AI 定制简历（先 `tailor brief`，再完整版 + **FidelityGuard**） | ⬜ 下一步 |
-| P5 | AI 定制简历（先 `tailor brief`，再完整版 + **FidelityGuard**） | ⬜ |
-| P6 | 看板 + 面试 + 问题记录 + 笔试/Offer + 统计 + 报告 + `.ics` | ⬜ |
-| P7 | App 线索（降级为技术验证：1 平台 + `probe` + 手动抓屏） | ⬜ |
+| **P5** | AI 定制简历（`tailor brief` → 完整版 + **FidelityGuard** 代码强制不编造） | ✅ |
+| **P6** | 看板时间轴 + 面试 + 问题记录 + 笔试/Offer + 统计 + 周报 + `.ics` | ✅ |
+| **P9** | 开源收尾（README 定稿 / `jh demo` 独立库 / LICENSE / **COMPLIANCE.md** / CI coverage / tag） | ✅ |
+| P7 | App 线索（降级为技术验证：1 平台 + `probe` + 手动抓屏）—— **尚未实现，`jh leads *` 是占位** | ⬜ |
 | P8 | Web 界面（移出主线，可延后） | ⬜ |
-| P9 | 开源收尾（README 定稿 / demo 独立库 / LICENSE / COMPLIANCE） | ⬜ |
+
+> **当前状态**：P0–P6 + P9 已完成（`jh --version` 会打印阶段标记）。
+> 剩下的 `jh leads`（P7）是**技术验证性质**的可选项；它未实现之前，README 与
+> `docs/COMPLIANCE.md` 都不会声称"支持 App 线索采集"。
+
+---
+
+## 常见问题（速查）
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| `jh: command not found` | 没激活虚拟环境 / 没装 | 见 [docs/install.md](docs/install.md) 第 1–2 节 |
+| 命令跑了但"未配置 LLM" | `.env` 里没填 `DEEPSEEK_API_KEY`（或不在当前工作目录） | **这是设计行为**：只用规则分，功能照常。填 Key 见 [docs/config.md](docs/config.md) §7 |
+| Windows 中文乱码 | 裸 `open()` 用了 cp936 | 仓库已强制 UTF-8；自己写脚本时显式 `encoding="utf-8"` |
+| 数据库没初始化 | 还没跑过 `jh init` | `jh init`（幂等，可重复跑） |
+| 想让别人看效果但没 Key | —— | `jh demo`（离线假数据，不花钱、不碰真库） |
+| 定位不到库 / 想把库搬到别的盘 | 路径解析 | 设 `JH_DATA_DIR`（见 [docs/config.md](docs/config.md) §8） |
+| 简历是 `.doc` / `.pdf` | 不支持解析 | 用 Word 另存为 `.docx`，或复制成 `.txt` |
+| 导出 docx 报缺 python-docx | 没装 `[docx]` extra | `uv sync --extra docx`，或 `--format md` |
+| 担心隐私 / 是否违规 | —— | 见 [docs/COMPLIANCE.md](docs/COMPLIANCE.md)（含实测扫描结果） |
+
+更多（含 8 条以上）见 [docs/install.md](docs/install.md#常见问题)。
 
 ---
 

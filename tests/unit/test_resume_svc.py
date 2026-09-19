@@ -222,10 +222,14 @@ def test_project_names_are_clean(content: resume_svc.ResumeContent) -> None:
 def test_project_bullets_exclude_pure_metadata(content: resume_svc.ResumeContent) -> None:
     """★ 每条描述必须是**实质内容**，不能是"AI 协同开发"这种元信息碎片。
 
-    实测来历：真实简历的标题行是
-        `AgentFlow · 可视化 AI 流水线编排平台（个人项目 · AI 协同开发，2026.08）`
-    抠掉时间段与角色词之后，残留的 `· AI 协同开发，` 曾被当成一条描述 ——
+    实测来历（P9 隐私自检时把真实标题换成了同形状的虚构示例）：
+    真实简历的项目标题行形如
+        `<项目名> · <一句话定位>（个人项目 · <协作方式>，YYYY.MM）`
+    抠掉时间段与角色词之后，残留的 `· <协作方式>，` 曾被当成一条描述 ——
     它既不是项目内容，也不该占一条 bullet，展示出来像解析错位了。
+
+    ⚠️ 这里**故意不引用真实标题原文**：那是真实简历的内容，
+       而"任何来源是真实简历的文本都不进仓库"是本项目的硬规矩（见 COMPLIANCE.md）。
     """
     for project in content.projects:
         for bullet in project.bullets:

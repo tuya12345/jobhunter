@@ -10,6 +10,9 @@
 #
 # 默认只跑确定性测试：pyproject 里 addopts 已带 -m 'not live and not emulator'，
 # 所以 CI 不依赖网络、不依赖模拟器 → 不会三天两头红灯。
+#
+# P9 加了什么：pytest 带覆盖率（`--cov-fail-under=80`，当前 84%）并把 coverage.xml
+# 作为产物上传。门槛刻意留有余量、且不追高 —— 理由写在那个 step 的注释里。
 # ============================================================================
 name: CI
 
@@ -65,8 +68,24 @@ jobs:
       - name: 确认 CLI 入口可用
         run: uv run jh --help
 
-      - name: pytest（默认排除 live / emulator）
-        run: uv run pytest -v
+      - name: pytest（默认排除 live / emulator）+ 覆盖率门槛
+        # ★ 覆盖率闸门（P9 加）：当前 **84%**，门槛设 80% —— 留一点余量给正常改动，
+        #   但真出现"整块功能没人测"时会红。
+        #   ⚠️ 刻意**不设 90/95** 这种高门槛：追覆盖率会催生"为覆盖率而写"的测试，
+        #      那种测试不验证行为、只在改实现时制造阻力（本项目已经有 800+ 条真断言）。
+        #   `--cov-report=term-missing` 会把没覆盖到的行号打出来，比一个数字有用得多。
+        run: >-
+          uv run pytest
+          --cov=jobhunter --cov-report=term-missing --cov-report=xml
+          --cov-fail-under=80
+
+      - name: 上传覆盖率报告（失败也传，方便查为什么掉下来）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage.xml
+          if-no-files-found: ignore
 
       - name: 报告 SQLite 版本（排查"外键/WAL 行为差异"时有用）
         # SQLite 版本会影响 PRAGMA 与 batch 迁移行为，出问题时第一个要看的就是它
