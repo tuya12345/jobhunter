@@ -101,6 +101,29 @@
 - 实现坑（记下来）：`greeting_corrected` 必须用**改字段之前**的快照判断 ——
   `set_status` 会先把 False 写进列，之后读就永远 False（实测：纠正生效了但提示打不出来）。
 
+### 7. 修复轮回执：#55（#24 的续集 —— 「形参加了但没人传」第三次）
+
+验证会话在复检里发现 #24**只修了一个调用点**：`compute_cache_key(prompt_fingerprint=…)`
+是**可选**参数，`match_llm_svc` 传了，另外四个（greeting / tailor / followup / question）
+一个都没传。后果在 greeting 上最直白：切 A/B 版本拿回上一版文案，而 `source` 仍显示
+`llm` —— 用户以为刚生成，其实一个字都没重算。
+
+**改法（不做第二个实现，只有一份算法）**
+
+| 位置 | 改了什么 |
+|---|---|
+| `llm/cache.py` | 新增 `payload_fingerprint(payload)`：对**整份 payload**（task / prompt_version / json_mode / temperature / max_tokens / 每条 role+content）取 sha256；`compute_cache_key` 的 docstring 明确"业务代码里不允许不传" |
+| `greeting_svc.py` / `tailor_svc.py` / `followup_svc.py` / `question_svc.py` | 一律**先拼 payload、再算 key**，传 `prompt_fingerprint=llm_cache.payload_fingerprint(payload)` |
+| `match_llm_svc.py` | 原来的 `_prompt_fingerprint` 保留同名（独立验证脚本直接调它），改为**薄封装**委托给共用实现 —— 算法不得有第二份 |
+| `followup_svc.py` | 顺带去掉"只有默认 days/style 才可缓存"的旧限制：key 现在覆盖全部输入，限制已无必要 |
+| `tests/unit/test_cache_key_guard.py` | ★ **结构守卫**：AST 扫 `src/`，任何不传 `prompt_fingerprint=` 的调用点直接红；另加元测试证明守卫会响、不会把注释/字符串误判、`**kwargs` 转发**不算**传了 |
+
+**读数**：`pytest tests/unit` = **711 passed**；验证会话的两条契约用例
+（`test_v_p4_greeting.py -k invalidated`：变体切换、表头变更）现在 **2 passed**；
+`pytest tests/verify` = 324 passed / **1 failed** —— 那一条是验证会话**故意**写的
+`assert "prompt_fingerprint=" not in greeting_svc`（注释里写明"#55 修好时这里会变红，
+请把它改成'必须传'"）。按分工我不动 `tests/verify/`，留给验证会话翻转。
+
 ---
 
 ## P9 —— 开源收尾 + 合规自检

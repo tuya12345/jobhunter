@@ -569,16 +569,29 @@ def generate_greeting(
             gate_keywords=jd_text_keywords,
         )
 
+    # ★★ 先把提示词拼出来，再用**它自己的指纹**算缓存 key（ISSUES #55）。
+    #   为什么必须这样：`variant`（with_project / without_project）、职位名、城市、
+    #   `settings.greeting.github_url`、禁用词、关键词集合 —— 这些**都会进提示词**，
+    #   但四个固定成分（prompt_version/model/jd_hash/resume_hash）一个都覆盖不到。
+    #   实测后果：切了 A/B 版本，模型被要求写"别提项目名"，返回的却是上一版那段
+    #   （`source` 还是 `llm`）—— 用户以为刚生成，其实一个字都没重算。
+    payload = build_payload(
+        job,
+        candidate,
+        keywords=keywords,
+        variant=variant,
+        settings=settings,
+    )
     cache_key = llm_cache.compute_cache_key(
         prompt_version=GREETING_PROMPT_VERSION,
         model=provider.model,
         jd_hash=job.jd_hash,
         resume_content_hash=candidate.content_hash,
         task="greeting",
+        prompt_fingerprint=llm_cache.payload_fingerprint(payload),
     )
     content = ""
     content_from_cache = False
-    payload: PromptPayload | None = None
     if session is not None and use_cache and cache_key:
         hit = llm_cache.get_cached(session, cache_key)
         if hit is not None:
@@ -586,9 +599,6 @@ def generate_greeting(
             content_from_cache = True
 
     if not content:
-        payload = build_payload(
-            job, candidate, keywords=keywords, variant=variant, settings=settings
-        )
         try:
             response = provider.complete(payload)
         except DeepSeekError as exc:
@@ -635,9 +645,10 @@ def generate_greeting(
         vocabulary=vocabulary,
         provider=provider,
         gate_keywords=jd_text_keywords,
-        # 命中缓存时没有本次的 payload → 不做修复调用（省一次钱；缓存里的文本
+        # 命中缓存时**没有本次的 payload**（#55 之后 payload 总是会拼出来，
+        # 但那次调用并没有真的发生）→ 不做修复调用（省一次钱；缓存里的文本
         # 上次已经过闸门，要么合格要么就是当时判定的结果）
-        previous_message=None if content_from_cache or payload is None else payload.messages[-1],
+        previous_message=None if content_from_cache else payload.messages[-1],
     )
 
 

@@ -657,12 +657,26 @@ def analyze(
             "  · 要用完整版：把 key 写进项目根的 .env"
         )
 
+    # ★ 先构造 payload，再算 key（ISSUES #55）。
+    #   关键词/matched/missing 都会进提示词，但不在 jd_hash 里 —— 只按 jd_hash 建 key
+    #   会出现"提示词变了、key 没变"，于是把上一份建议原样喂回去。
+    #   整份提示词取指纹后，key 与输入在结构上不可能不一致。
+    payload = build_payload(
+        job,
+        candidate,
+        keywords=list(result.jd_keywords),
+        matched=result.matched_keywords,
+        missing=result.missing_keywords,
+        prompt=prompt,
+        settings=settings,
+    )
     cache_key = llm_cache.compute_cache_key(
         prompt_version=prompt.version,
         model=provider.model,
         jd_hash=job.jd_hash,
         resume_content_hash=candidate.content_hash,
         task=TASK,
+        prompt_fingerprint=llm_cache.payload_fingerprint(payload),
     )
     content = ""
     from_cache = False
@@ -673,15 +687,6 @@ def analyze(
             from_cache = True
 
     if not content:
-        payload = build_payload(
-            job,
-            candidate,
-            keywords=list(result.jd_keywords),
-            matched=result.matched_keywords,
-            missing=result.missing_keywords,
-            prompt=prompt,
-            settings=settings,
-        )
         content = _complete_with_retry(provider, payload, settings)
         if cache_key and content:
             llm_cache.put_cached(

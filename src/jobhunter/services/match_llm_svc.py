@@ -44,7 +44,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 from collections.abc import Callable, Sequence
@@ -266,7 +265,7 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _prompt_fingerprint(payload: PromptPayload) -> str:
-    """对**真正送出去的提示词**取指纹，作为缓存 key 的第五个成分（ISSUES #24）。
+    """对**真正送出去的提示词**取指纹，作为缓存 key 的成分（ISSUES #24 / #55）。
 
     ★ 为什么是"整份提示词"而不是"逐字段枚举"：
 
@@ -277,14 +276,14 @@ def _prompt_fingerprint(payload: PromptPayload) -> str:
       取整份提示词的指纹之后，**"key 与输入不一致"在结构上不可能发生**：
       只要发给模型的字变了一个，key 就变。
 
-    ★ 为什么不用 `hash()`：Python 的字符串 hash 带进程级随机盐，
-      换个进程就算不出同一个值 —— 缓存必须跨进程稳定，所以用 sha256。
-
-    ★ 为什么把 role 也一起算进去：同一段文字放在 system 还是 user 里，
-      对模型的含义完全不同，属于"输入变了"。
+    ★ 实现已上移到 `llm/cache.py::payload_fingerprint()`（#55 时 greet/tailor/
+      followup/question 四个调用点也要用同一套算法）。这里保留同名薄封装，
+      原因是：① 它是对外可见的（独立验证脚本直接调它比对 key）；
+      ② 调用点那行 `prompt_fingerprint=_prompt_fingerprint(payload)` 已经是
+      结构守卫断言的对象 —— 换个名字等于把守卫悄悄作废。
+      算法只有一份，改算法只改 `cache.py`。
     """
-    raw = "\x00".join(f"{message.role}\x01{message.content}" for message in payload.messages)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return llm_cache.payload_fingerprint(payload)
 
 
 def _resume_digest(candidate: ResumeCandidate, rule_result: MatchResult | None) -> str:

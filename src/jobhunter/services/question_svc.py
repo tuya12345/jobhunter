@@ -329,18 +329,8 @@ def _model_content(
     ★ 抽出来的理由不只是"分支太多"：缓存与真调用这两条路径的**写入语义不同**
       （缓存要 commit 才算真的花了钱不白花），单独放一处才不会漏。
     """
-    cache_key = llm_cache.compute_cache_key(
-        prompt_version=prompt.version,
-        model=provider.model,
-        jd_hash=job.jd_hash,
-        resume_content_hash=candidate.content_hash,
-        task=TASK,
-    )
-    if use_cache and cache_key:
-        hit = llm_cache.get_cached(session, cache_key)
-        if hit is not None:
-            return hit.content, True
-
+    # ★★ 先把提示词拼出来，再用**它自己的指纹**算 key（ISSUES #24 / #55）：
+    #   职位名/城市/JD 关键词/简历要点都会进提示词，而四个固定成分覆盖不到它们。
     payload = predict_payload(
         job,
         candidate,
@@ -349,6 +339,19 @@ def _model_content(
         count=count,
         prompt=prompt,
     )
+    cache_key = llm_cache.compute_cache_key(
+        prompt_version=prompt.version,
+        model=provider.model,
+        jd_hash=job.jd_hash,
+        resume_content_hash=candidate.content_hash,
+        task=TASK,
+        prompt_fingerprint=llm_cache.payload_fingerprint(payload),
+    )
+    if use_cache and cache_key:
+        hit = llm_cache.get_cached(session, cache_key)
+        if hit is not None:
+            return hit.content, True
+
     try:
         response = provider.complete(payload)
     except DeepSeekError as exc:

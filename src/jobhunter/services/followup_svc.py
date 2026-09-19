@@ -327,18 +327,28 @@ def generate_followup(
         return result
 
     prompt = load_followup_prompt(settings)
+    # ★★ 先把提示词拼出来，再用**它自己的指纹**算 key（ISSUES #24 / #55）：
+    #   投了几天、风格、职位名、素材集合都会进提示词，而四个固定成分覆盖不到它们。
+    payload = build_payload(
+        job,
+        candidate,
+        days=real_days,
+        style=chosen_style,
+        material=material,
+        prompt=prompt,
+        settings=settings,
+    )
     cache_key = llm_cache.compute_cache_key(
         prompt_version=prompt.version,
         model=provider.model,
         jd_hash=job.jd_hash,
         resume_content_hash=candidate.content_hash,
         task=TASK,
+        prompt_fingerprint=llm_cache.payload_fingerprint(payload),
     )
-    # ★ 缓存 key 里要含"投了几天"与风格：它们会改变文案，
-    #   但 compute_cache_key 只认四个固定成分 —— 所以把这两个变量
-    #   拼进 jd_hash 的位置是错的（会污染 match 的 key 语义），
-    #   这里改成**只在两者都与默认一致时才用缓存**（保守但正确）。
-    cacheable = cache_key and days is None and chosen_style == FOLLOWUP_STYLES[0]
+    # ★ 指纹已经把"投了几天"与风格算进去了 —— 所以不再需要 #55 之前那种
+    #   "只在两者都是默认值时才敢用缓存"的保守限制（那是权宜之计，白白多花钱）。
+    cacheable = bool(cache_key)
     content = ""
     if use_cache and cacheable:
         hit = llm_cache.get_cached(session, cache_key)
@@ -346,15 +356,6 @@ def generate_followup(
             content = hit.content
 
     if not content:
-        payload = build_payload(
-            job,
-            candidate,
-            days=real_days,
-            style=chosen_style,
-            material=material,
-            prompt=prompt,
-            settings=settings,
-        )
         try:
             response = provider.complete(payload)
         except DeepSeekError as exc:

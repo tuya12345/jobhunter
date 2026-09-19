@@ -47,6 +47,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from jobhunter.llm.base import PromptPayload
 from jobhunter.models import LLMCache
 from jobhunter.utils.logging import get_logger
 
@@ -56,6 +57,7 @@ __all__ = [
     "CachedResponse",
     "compute_cache_key",
     "get_cached",
+    "payload_fingerprint",
     "put_cached",
 ]
 
@@ -71,6 +73,35 @@ class CachedResponse:
     cost: float | None = None
     #: 是否命中缓存（恒为 True；写上是为了让调用方的返回结构与 Provider 一致）
     from_cache: bool = True
+
+
+def payload_fingerprint(payload: PromptPayload) -> str:
+    """给**一份拼好的提示词**算指纹（缓存 key 的最后一块，ISSUES #24 / #55）。
+
+    ★ 为什么指纹要算"整份 payload"而不是逐个枚举字段：
+      #24（match）与 #55（greeting）是同一个根因的两次现身 ——
+      "进了提示词、但不在四个固定成分里"的东西总会有人忘。
+      枚举法要求每加一个字段就回来同步一次 key，**必然漏**（已经漏了两次）。
+      按整份内容算，就把这条纪律变成了**结构上不可能漏**：
+        改了任何影响提示词的东西 → 指纹变 → key 变 → 一定重新问模型。
+
+    ★ 为什么把 `json_mode` / `temperature` 也算进去：它们同样影响模型输出，
+      而"同一份文字换个温度"是调试提示词时最常做的动作之一；
+      不算进去就会出现"我调了温度但结果没变"的假象（真凶是缓存）。
+
+    ★ 代价（明确写下来）：改一处措辞会让该任务的历史缓存全部失效 ——
+      一场求职里这种失效折合几毛钱，而"拿到旧文案"会让人怀疑整个工具。
+    """
+    pieces = [
+        payload.task or "",
+        str(payload.prompt_version),
+        "json" if payload.json_mode else "text",
+        f"{payload.temperature:.3f}",
+        str(payload.max_tokens),
+    ]
+    pieces.extend(f"{message.role}\x1f{message.content}" for message in payload.messages)
+    raw = "\x1e".join(pieces)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def compute_cache_key(
@@ -96,17 +127,24 @@ def compute_cache_key(
       不加 task 就会**撞成同一条缓存** —— 开场白读到匹配的 JSON。
       为了不破坏已有调用点，它是可选参数：不传时行为与之前完全一致。
 
-    ★ `prompt_fingerprint` 参数（ISSUES #24 加）：**提示词本身**的指纹。
+    ★ `prompt_fingerprint` 参数（ISSUES #24 加，**#55 之后所有调用点都必须传**）：
 
       四个固定成分覆盖不了"进提示词但不在这四个里"的东西：规则层锚点
       （`rule_hint`，随 `match_weights` / `skill_aliases` 变）、JD 表头字段
-      （城市/经验/学历…）、可用简历名单。改了权重却命中旧缓存，
-      用户会看到"分数纹丝不动"并得出"调权重没用"的错误结论。
+      （城市/经验/学历…）、可用简历名单、开场白的 `variant`、
+      `greeting.github_url` / 禁用词……改了它们却命中旧缓存，
+      用户会看到"分数/文案纹丝不动"并得出"改了没用"的错误结论。
 
-      同样是**可选参数**，两种取值有明确语义：
-        · 传了指纹（推荐）→ key 覆盖整份提示词，输入变了就一定重算；
-        · 不传 → 保持原行为（四个成分），适用于"提示词完全由这四个成分决定"
-          的调用点，避免无谓地让既有缓存全部失效。
+      ★★ #55 的教训：它是**可选**参数，于是 #24 只接了 `match_llm_svc` 一个调用点，
+      另外四个（greeting / tailor / followup / question）全都漏了 ——
+      "形参加了但没人传"和 #37 是同一个形态。
+      现在：调用点一律传 `payload_fingerprint(payload)`，
+      并由 `tests/unit/test_cache_key_guard.py` 用 AST 守住"每个调用点都传了"
+      （漏传会让那条测试红，而不是安静地复用旧结果）。
+
+      ★ 本参数保留"可选"只是为了不破坏历史调用点与单测；
+      **业务代码里不允许不传**（守卫测试会拦）。
+      `task=None`（旧式调用）时不参与 key，行为与历史一致。
 
     分隔符用 `|` 而不是直接拼接：直接拼接时
     `("1", "23")` 和 `("12", "3")` 会撞成同一个 key（真实的哈希碰撞来源）。
