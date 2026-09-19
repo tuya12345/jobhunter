@@ -98,19 +98,23 @@ def apply_root(
         bool, typer.Option("--yes", "-y", help="模糊匹配到多条时不询问，全部应用")
     ] = False,
     sent: Annotated[
-        bool,
+        bool | None,
         typer.Option(
-            "--sent",
-            help="声明开场白**真的发出去了**（闭环字段 greeting_sent；生成 ≠ 发送）",
+            "--sent/--no-sent",
+            help=(
+                "声明开场白**真的发出去了**（闭环字段 greeting_sent；生成 ≠ 发送）。"
+                "★ 不给这个选项时：标为 applied 会**推定**话术已发（人点了投递按钮），"
+                "并在输出里说明；如那次其实没发话术，用 --no-sent 纠正"
+            ),
         ),
-    ] = False,
+    ] = None,
     edited: Annotated[
-        bool,
+        bool | None,
         typer.Option(
-            "--edited",
-            help="声明开场白**发之前我改过**（闭环字段 greeting_edited）",
+            "--edited/--no-edited",
+            help="声明开场白**发之前我改过**（闭环字段 greeting_edited）；--no-edited 可纠正推定",
         ),
-    ] = False,
+    ] = None,
 ) -> None:
     """零手打跟进入口（P4.5：批量 / 模糊匹配 / 待处理清单；P6：时间轴）。"""
     if timeline is not None:
@@ -453,7 +457,7 @@ def _mark_batch(pairs: list[str]) -> None:
 
 
 def _mark_by_keyword(
-    keyword: str, status: str, *, yes: bool, sent: bool = False, edited: bool = False
+    keyword: str, status: str, *, yes: bool, sent: bool | None = None, edited: bool | None = None
 ) -> None:
     """模糊匹配公司名/职位名，然后打标。
 
@@ -505,8 +509,8 @@ def _mark_by_keyword(
                         status,
                         source=f"jh apply {keyword!r}",
                         # ★ ISSUE #37：闭环字段只由**真实动作**置位（人给了 --sent/--edited）
-                        greeting_sent=True if sent else None,
-                        greeting_edited=True if edited else None,
+                        greeting_sent=sent,
+                        greeting_edited=edited,
                     )
                 except apply_svc.ApplicationError as exc:
                     # 状态非法之类的错误要给一句人话，而不是让 Python 堆栈冲出来
@@ -574,7 +578,9 @@ def _pull_options_out_of_tokens(
     return cleaned, found_status, found_yes
 
 
-def _mark_by_job_id(job_id: int, status: str, *, sent: bool = False, edited: bool = False) -> None:
+def _mark_by_job_id(
+    job_id: int, status: str, *, sent: bool | None = None, edited: bool | None = None
+) -> None:
     """按岗位 ID 打标（最直接、最不会打错的一种）。"""
     engine, factory = require_db()
     try:
@@ -585,8 +591,8 @@ def _mark_by_job_id(job_id: int, status: str, *, sent: bool = False, edited: boo
                     job_id,
                     status,
                     source=f"jh apply --job {job_id}",
-                    greeting_sent=True if sent else None,
-                    greeting_edited=True if edited else None,
+                    greeting_sent=sent,
+                    greeting_edited=edited,
                 )
             except apply_svc.ApplicationError as exc:
                 err_console.print(f"[red]{exc}[/red]")
@@ -597,7 +603,9 @@ def _mark_by_job_id(job_id: int, status: str, *, sent: bool = False, edited: boo
     _report(result, status)
 
 
-def _mark_by_index(index: int, status: str, *, sent: bool = False, edited: bool = False) -> None:
+def _mark_by_index(
+    index: int, status: str, *, sent: bool | None = None, edited: bool | None = None
+) -> None:
     """按 `jh today` 的序号打标。
 
     ★ 序号走 `today_svc.resolve_index()`：优先用**今天的清单快照**，
@@ -625,8 +633,8 @@ def _mark_by_index(index: int, status: str, *, sent: bool = False, edited: bool 
                     source=f"jh apply {index}={status}",
                     # ★ ISSUE #37：--sent / --edited 是**人声明的事实**，
                     #   生成 ≠ 发送（不传时保持"未发送"）
-                    greeting_sent=True if sent else None,
-                    greeting_edited=True if edited else None,
+                    greeting_sent=sent,
+                    greeting_edited=edited,
                 )
             except apply_svc.ApplicationError as exc:
                 err_console.print(f"[red]{exc}[/red]")
@@ -648,6 +656,10 @@ def _report(result: apply_svc.ApplyResult, status: str) -> None:
     """统一的打标结果输出。"""
     if not result.changed:
         warn(f"岗位 #{result.job_id} 本来就是 {status}，没有改动（也没有重复写事件）")
+        # ★ 状态没变、但闭环字段被纠正了 —— 这件事必须说出来（ISSUES #37）：
+        #   否则用户只看到"没有改动"，不知道 `--no-sent` 到底生效没有。
+        if result.greeting_corrected:
+            warn("已按 `--no-sent` 把「开场白已发出」改回 False（之前那次是推定，现在纠正了）")
         return
     success(f"岗位 #{result.job_id}：{result.from_status} → [bold]{result.to_status}[/bold]")
     if result.to_status == apply_svc.SKIP_TOKEN:
@@ -660,5 +672,18 @@ def _report(result: apply_svc.ApplyResult, status: str) -> None:
     if status == "applied":
         console.print(
             "  [dim]已记进 applications 并写了一条事件（时间轴与日额度都从它聚合）。[/dim]"
+        )
+    # ★ 推定必须**说出来**（ISSUES #37 的收尾）：标 applied 时如果这条投递已有开场白，
+    #   服务层会推定"话术确实发出去了"并置 greeting_sent —— 那是个**推定**，不是事实。
+    #   不说出来的话，用户会在统计里看到一个自己没做过的动作（本项目最反对的静默失真）。
+    if result.greeting_inferred:
+        warn(
+            "已推定「开场白已发出」（greeting_sent=True）—— 依据是这条投递有开场白、"
+            "而你把状态标成了已投"
+        )
+        console.print(
+            f"  [dim]如果这次其实没发话术："
+            f"[green]jh apply --job {result.job_id} --status applied --no-sent[/green] 纠正"
+            "（工具只在人给 --sent 时才确信，其余情况都是推定并说明）[/dim]"
         )
     console.print("  [dim]可用状态：" + "、".join(APPLICATION_STATUSES) + "[/dim]")

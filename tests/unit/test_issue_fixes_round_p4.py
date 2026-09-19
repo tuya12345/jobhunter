@@ -689,3 +689,46 @@ def test_seed_helper_still_scores_jobs(session, settings) -> None:
     session.flush()
     assert all(job.match_score is not None for job in jobs)
     assert all(job.jd_keywords_json for job in jobs)
+
+
+def test_cli_applied_says_it_inferred_greeting_sent(session, settings) -> None:
+    """★ 推定必须**在终端里说出来**（ISSUES #37 的收尾，主会话补）。
+
+    服务层在"有开场白 + 标 applied"时会推定"话术已发出"。那是个**推定**，不是事实 ——
+    不说出来的话，用户会在统计里看到一个自己没做过的动作（本项目最反对的静默失真）。
+    这条守住三件事：① 推定确实发生；② 终端打出了提示；③ 提示里给出纠正命令。
+    """
+    job, application = _pending_with_greeting(session, settings)
+    session.commit()
+
+    result = runner.invoke(
+        app, ["--no-remind", "apply", "--job", str(job.id), "--status", "applied"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "已推定" in result.output, f"推定没有告诉用户：\n{result.output}"
+    assert "--no-sent" in result.output, "提示里要给纠正命令，否则用户没法改回来"
+
+    session.expire_all()
+    assert application.greeting_sent is True
+
+
+def test_cli_no_sent_corrects_the_inference(session, settings) -> None:
+    """`--no-sent` 要能把推定改回 False，**并且说出来**（否则用户不知道生效没有）。"""
+    job, application = _pending_with_greeting(session, settings)
+    session.commit()
+
+    first = runner.invoke(
+        app, ["--no-remind", "apply", "--job", str(job.id), "--status", "applied"]
+    )
+    assert first.exit_code == 0, first.output
+    session.expire_all()
+    assert application.greeting_sent is True
+
+    # 状态已经是 applied（changed=False），但闭环字段要能被纠正
+    second = runner.invoke(
+        app, ["--no-remind", "apply", "--job", str(job.id), "--status", "applied", "--no-sent"]
+    )
+    assert second.exit_code == 0, second.output
+    assert "改回 False" in second.output, f"纠正没有告诉用户：\n{second.output}"
+    session.expire_all()
+    assert application.greeting_sent is False

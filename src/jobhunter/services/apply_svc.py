@@ -81,6 +81,13 @@ class ApplyResult:
     from_status: str
     to_status: str
     changed: bool
+    #: ★ ISSUES #37 的收尾：这次打标**推定**了"开场白已发出"（`greeting_sent=True`）。
+    #:   推定必须被调用方**说出来**给用户看 —— 不说就是一个自己没做过的动作
+    #:   出现在统计里（本项目最反对的静默失真）。CLI 会据此打一行提示 + 纠正命令。
+    greeting_inferred: bool = False
+    #: 这次把之前的推定**纠正**回了 False（`--no-sent`）。CLI 也要说一句 ——
+    #: 不然用户只看到"本来就是 applied，没有改动"，不知道纠正生效了没有。
+    greeting_corrected: bool = False
 
 
 def get_latest_application(session: Session, job_id: int) -> Application | None:
@@ -312,6 +319,9 @@ def set_status(
 
     from_status = application.status
     changed = from_status != status
+    # ★ 纠正的判定必须在**改字段之前**取快照（踩过一次：下面 330 行会先把
+    #   `application.greeting_sent` 赋成传进来的 False，再判断"有没有纠正"就永远是 False）。
+    was_greeting_sent = bool(application.greeting_sent)
     application.status = status
     when = occurred_at or now_utc()
 
@@ -337,10 +347,17 @@ def set_status(
         )
     # ★ 闭环字段与它的事件（ISSUES #37）全部收在 `_settle_greeting_closure` 里：
     #   `set_status` 的决策点已经够多了（PLR0912），这段单独抽出来才读得清。
+    greeting_inferred = False
+    # 纠正："之前推定过已发，这次明确说没发" → 要把列改回 False 并让 CLI 说出来。
+    # 用**改字段之前**的快照 `was_greeting_sent` 判断（见上面的说明）。
+    greeting_corrected = greeting_sent is False and was_greeting_sent
     if greeting_sent is None and changed and status == "applied" and application.greeting_text:
         # 走到 applied 只可能是人点过投递按钮，而这个工具**只生成、不发送** ——
-        # 所以"标成已投"时默认认为话术确实发出去了（显式传 False 可以纠正）。
+        # 所以"标成已投"时推定话术确实发出去了（显式 `--no-sent` 可以纠正）。
+        # ⚠️ 这是**推定**，必须回传给 CLI 让它打一行提示：不说出来，
+        #    用户就会在统计里看到一个自己没做过的动作（静默失真）。
         application.greeting_sent = True
+        greeting_inferred = True
     _settle_greeting_closure(
         session,
         application,
@@ -362,6 +379,8 @@ def set_status(
         from_status=from_status,
         to_status=status,
         changed=changed,
+        greeting_inferred=greeting_inferred,
+        greeting_corrected=bool(greeting_corrected),
     )
 
 
