@@ -655,12 +655,13 @@ def _columns(db_url: str) -> dict[str, dict]:
         engine.dispose()
 
 
-def test_migration_0004_is_reversible(db_url) -> None:
+def test_migration_0004_is_reversible(db_url, alembic_head: str) -> None:
     """upgrade → downgrade → upgrade 三连（参考 `test_v_p6` 的写法）。"""
     upgrade_head(db_url)
     engine = create_db_engine(db_url, ensure_directory=False)
     try:
-        assert current_revision(engine) == "0004"
+        # 到 head（可能已经不止 0004）—— 这条用例关心的是"0004 那两列"能不能回滚
+        assert current_revision(engine) == alembic_head
     finally:
         engine.dispose()
 
@@ -688,7 +689,7 @@ def test_migration_0004_is_reversible(db_url) -> None:
     upgrade_head(db_url)
     engine = create_db_engine(db_url, ensure_directory=False)
     try:
-        assert current_revision(engine) == "0004"
+        assert current_revision(engine) == alembic_head
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT cache_key, hits, last_hit_at FROM llm_cache")).all()
     finally:

@@ -162,3 +162,28 @@ def project_root(settings) -> Path:
     )
     assert os.environ.get("JH_DATA_DIR"), "JH_DATA_DIR 未被隔离，测试可能写到真实目录"
     return paths.root
+
+
+def _alembic_head() -> str:
+    """从**迁移脚本目录**读出当前的 head 版本号。
+
+    ★ 为什么要有它（而不是在测试里写死 "0005"）：
+      迁移版本号是"会随每次加迁移而变"的东西。写死之后，加一道迁移却忘了改常量，
+      测试会红得莫名其妙；更糟的是有人为了让测试变绿去改常量，而库其实停在旧版本。
+      让测试去读脚本目录，比较的就永远是"库里的真实版本"与"脚本里的真实 head"。
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = find_project_root()
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    head = ScriptDirectory.from_config(config).get_current_head()
+    assert head, "迁移脚本目录里没有 head —— 是不是 alembic/versions 被清空了？"
+    return head
+
+
+@pytest.fixture
+def alembic_head() -> str:
+    """当前迁移链的 head 版本号（供"库是不是最新"这类断言用）。"""
+    return _alembic_head()

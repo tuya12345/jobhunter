@@ -33,7 +33,10 @@ from jobhunter.storage.migrate import current_revision, downgrade_base, upgrade_
 #   0002（P6）interview_questions.interview_id 可空 + 新增 job_id（预测题挂岗位）
 #   0003（#42）application_events.event_type 加 CHECK（EVENT_TYPES 八取一）
 #   0004（#25）llm_cache 加 hits / last_hit_at（命中率）
-EXPECTED_REVISION = "0004"
+#   0005（#59）P7 消费端：companies 加导入列 + name_norm 唯一 + applications.company_id
+# ★ 版本号**写死**是刻意的（见下），但下面那条断言用的是 conftest 的 `alembic_head`
+#   夹具：加迁移时"改这里的注释"仍然是必须的动作，而断言不会因为忘了改而假绿。
+EXPECTED_REVISION = "0005"
 EXPECTED_TABLES = 11
 
 runner = CliRunner()
@@ -52,9 +55,15 @@ def test_init_creates_all_tables(engine) -> None:
     assert "llm_cache" in business
 
 
-def test_revision_is_at_head(engine) -> None:
-    """库的 Alembic 版本 = 迁移脚本的最新版本。"""
-    assert current_revision(engine) == EXPECTED_REVISION
+def test_revision_is_at_head(engine, alembic_head: str) -> None:
+    """库的 Alembic 版本 = 迁移脚本的最新版本。
+
+    ★ `alembic_head` 从迁移脚本目录**读**出来（不是写死的字符串）：
+      写死的话，加一道迁移却忘了改常量，这条测试会红得莫名其妙；
+      更糟的是有人为了让它绿去改常量，而库其实停在旧版本。
+      这里比较的是"库里的版本"vs"脚本里的 head"，两边都是真实的。
+    """
+    assert current_revision(engine) == alembic_head == EXPECTED_REVISION
 
 
 # ---------------------------------------------------------------------------

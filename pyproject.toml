@@ -44,6 +44,12 @@ llm = ["openai>=1.30"]
 # --extra emulator：P7 的"技术验证"才用。★ 钉死版本：uiautomator2 上游改动频繁，
 # 不钉版本会导致半年前能跑的脚本突然失灵，而这种环境问题最难排查。
 emulator = ["uiautomator2==3.2.2"]
+# --extra web：只有 `jh leads serve`（P7 消费端的本地页面）需要。
+# ★ 为什么放 extra 而不是主依赖：这是"看线索"才用得到的两个包，
+#   而 `jh job add` / `jh match run` / `jh today` 这些主路径一点都不需要它们。
+#   没装时 `jh leads serve` 会给一句中文提示（告诉你装哪条命令），
+#   而 `jh leads import` 照常可用（它只用 pydantic）。
+web = ["fastapi>=0.115", "uvicorn>=0.30"]
 
 [dependency-groups]
 dev = [
@@ -129,6 +135,10 @@ ignore = [
 # CLI 命令的参数很多（Typer 的写法天然如此），分支数也随参数增长
 "src/jobhunter/cli/commands/job_cmd.py" = ["PLR0912"]
 "src/jobhunter/cli/commands/resume_cmd.py" = ["PLR0912"]
+# FastAPI 的依赖注入**要求**把 `Depends(...)` 写在参数默认值里（B008 的字面意思
+# 是"别在默认值里调用函数"，但那正是这个框架的公开 API）。
+# 这是唯一一条"为了让框架能用"的豁免，作用范围只限 Web 层的一个文件。
+"src/jobhunter/web/app.py" = ["B008"]
 # tailor 的"分支多"是刻意的：brief 要把三类结论（讲什么/突出什么/避开什么）都渲染清楚，
 # analyze 要在"有建议 / 没建议 / 整批被闸门拦下"三种结局下都给出下一步。
 # 拆成小函数会让"用户到底看到什么"变难读 —— 这些渲染都有 CLI 测试守着。

@@ -89,10 +89,14 @@ EXPECTED_COMMANDS = (
 #     `interview list` / `question predict` / `assessment list` / `offer compare` / `cal export`
 #     → 分别由 test_p6_tracking.py（状态机/事件流/统计/时间轴/薄弱点/周报/追问）、
 #       test_assessment_offer.py、test_cal.py 覆盖。
-#   仍然留在名单里的只有 P7 的 `leads` —— P9 完成 `jh demo` 之后它也移出了。
-PLACEHOLDER_INVOCATIONS: list[list[str]] = [
-    ["leads", "export"],
-]
+# ★ P7 落地之后（ISSUE #59）**再也没有占位命令了**：
+#   `jh leads` 从"add/probe/capture/export 四个占位"变成"import/serve 两个真功能"，
+#   采集类命令整体搬去了独立部署 `leadhunter`（命令 `lh`）。
+#
+#   ★ 所以这个名单现在是**空的**，而且下面那条用例不只是"没人可测"——
+#     它反过来断言"本仓库不再有任何'该功能尚未实现'的入口"：
+#     将来谁再加占位命令，得先把这条纪律重新想一遍（占位命令不假装成功）。
+PLACEHOLDER_INVOCATIONS: list[list[str]] = []
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +171,8 @@ def test_subcommands_are_reachable() -> None:
         ("job", "add"),
         ("match", "explain"),
         ("tailor", "export"),
-        ("leads", "probe"),
+        ("leads", "import"),
+        ("leads", "serve"),
         ("interview", "add"),
         ("offer", "add"),
     ]:
@@ -190,9 +195,17 @@ def test_single_command_apps_show_help() -> None:
 # ---------------------------------------------------------------------------
 # ② 占位命令：不假装成功
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("invocation", PLACEHOLDER_INVOCATIONS)
+@pytest.mark.parametrize("invocation", PLACEHOLDER_INVOCATIONS or [pytest.param([], marks=[])])
 def test_placeholder_commands_report_not_implemented(invocation: list[str]) -> None:
-    """占位命令必须以非 0 退出，并说清"未实现 + 计划阶段"。"""
+    """占位命令必须以非 0 退出，并说清"未实现 + 计划阶段"。
+
+    ★ 现在 `PLACEHOLDER_INVOCATIONS` 是**空的**（P7 落地后本仓库没有占位命令了），
+      所以这条用例在空名单下退化成一条"没有可测对象"的用例；
+      真正接替它的是下面 `test_no_placeholder_commands_remain`。
+      保留函数是为了让"占位命令该怎么表现"这条约定留在代码里（将来再加占位时照它写）。
+    """
+    if not invocation:
+        pytest.skip("本仓库已经没有占位命令（见 PLACEHOLDER_INVOCATIONS 的说明）")
     result = runner.invoke(app, ["--no-remind", *invocation])
     assert result.exit_code == EXIT_NOT_IMPLEMENTED, (
         f"{invocation} 应以 {EXIT_NOT_IMPLEMENTED} 退出，实际 {result.exit_code}\n{result.output}"
@@ -203,6 +216,28 @@ def test_placeholder_commands_report_not_implemented(invocation: list[str]) -> N
     # 必须指出当前阶段与可用命令，给出下一步动作
     assert CURRENT_PHASE in result.output
     assert "jh init" in result.output
+
+
+def test_no_placeholder_commands_remain() -> None:
+    """★ P7 落地后：**本仓库一个占位命令都不该剩**。
+
+    为什么把它写死：占位命令的价值是"功能没做，但不假装做了"。
+    现在所有阶段（P0–P7 消费端 + P9）都落地了，再出现"该功能尚未实现"
+    只可能是**有人加了新占位**或**把已实现的命令改回占位** —— 两种都该被看见。
+
+    ★ 采集类命令（`jh leads add/probe/capture/export`）已经不在这里了：
+      它们搬去了独立部署 `leadhunter`（命令 `lh`）。所以这条用例同时也确认
+      "没有把采集命令搬回来"（红线之一：那些命令要装模拟器依赖）。
+    """
+    for invocation in (
+        ["leads", "add", "x.txt"],
+        ["leads", "probe"],
+        ["leads", "capture"],
+        ["leads", "export"],
+    ):
+        result = runner.invoke(app, ["--no-remind", *invocation])
+        assert result.exit_code == 2, f"{invocation} 不该还存在：{result.output}"
+        assert "No such command" in result.output, result.output
 
 
 def test_init_is_not_a_placeholder() -> None:

@@ -17,9 +17,15 @@
       或调用 `default_paths(root=tmp_path)`。
 
 目录用途：
-    data/      SQLite 库文件、抓屏产物（data/leads/）—— 真实数据，gitignore
+    data/      SQLite 库文件 —— 真实数据，gitignore
     output/    导出的 Markdown / CSV / docx —— 产物，gitignore
     state/     运行时状态（上次运行时间、临时进度）—— gitignore
+
+★ 这里曾经还有 `data/leads/`（P7 抓屏产物）。2026-09-19 的 P7 架构变更
+  （ISSUE #59）把采集端整个搬去了独立部署 `leadhunter`，抓屏与其产物目录都跟着走了；
+  本仓库的 `data/` 只剩数据库。删掉那个目录属性是**刻意的**：
+  留一个"将来可能用"的空目录属性，只会让人以为这里还有抓屏功能
+  （与 #18 删掉 `rate_limit.max_pages` 是同一个理由 —— 没人读的东西会变成假承诺）。
 """
 
 from __future__ import annotations
@@ -56,11 +62,6 @@ class PathSet:
         URL 解析器吃掉，必须转成 `D:/a/b.db` 这种正斜杠形式才可靠。
         """
         return f"sqlite:///{self.db_path.as_posix()}"
-
-    @property
-    def leads_dir(self) -> Path:
-        """P7 抓屏产物目录（一次抓屏一个子目录）。"""
-        return self.data_dir / "leads"
 
     def ensure_all(self) -> PathSet:
         """确保三个目录都存在，返回自身（便于链式调用）。

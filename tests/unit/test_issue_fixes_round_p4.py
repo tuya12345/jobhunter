@@ -30,18 +30,18 @@ runner = CliRunner()
 
 MIGRATION_0003 = "ck_application_events_event_type"
 
-#: 当前 head 的 revision。0004（#25，llm_cache 加 hits/last_hit_at）之后
-#: 它不再是那个断言里写死的 "0003" —— 这里只保留与 #42 有关的断言，
-#: 把"head 是哪个版本"留给 `test_smoke.py::test_revision_is_at_head` 一处去守。
-HEAD_REVISION = "0004"
+#: 当前 head 的 revision。它随迁移推进而变（0004 → 0005 …），
+#: 所以断言用的是 conftest 的 `alembic_head` 夹具（从迁移脚本目录读），
+#: 这里只保留一份"当前是哪个版本"的文字记录，避免读代码的人要自己去数迁移。
+HEAD_REVISION = "0005"
 
 
 # ===========================================================================
 # #42 —— event_type 的 CHECK 约束（迁移 + 服务层两道）
 # ===========================================================================
-def test_migration_is_at_0003(engine) -> None:
+def test_migration_is_at_0003(engine, alembic_head: str) -> None:
     """#42 的约束在 head 版本上依然生效（revision 号本身由 smoke 守）。"""
-    assert current_revision(engine) == HEAD_REVISION
+    assert current_revision(engine) == alembic_head == HEAD_REVISION
 
 
 def test_event_type_check_exists_in_db(engine) -> None:
@@ -106,7 +106,9 @@ def _downgrade_to_0002(db_url: str) -> None:
     command.downgrade(alembic_config(db_url), "0002")
 
 
-def test_migration_repairs_invalid_event_types_before_adding_the_check(db_url) -> None:
+def test_migration_repairs_invalid_event_types_before_adding_the_check(
+    db_url, alembic_head: str
+) -> None:
     """★★ 迁移的可升级性：库里已有拼错的 event_type 时，升级必须**成功**并留痕。
 
     依据（本 issue 的硬要求）："若现有数据里已有非法 event_type，
@@ -168,7 +170,7 @@ def test_migration_repairs_invalid_event_types_before_adding_the_check(db_url) -
             rows = conn.execute(
                 text("SELECT event_type, payload_json FROM application_events ORDER BY id")
             ).all()
-        assert current_revision(engine) == HEAD_REVISION
+        assert current_revision(engine) == alembic_head == HEAD_REVISION
     finally:
         engine.dispose()
 
@@ -184,7 +186,7 @@ def test_migration_repairs_invalid_event_types_before_adding_the_check(db_url) -
     assert _json.loads(rows[2][1])["migrated_from_event_type"] == "note "
 
 
-def test_migration_downgrade_removes_the_check_and_keeps_data(db_url) -> None:
+def test_migration_downgrade_removes_the_check_and_keeps_data(db_url, alembic_head: str) -> None:
     """downgrade 只删约束、不动数据（回滚不该顺手改历史）。"""
     upgrade_head(db_url)
     engine = create_db_engine(db_url)
@@ -233,7 +235,7 @@ def test_migration_downgrade_removes_the_check_and_keeps_data(db_url) -> None:
     upgrade_head(db_url)  # 三连的最后一步：还能再升回去
     engine = create_db_engine(db_url)
     try:
-        assert current_revision(engine) == HEAD_REVISION
+        assert current_revision(engine) == alembic_head == HEAD_REVISION
         assert "application_events" in set(inspect(engine).get_table_names())
     finally:
         engine.dispose()

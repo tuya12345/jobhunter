@@ -66,6 +66,15 @@ class Application(BaseModel):
     platform: Mapped[str | None] = mapped_column(String(40))
     # ★ 渠道：招聘网站 / 官网 / 内推 / HR直招 —— 渠道转化率统计的口径来源
     channel: Mapped[str | None] = mapped_column(String(20))
+    # ★ 这条投递是**从哪条线索**标记来的（P7 消费端，迁移 0005）
+    #
+    #   为什么必须显式存一列、而不是"按 channel 反推"：渠道只有四五个取值，
+    #   同渠道的另一条线索会把这里也点亮 —— 页面就会显示"已投"，
+    #   而那次投递其实跟这条线索没关系（#57 就是这类"看不出真相"的毛病）。
+    #
+    #   可空是刻意的：绝大多数投递（BOSS 上投的、`jh apply` 记的）本来就没有对应线索；
+    #   `ondelete="SET NULL"` 则保证删线索不会连带删掉投递记录（投递是资产）。
+    company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id", ondelete="SET NULL"))
 
     # ---- 开场白（含闭环字段）----------------------------------------------
     greeting_text: Mapped[str | None] = mapped_column(Text)
@@ -105,6 +114,8 @@ class Application(BaseModel):
         #   本项目**不建计数表**：日已投数从 applications 实时聚合，
         #   避免"计数器和真实记录对不上"这种最难查的不一致。
         Index("ix_applications_applied_at", "applied_at"),
+        # 线索页按 `company_id` 反查"这条线索投过没"（P7 消费端，迁移 0005）
+        Index("ix_applications_company_id", "company_id"),
     )
 
     def __repr__(self) -> str:
