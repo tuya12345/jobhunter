@@ -140,7 +140,7 @@ def test_fetch_detail_marks_the_wall_after_rendering(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         ManualAdapter,
         "_render_page",
-        lambda self, url: (LOGIN_HTML, "APP扫码登录 验证码登录/注册", None),
+        lambda self, url: (LOGIN_HTML, "APP扫码登录 验证码登录/注册", None, url),
     )
 
     detail = ManualAdapter(platform="boss").fetch_detail(BOSS_URL)
@@ -165,7 +165,7 @@ def test_cli_stores_nothing_and_explains_when_it_hits_a_wall(
     monkeypatch.setattr(
         ManualAdapter,
         "_render_page",
-        lambda self, url: (LOGIN_HTML, "", "【BOSS直聘注册登录】"),
+        lambda self, url: (LOGIN_HTML, "", "【BOSS直聘注册登录】", url),
     )
 
     result = runner.invoke(app, ["--no-remind", "job", "add", BOSS_URL])
@@ -175,6 +175,31 @@ def test_cli_stores_nothing_and_explains_when_it_hits_a_wall(
     assert "登录" in result.output
     assert "--html" in result.output and "--manual" in result.output
     assert "入库完成" not in result.output, "什么都没入库，不许打印成功"
+
+
+def test_dry_run_prints_the_failure_reason(
+    initialized: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ `--dry-run` 也要说清"为什么什么都没解析到"（安静地不说 = #62 同类毛病）。
+
+    ★ 这条是修 #65 时顺手发现的：失败原因原本打印在函数**末尾**，
+      而 `--dry-run` 在中途就 return 了 —— 于是最需要解释的那条命令一个字都不解释
+      （用户看到空表 + "没有写入数据库"）。现在失败块挪到了 return 之前。
+    """
+    monkeypatch.setattr("jobhunter.adapters.manual.is_playwright_available", lambda: True)
+    monkeypatch.setattr(ManualAdapter, "_polite_delay", lambda self: None)
+    monkeypatch.setattr(
+        ManualAdapter,
+        "_render_page",
+        lambda self, url: (LOGIN_HTML, "", "【BOSS直聘注册登录】", url),
+    )
+
+    result = runner.invoke(app, ["--no-remind", "job", "add", BOSS_URL, "--dry-run"])
+
+    assert "dry-run" in result.output
+    assert "没抓到" in result.output, "dry-run 只说了没写库，没说为什么没解析到"
+    assert "登录" in result.output, "dry-run 里没给出可操作的原因"
+    assert _job_count(initialized) == 0
 
 
 def test_saved_login_page_through_html_flag_is_also_refused(
@@ -302,7 +327,7 @@ def test_platform_is_honored_on_the_link_path_too(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         ManualAdapter,
         "_render_page",
-        lambda self, url: (JOB_HTML, None, None),
+        lambda self, url: (JOB_HTML, None, None, url),
     )
 
     forced = ManualAdapter(platform="boss").fetch_detail("https://example.com/job/1")

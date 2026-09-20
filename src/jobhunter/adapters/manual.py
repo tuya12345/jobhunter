@@ -35,6 +35,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from jobhunter.adapters.base import JobDetail, JobSource
 from jobhunter.adapters.parse_html import (
@@ -132,7 +133,14 @@ class ManualAdapter(JobSource):
 
     platform = "manual"
 
-    def __init__(self, settings: AppSettings | None = None, *, platform: str | None = None) -> None:
+    def __init__(
+        self,
+        settings: AppSettings | None = None,
+        *,
+        platform: str | None = None,
+        use_cdp: bool = False,
+        cdp_endpoint: Any = None,
+    ) -> None:
         """Args:
         settings: 配置（不传用单例）
         platform: **强制指定的平台**（CLI 的 `--platform`，ISSUES #61）。
@@ -146,9 +154,16 @@ class ManualAdapter(JobSource):
               `fetch_detail(url)` 是 `JobSource` 的抽象契约，加参数就得改 ABC
               （而其它适配器并不需要"覆盖平台"这件事）。平台是"这次抓取的上下文"，
               放在构造器里语义正确，也不污染接口。
+
+        use_cdp: 用**用户自己的浏览器**（CDP）抓，而不是新起一个 headless 实例
+            （ISSUES #65，CLI 的 `--cdp`）。需要登录的站点只有这条路能抓到正文。
+        cdp_endpoint: 已经准备好的 CDP 端点（CLI 先 `ensure_cdp_browser()` 拿到它，
+            顺便打印"去那个窗口登录一次"的提示）。不传则抓取时自己确保。
         """
         self.settings = settings or get_settings()
         self._platform_override = platform
+        self._use_cdp = use_cdp
+        self._cdp_endpoint = cdp_endpoint
 
     def _resolve_platform(self, url: str) -> str:
         """这次抓取该用哪个平台：显式指定的优先，否则按域名判断。"""
@@ -182,7 +197,12 @@ class ManualAdapter(JobSource):
         self._polite_delay()
 
         try:
-            html, rendered_jd, title_hint = self._render_page(url)
+            # ★ 两条渲染路径共用后面全部逻辑（清洗、补字段、登录墙判定、平台 ID），
+            #   差别只在"用哪个浏览器"（ISSUES #65）。
+            if self._use_cdp:
+                html, rendered_jd, title_hint, final_url = self._render_page_via_cdp(url)
+            else:
+                html, rendered_jd, title_hint, final_url = self._render_page(url)
         except Exception as exc:  # noqa: BLE001 - 网络/浏览器异常一律降级
             logger.warning("抓取失败（%s）：%s", url, exc)
             return None
@@ -192,39 +212,15 @@ class ManualAdapter(JobSource):
             return None
 
         detail = html_to_detail(html, url, platform=platform)
-
-        # ★★ 渲染文本优先（见 _clean_rendered_text 的说明）：
-        #   清理后的头部就是"岗位名 + 工作地点 + 部门 + 更新时间"，
-        #   正文就是完整的岗位职责。它比"从 HTML 里猜"准得多 ——
-        #   所以这里**不仅覆盖正文，还从这段文本里补结构化字段**。
-        #
-        #   注意不要跟 HTML 版本比长度：清理过的版本天生更短，
-        #   比长度会把带导航的噪音版本选回来（实测踩过）。
-        if rendered_jd and len(rendered_jd) >= _MIN_RENDERED_JD_LENGTH:
-            detail.jd_text = rendered_jd
-            detail.fetch_status = "ok"
-            _fill_fields_from_rendered(detail, rendered_jd, platform)
-
-        if title_hint and not detail.title:
-            detail.title = title_hint
-
-        # 补一层：页面没给出平台的岗位 ID 时，从 URL 再试一次
-        if detail.platform_job_id is None:
-            detail.platform_job_id = extract_platform_job_id(url, platform)
-        if detail.platform == "manual":
-            detail.platform = platform
-
-        # ★★ 再过一道"这是不是登录墙"（ISSUES #62）：渲染**之后**能拿到的证据
-        #   比只看 HTML 多（登录页的正文往往是客户端渲染出来的）。
-        #   命中就把状态压成 failed 并清掉正文 —— 绝不让登录页文本入库。
-        if detail.fetch_status != "failed":
-            wall_note = detect_access_wall(html, rendered_text=rendered_jd or "", platform=platform)
-            if wall_note:
-                detail.fetch_status = "failed"
-                detail.fetch_note = wall_note
-                detail.jd_text = ""
-                detail.raw["access_wall"] = True
-
+        _finish_detail(
+            detail,
+            html=html,
+            rendered_jd=rendered_jd,
+            title_hint=title_hint,
+            url=url,
+            platform=platform,
+            final_url=final_url,
+        )
         if detail.fetch_status == "failed":
             logger.warning(
                 "页面打开了但没抽到 JD 正文（可能需要登录 / 是验证页 / 结构已改版）：%s", url
@@ -249,7 +245,7 @@ class ManualAdapter(JobSource):
         """用 Playwright 打开页面并取回 HTML（同步 API，CLI 场景够用）。"""
         return self._render_page(url)[0]
 
-    def _render_page(self, url: str) -> tuple[str, str | None, str | None]:
+    def _render_page(self, url: str) -> tuple[str, str | None, str | None, str | None]:
         """打开页面，返回 `(html, 渲染后最长的文本块, data-test=jobTitle 的文本)`。
 
         ★★ 为什么要在**浏览器里**就把 JD 取出来，而不是拿 HTML 回来再解析
@@ -290,20 +286,180 @@ class ManualAdapter(JobSource):
                 )
                 page = context.new_page()
                 page.route("**/*", _block_heavy_resources)
-                page.goto(url, wait_until=_WAIT_UNTIL, timeout=_DEFAULT_TIMEOUT_MS)
-                # 有些页面永远不会 idle（长轮询、埋点请求），等不到就算了
-                with contextlib.suppress(Exception):
-                    page.wait_for_load_state("networkidle", timeout=5_000)
-                # 单页应用首屏渲染完还要一点时间（对这类站点很关键）
-                with contextlib.suppress(Exception):
-                    page.wait_for_timeout(1_500)
-
-                html = page.content()
-                jd_text = _longest_rendered_text(page)
-                title_hint = _data_test_title(page)
-                return html, jd_text, title_hint
+                return _collect_from_page(page, url)
             finally:
                 browser.close()
+
+    def _render_page_via_cdp(self, url: str) -> tuple[str, str | None, str | None, str | None]:
+        """用**用户自己的浏览器**（CDP）打开页面并取回 `(html, 渲染文本, 标题线索)`。
+
+        ★★ 为什么要这条路（ISSUES #65）：headless 实例没有登录态，
+          需要登录的站点只会给登录页 —— 工具再聪明也只能"如实报抓不到"。
+          连到用户自己的浏览器实例，用的就是**他自己的会话**。
+
+        ★ 它**不是**绕风控：#62 修好之后，"抓到登录页"是会明确报错的；
+          这条路只是让"用户在浏览器里能看到的页面"也能被抓到 ——
+          没有伪造 Cookie / Referer / 指纹，没有登录自动化，没有翻页。
+
+        ★ 与 `_render_page` 共用 `_collect_from_page`：等待序列、取 HTML、
+          取最长文本块、清正文的规则**只有一份** —— 否则两条路会慢慢跑偏
+          （本项目已经因为"同一件事两份实现"吃过好几次亏）。
+
+        ★★ 抓完**什么都不关**（实测踩到的坑，缺口 ①）
+
+          初版在 `finally` 里关了刚用过的那个页面。看起来"很干净"，后果却是：
+          那个专用窗口**只有一个标签页**，而 Edge/Chrome **关掉最后一个标签就退出**
+           —— 用户刚登录好、跑一次抓取，窗口就没了（实测 CDP 端口随后不再监听）。
+          而他下次还得重新开、重新等。
+
+          所以现在的规矩是：**连过去的浏览器，我们什么都不关** ——
+            ① 页面留着，停在刚抓完的那个 URL 上（用户能看见工具读了哪个页面，
+               这是透明度，也让"它到底干了什么"可核对）；
+            ② 下次抓取**复用同一个标签页**（`cdp_page()` 优先复用已有页面）；
+            ③ 只有"我们自己创建的 context"才可以关（见 `safe_close` 的说明）。
+        """
+        from playwright.sync_api import sync_playwright
+
+        from jobhunter.adapters import cdp as cdp_module
+
+        endpoint = self._cdp_endpoint
+        if endpoint is None:
+            endpoint = cdp_module.ensure_cdp_browser(self.settings)
+
+        with sync_playwright() as playwright:
+            _context, page = cdp_module.cdp_page(playwright, endpoint)
+            _prepare_page(page)
+            return _collect_from_page(page, url)
+
+
+def _finish_detail(
+    detail: JobDetail,
+    *,
+    html: str,
+    rendered_jd: str | None,
+    title_hint: str | None,
+    url: str,
+    platform: str,
+    final_url: str | None = None,
+) -> None:
+    """渲染之后的收尾：**两条渲染路径共用**（新起 headless / 连用户的浏览器）。
+
+    ★ 抽出来的理由：这里是"渲染结果怎么变成 JobDetail"的**全部规则** ——
+      渲染文本优先、补结构化字段、从 URL 补平台 ID、登录墙判定。
+      两条路径各写一份的话，迟早会有一条忘了判登录墙（而那个后果是
+      "登录页正文入库"，正是 #62）。
+
+    ★★ 渲染文本优先（见 `_clean_rendered_text` 的说明）：清理后的头部就是
+      "岗位名 + 工作地点 + 部门 + 更新时间"，正文就是完整的岗位职责 ——
+      比"从 HTML 里猜"准得多，所以这里**不仅覆盖正文，还从这段文本里补结构化字段**。
+      注意不要跟 HTML 版本比长度：清理过的版本天生更短，
+      比长度会把带导航的噪音版本选回来（实测踩过）。
+    """
+    if rendered_jd and len(rendered_jd) >= _MIN_RENDERED_JD_LENGTH:
+        detail.jd_text = rendered_jd
+        detail.fetch_status = "ok"
+        _fill_fields_from_rendered(detail, rendered_jd, platform)
+
+    if title_hint and not detail.title:
+        detail.title = title_hint
+
+    # 补一层：页面没给出平台的岗位 ID 时，从 URL 再试一次
+    if detail.platform_job_id is None:
+        detail.platform_job_id = extract_platform_job_id(url, platform)
+    if detail.platform == "manual":
+        detail.platform = platform
+
+    # ★★ 再过一道"这是不是登录墙"（ISSUES #62）：渲染**之后**能拿到的证据
+    #   比只看 HTML 多（登录页的正文往往是客户端渲染出来的）。
+    #   命中就把状态压成 failed 并清掉正文 —— 绝不让登录页文本入库。
+    if detail.fetch_status == "failed":
+        return
+    wall_note = detect_access_wall(html, rendered_text=rendered_jd or "", platform=platform)
+    if wall_note:
+        detail.fetch_status = "failed"
+        detail.fetch_note = wall_note
+        detail.jd_text = ""
+        detail.raw["access_wall"] = True
+        return
+
+    # ★★ 再看一眼"浏览器最后停在哪个地址"（ISSUES #65 实测踩到）
+    #
+    #   在专用实例里跑真实 BOSS 链接时，浏览器把我们带到了**它自己的**
+    #   「我们现在正在你的所有设备上同步你的浏览数据」首次运行页 ——
+    #   那段文字被当成 JD（140 字）拿到 `partial`，**会被入库**。
+    #   它既不是登录墙（没有登录字样），也没有岗位结构可判 —— 只看正文根本挡不住。
+    #
+    #   地址是最便宜的硬判据：**跨站**（域名不同）就说明我们看到的不是那个岗位页。
+    #   同站内的跳转（登录页、验证页）不在这里拦，交给上面的登录墙判定。
+    note = _cross_site_note(url, final_url)
+    if note:
+        detail.fetch_status = "failed"
+        detail.fetch_note = note
+        detail.jd_text = ""
+        detail.raw["final_url"] = final_url
+        detail.raw["cross_site"] = True
+
+
+def _cross_site_note(requested: str, final: str | None) -> str | None:
+    """`goto` 之后是否**跨站**了？跨站时返回一句可操作的中文说明。
+
+    ★ 为什么不比"完整 URL 相等"：同一个站点会有正常的规范化
+      （补斜杠、加/去 `www.`、加跟踪参数、http→https），比整串会天天误报。
+      比**域名**既能挡住"被带到别的站/浏览器自己的页面"，又不会误伤这些规范化。
+    """
+    if not final:
+        return None
+    requested_host = (urlsplit(requested).hostname or "").lower().removeprefix("www.")
+    final_host = (urlsplit(final).hostname or "").lower().removeprefix("www.")
+    if not requested_host or not final_host or requested_host == final_host:
+        return None
+    return (
+        f"浏览器把你带到了**另一个站点**，抓到的是那里的页面而不是你要的岗位：\n"
+        f"    你给的是：{requested_host}\n"
+        f"    实际停在：{final}（{final_host}）\n"
+        "  常见原因：① 浏览器**自己的提示页**（首次运行 / 同步数据 / 默认浏览器询问）\n"
+        "            —— 在那个窗口里点掉它，再重跑一次就好；\n"
+        "          ② 站点把你重定向到了登录/首页 —— 在那个窗口里登录后再重跑；\n"
+        "          ③ 顺手用 --html 另存网页那条路也可以（见 jh job add --help）。"
+    )
+
+
+def _prepare_page(page: Any) -> None:
+    """导航前的准备：挡住重资源（图片/媒体/字体）。
+
+    ★ 两条渲染路径（新起 headless / 连用户的浏览器）**共用**它 ——
+      这样"我们请求了什么、没请求什么"只有一处定义。
+    """
+    with contextlib.suppress(Exception):
+        page.route("**/*", _block_heavy_resources)
+
+
+def _collect_from_page(page: Any, url: str) -> tuple[str, str | None, str | None, str | None]:
+    """导航到 `url` 并取回 `(html, 渲染后的最长文本块, data-test 标题, 最终地址)`。
+
+    ★ 等待序列是**实测调出来的**，两步都不能省：
+        · `domcontentloaded` 之后等 `networkidle`（有些页面永远不 idle → 5 秒就放弃）；
+        · 再等 1.5 秒让单页应用首屏渲染完（不等的话正文还没出来，
+          就会走"从 HTML 里猜"那条差得多的路）。
+
+    ★ 为什么要带回**最终地址**：`goto` 之后浏览器可能把我们带到别处 ——
+      跳转到登录页、跳转到站点首页、或者（CDP 路径上实测踩到）**浏览器自己的
+      "同步你的浏览数据"首次运行页**。只看正文的话，那些页面的文字会被当成 JD 存进库；
+      地址是**最便宜也最硬**的判据（见 `_finish_detail` 里的跨站判定）。
+    """
+    page.goto(url, wait_until=_WAIT_UNTIL, timeout=_DEFAULT_TIMEOUT_MS)
+    # 有些页面永远不会 idle（长轮询、埋点请求），等不到就算了
+    with contextlib.suppress(Exception):
+        page.wait_for_load_state("networkidle", timeout=5_000)
+    # 单页应用首屏渲染完还要一点时间（对这类站点很关键）
+    with contextlib.suppress(Exception):
+        page.wait_for_timeout(1_500)
+
+    html = page.content()
+    jd_text = _longest_rendered_text(page)
+    title_hint = _data_test_title(page)
+    final_url = getattr(page, "url", None)
+    return html, jd_text, title_hint, final_url if isinstance(final_url, str) else None
 
 
 #: JD 正文的**起始特征词**（出现即认为"从这里开始是正文"）

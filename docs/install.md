@@ -405,20 +405,32 @@ jh job show 1 --jd          # 看完整字段与 JD 正文
 
 - ★ **要登录的站点（BOSS 就是）**：详情页需要登录才给看，工具会**明确告诉你**
   「抓到的是登录/验证页而不是 JD」，并且**一条都不入库**（不会把登录页正文当 JD 存下来）。
-  这时用"另存为网页"这条路，**并把原始链接与平台一起带上**：
+  三条路，按省事排序：
 
   ```powershell
-  # 浏览器里打开岗位 → Ctrl+S 另存为网页 → 然后：
-  jh job add --html page.html --url "https://www.zhipin.com/job_detail/xxx.html" --platform boss
+  # ① 用你自己的浏览器抓（复用已登录的会话）—— 最省事
+  jh job add --cdp "https://www.zhipin.com/job_detail/xxx.html"
+  #    首次会打开一个"给工具用的"浏览器窗口（专用配置目录 state/cdp-profile），
+  #    在里面登录一次 BOSS 即可，之后一直可用；不打扰你日常那个浏览器。
+
+  # ② 浏览器里打开岗位 → Ctrl+S 另存为网页 → 导入
+  jh job add --html page.html --url "<原链接>" --platform boss
+
+  # ③ 直接复制 JD 正文
+  jh job add --manual --url "<原链接>" --platform boss
   ```
 
   · `--url` 让库里存的是**真链接**（不带的话只能记成 `file:///…`，列表里点不回去，
     `platform_job_id` 也抽不出来 —— 第一层去重就废了）；
   · `--platform` 让"这是哪个平台的岗位"这件事**由你说了算**（本地网页没有域名上下文，
     工具猜不出来）。它对手动文本同样有效；
-  · 两者都不填也能跑，只是记录里只有一份本地文件路径，平台会记成 `manual`。
-  · 合规：这条路**不绕过登录**、不伪造 Cookie/Referer —— 只是把你**自己在浏览器里
-    已经看到的内容**存下来。
+  · ★ **三条路都不绕过登录**：`--cdp` 用的是**你自己的浏览器、你自己的会话**，
+    没有伪造 Cookie / Referer / 指纹、没有自动登录、没有自动点击；
+    `--html` / `--manual` 用的是你自己在浏览器里已经看到的内容。详见
+    [COMPLIANCE.md](COMPLIANCE.md) §5.7。
+  · `--cdp` 的配置（都在 `config.yaml` 的 `browser:` 下）：`cdp_port`（默认 9333）、
+    `cdp_executable`（不填自动找 Edge/Chrome）、`cdp_profile_dir`（默认 `state/cdp-profile`；
+    **里面有登录态，不要放进仓库**）。
 
 - 合规：`jh job add <url>` **只读取**页面内容，不点投递、不点赞、不私信、不绕验证码，
   请求之间有随机延时，失败即跳过（不重试轰炸）。
@@ -802,14 +814,19 @@ jh leads serve        # 重新起一次；已经开着的话，构建完直接�
 而你从输出里看不出任何异常（ISSUES #62 就是这么发现的）。
 现在它会识别出"这不是岗位页"（页面里有登录/验证特征词、且没有任何岗位结构），
 压成失败并**清掉正文**，绝不入库。
-**解决**：走"另存为网页"这条路（**不用绕过登录**），并把链接与平台一起带上：
+**解决**：三条路（详见上面 §5 的 ③ 那一节）：
 
 ```powershell
-# 浏览器里打开这个岗位（你已登录，能看到正文）→ Ctrl+S 另存为网页
-jh job add --html page.html --url "https://www.zhipin.com/job_detail/xxx.html" --platform boss
+jh job add --cdp "<岗位链接>"                          # ① 复用你自己浏览器的登录态
+jh job add --html page.html --url "<链接>" --platform boss   # ② 另存为网页
+jh job add --manual --url "<链接>" --platform boss           # ③ 复制正文
 ```
 
-**为什么一定要带 `--url`**：不带的话库里只能记成 `file:///…/page.html` ——
+**① `--cdp` 第一次用会弹出一个浏览器窗口**，那是**给工具用的专用实例**（配置目录
+`state/cdp-profile`）——在里面登录一次目标站点，之后就不用再登了；它与你日常那个浏览器互不影响。
+**注意**：不要把它当成"批量抓取"的入口 —— 它一次只抓你给的那**一个**链接（这是红线，代码里有用例守着）。
+
+**为什么一定要带 `--url`**（走 ②③ 时）：不带的话库里只能记成 `file:///…/page.html` ——
 列表里点不回去，`platform_job_id` 也抽不出来（第一层去重失效）。
 **为什么要带 `--platform`**：本地网页没有域名上下文，工具判断不出这是哪个平台；
 你自己知道，所以由你说了算（不带时记成 `manual`）。

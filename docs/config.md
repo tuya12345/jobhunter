@@ -433,6 +433,45 @@ rate_limit:
 
 ---
 
+## 6.5 浏览器抓取（`browser.*`，只有 `jh job add --cdp` 用）
+
+★ 这一组只在用 `--cdp` 时才需要（ISSUES #65：连**你自己的**浏览器抓需要登录的页面）。
+普通抓取（`jh job add <链接>`）用不到它们。
+
+### `browser.cdp_port`
+
+- **是什么**：CDP（Chrome DevTools Protocol）调试端口 —— 工具通过它连到你自己的浏览器。
+- **默认值**：`9333`。**取值范围**：`1024 ≤ port ≤ 65535`。
+- ⚠️ **写错了会怎样**：端口被占用 / 被防火墙挡住时，`jh job add --cdp` 会等 20 秒然后报
+  「CDP 端口一直没有就绪」并提示你换一个端口 —— **不会**静默失败。
+
+### `browser.cdp_executable`
+
+- **是什么**：浏览器可执行文件的路径。
+- **默认值**：`None` —— 自动找 Edge / Chrome（Windows 的 `Program Files` 两个位置、
+  macOS 的 `/Applications`、Linux 的 `PATH` 上的 `microsoft-edge` / `google-chrome` / `chromium`）。
+- ⚠️ **写错了会怎样**：路径不存在 = 视同没配（继续自动找）；全找不到时给一句可操作提示，
+  告诉你在这里填路径，或改用 `--html` / `--manual`。
+
+### `browser.cdp_profile_dir`
+
+- **是什么**：`--cdp` 用的**专用浏览器配置目录**（`--user-data-dir`）。
+- **默认值**：`None` → `<state_dir>/cdp-profile`（通常就是 `state/cdp-profile`）。
+- ⚠️ **注意**：这个目录里会有**真实登录态**（Cookie 等）。默认放在 `state/` 下是因为
+  它被 `.gitignore` 覆盖 —— **不要**把它改到仓库里（`tests/unit/test_cdp.py` 有用例守着这个位置）。
+- **为什么要有专用目录**（两个实测原因）：① Edge/Chrome 已经在运行时
+  `--remote-debugging-port` **完全无效**（新进程只是把标签页交给现有实例，端口不会起来）；
+  ② 专用实例不打扰你日常那个浏览器 —— 第一次在里面登录一次，之后一直可用。
+
+```yaml
+browser:
+  cdp_port: 9333            # 与日常浏览器互不影响
+  cdp_executable: null      # 不填自动找 Edge/Chrome
+  cdp_profile_dir: null     # 不填 → state/cdp-profile（里面有登录态，别放进仓库）
+```
+
+---
+
 ## 7. LLM 与密钥（.env 里的 DEEPSEEK_* / llm_provider / llm_concurrency / llm_max_retries）
 
 ★ **密钥只能放 `.env`**（或真正的环境变量）：`config.yaml` 会被提交进仓库（`settings.py:16`）。
@@ -677,7 +716,7 @@ DEEPSEEK_MODEL=deepseek-chat
 
 ---
 
-## 13. 附：`show_reminders` / `config_file`，以及全部 27 个字段索引
+## 13. 附：`show_reminders` / `config_file`，以及全部 28 个字段索引
 
 ### `show_reminders`
 
@@ -723,6 +762,7 @@ show_reminders: true
 | `greeting` | §4 | 开场白字数约束 + GitHub | 80/150/60/`""` |
 | `tailor` | §5 | 定制简历的硬约束 | 1.5/30/12/3/2 |
 | `rate_limit` | §6 | 随机延时（合规红线；~~翻页上限~~ 已删，#18） | 2.0/5.0 |
+| `browser` | §6.5 | 浏览器抓取（只有 `--cdp` 用；含端口/路径/专用 profile） | 9333/None/None |
 | `show_reminders` | §13 | 顶部待处理提醒开关 | `true` |
 | `deepseek_api_key` | §7 | 密钥（只从 `.env`/环境变量来） | `""` |
 | `deepseek_base_url` | §7 | API 地址 | `https://api.deepseek.com` |

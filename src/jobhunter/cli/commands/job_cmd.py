@@ -110,6 +110,16 @@ def job_add(
             ),
         ),
     ] = None,
+    cdp: Annotated[
+        bool,
+        typer.Option(
+            "--cdp",
+            help=(
+                "用**你自己的浏览器**抓（复用已登录的会话）—— 需要登录的站点用这个。"
+                "首次会打开一个专用窗口，在里面登录一次即可"
+            ),
+        ),
+    ] = False,
     keyword: Annotated[
         str | None,
         typer.Option("--keyword", "-k", help="这个岗位来自哪个搜索词/渠道（用于复盘渠道效果）"),
@@ -139,6 +149,7 @@ def job_add(
         html_file=html_file,
         url=url,
         platform=platform,
+        cdp=cdp,
         settings=settings,
     )
 
@@ -148,6 +159,15 @@ def job_add(
 
     # ---- 打印解析结果（dry-run 到此为止）--------------------------------
     _print_details(details, failures)
+
+    # ★★ 失败原因必须在 `--dry-run` 的提前返回**之前**打印（ISSUES #62 同类毛病）
+    #
+    #   改前这段在函数末尾，而 dry-run 在中途就 return 了 —— 于是
+    #   `jh job add --cdp <链接> --dry-run` 在"什么都没解析出来"时**一个字都不解释**：
+    #   用户看到的是空表 + "--dry-run：以上结果没有写入数据库"。
+    #   而 `--dry-run` 恰恰是"先看看会发生什么"的那条命令，最需要解释的就是它。
+    if failures:
+        _print_failures(failures)
 
     if dry_run:
         console.print()
@@ -179,19 +199,11 @@ def job_add(
         success("入库完成：" + "　".join(parts))
     else:
         warn("没有入库任何岗位：" + "　".join(parts))
-        console.print("  [dim]上面每一条的失败原因都写在下面了。[/dim]")
+        console.print("  [dim]上面每一条的失败原因都写在上面了。[/dim]")
 
     if outcome.totals:
         summary = "　".join(f"{status} {count}" for status, count in sorted(outcome.totals.items()))
         console.print(f"  [dim]库里现有：{summary}[/dim]")
-
-    if failures:
-        console.print()
-        warn(f"有 {len(failures)} 条没抓到。可以改用 [bold]jh job add --manual[/bold] 手动粘贴：")
-        for item in failures[:5]:
-            console.print(f"  [dim]· {item}[/dim]")
-        if len(failures) > 5:
-            console.print(f"  [dim]· …还有 {len(failures) - 5} 条[/dim]")
 
     console.print()
     console.print(
@@ -356,6 +368,45 @@ def _display_url(url: str | None) -> str:
     return url
 
 
+def _print_failures(failures: list[str]) -> None:
+    """把没抓到的原因逐条打出来（**dry-run 也要打**）。
+
+    ★ 为什么单独抽出来：`--dry-run` 在"什么都没解析出来"时最需要解释，
+      而它中途就 return 了 —— 所以这段必须在 return 之前调用
+      （ISSUES #62 同类毛病：安静地什么都不说，用户只能猜）。
+    """
+    console.print()
+    warn(f"有 {len(failures)} 条没抓到。可以改用 [bold]jh job add --manual[/bold] 手动粘贴：")
+    for item in failures[:5]:
+        console.print(f"  [dim]· {item}[/dim]")
+    if len(failures) > 5:
+        console.print(f"  [dim]· …还有 {len(failures) - 5} 条[/dim]")
+
+
+def _prepare_cdp(settings: object) -> object:
+    """准备 CDP 端点（`--cdp`）：没有就起一个**专用 profile** 的浏览器，并给用户提示。
+
+    ★ 为什么在 CLI 这层做、而不是让适配器自己悄悄做：
+      这个动作会**弹出浏览器窗口**，用户必须知道那是工具开的、并且要去里面登录一次。
+      悄悄开一个窗口然后报"抓不到"，是最让人困惑的一种失败。
+
+    ★ 起一个专用实例（而不是连用户日常那个）有两个原因（实测）：
+      ① Edge/Chrome 已在运行时 `--remote-debugging-port` 完全无效 ——
+         新进程只是把标签页交给现有实例，端口根本不会起来；
+      ② 那个专用目录里会有登录态，放在 `state/cdp-profile`（gitignore 覆盖）最安全。
+    """
+    from jobhunter.adapters import cdp as cdp_module
+
+    try:
+        endpoint = cdp_module.ensure_cdp_browser(settings, on_message=console.print)  # type: ignore[arg-type]
+    except RuntimeError as exc:
+        err_console.print(f"[red]无法启用 --cdp[/red]：{exc}")
+        raise typer.Exit(code=1) from exc
+    if not endpoint.started:
+        console.print(f"  [dim]复用已在运行的浏览器实例（CDP 端口 {endpoint.port}）[/dim]")
+    return endpoint
+
+
 # ---------------------------------------------------------------------------
 # 内部：收集待录入的详情
 # ---------------------------------------------------------------------------
@@ -462,6 +513,7 @@ def _collect_details(
     html_file: Path | None,
     url: str | None,
     platform: str | None,
+    cdp: bool = False,
     settings: object,
 ) -> tuple[list[JobDetail], list[str]]:
     """把各种输入统一收集成 `(成功解析的详情列表, 失败说明列表)`。
@@ -486,7 +538,10 @@ def _collect_details(
 
     if targets:
         # 平台覆盖经构造器传进去（见 ManualAdapter.__init__ 的说明）
-        adapter = ManualAdapter(settings, platform=platform)  # type: ignore[arg-type]
+        cdp_endpoint = _prepare_cdp(settings) if cdp else None
+        adapter = ManualAdapter(  # type: ignore[arg-type]
+            settings, platform=platform, use_cdp=cdp, cdp_endpoint=cdp_endpoint
+        )
         for target in targets:
             console.print(f"  [dim]抓取中… {target}[/dim]")
             detail = adapter.fetch_detail(target)

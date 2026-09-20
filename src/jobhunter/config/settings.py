@@ -45,6 +45,7 @@ from jobhunter.config.vocabulary import BUILTIN_SKILLS
 
 __all__ = [
     "AppSettings",
+    "BrowserSettings",
     "GreetingSettings",
     "MatchWeights",
     "RateLimitSettings",
@@ -166,6 +167,26 @@ class TailorSettings(BaseModel):
         return self
 
 
+class BrowserSettings(BaseModel):
+    """浏览器抓取（ISSUES #65：`jh job add --cdp`）。
+
+    ★ 为什么要有这一组配置：默认抓取会**新起一个 headless 浏览器**（没有登录态），
+      于是需要登录的站点（BOSS）只会给登录页。`--cdp` 改成连到**用户自己的**
+      浏览器实例去读页面 —— 而那需要三件事可配：端口、浏览器路径、专用配置目录。
+
+    ★ `cdp_profile_dir` 默认是 `<state_dir>/cdp-profile`：
+      那个目录里会有**真实登录态**（Cookie），所以它必须落在 `state/`（.gitignore 覆盖）。
+      **不要**把它改到仓库里（`config.yaml` 同级的目录也不行）——有测试守这条。
+    """
+
+    #: CDP 调试端口。挑一个不常见的（9222 是很多人默认的，容易撞）
+    cdp_port: int = Field(default=9333, ge=1024, le=65535)
+    #: 浏览器可执行文件；不填则自动找 Edge / Chrome（找不到会给可操作提示）
+    cdp_executable: str | None = None
+    #: 专用配置目录；不填 → `<state_dir>/cdp-profile`
+    cdp_profile_dir: Path | None = None
+
+
 class RateLimitSettings(BaseModel):
     """频率克制（合规红线之一）。
 
@@ -245,6 +266,9 @@ class AppSettings(BaseSettings):
 
     # ---- 频率克制 -----------------------------------------------------------
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+
+    # ---- 浏览器抓取（可选，`jh job add --cdp` 用）---------------------------
+    browser: BrowserSettings = Field(default_factory=BrowserSettings)
 
     # ---- CLI 行为 -----------------------------------------------------------
     show_reminders: bool = True
