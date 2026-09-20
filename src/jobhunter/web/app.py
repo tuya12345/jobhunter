@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session
 from jobhunter import __version__
 from jobhunter.models import Application, Company, Job
 from jobhunter.services import apply_svc, leads_svc
-from jobhunter.storage.db import create_db_engine, make_session_factory
+from jobhunter.storage.db import create_db_engine, database_problem, make_session_factory
 from jobhunter.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -121,12 +121,28 @@ def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> Fa
     engine = create_db_engine(db_url) if db_url else create_db_engine()
     session_factory = make_session_factory(engine)
 
+    # ★★ 库结构不对时，接口要**说人话**，不是一串 500（ISSUES #60）
+    #
+    #   验证会话实测：库停在迁移 0001 时 `jh leads serve` 能起来、页面也返回 200，
+    #   但 `/api/leads` 是 **HTTP 500**（原始 SQLAlchemy 堆栈）。
+    #   CLI 那条路现在会被 `require_db` 拦住（服务不再启动）；但"服务已起来、
+    #   库随后被动过"仍可能发生 —— 所以这里再兜一层：把"结构不对"翻译成
+    #   **503 + 中文说明**，而不是把堆栈丢给页面。
+    schema_problem = database_problem(db_url)
+    if schema_problem:
+        logger.warning("线索页启动时发现库结构问题：%s", schema_problem.splitlines()[0])
+
     def get_session() -> Any:
         session: Session = session_factory()
         try:
             yield session
         finally:
             session.close()
+
+    def _require_schema() -> None:
+        """接口入口的闸门：结构不对 → 503 + 可操作提示（不是 500 堆栈）。"""
+        if schema_problem:
+            raise HTTPException(status_code=503, detail=schema_problem)
 
     # ------------------------------------------------------------------
     # 只读接口
@@ -137,14 +153,21 @@ def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> Fa
         return {
             "ok": True,
             "version": __version__,
-            "leads": int(session.scalar(select(func.count()).select_from(Company)) or 0),
-            "jobs": int(session.scalar(select(func.count()).select_from(Job)) or 0),
+            # 结构有问题时也如实报出来（页面据此显示提示，而不是等接口 503）
+            "schema_problem": schema_problem.splitlines()[0] if schema_problem else None,
+            "leads": int(session.scalar(select(func.count()).select_from(Company)) or 0)
+            if not schema_problem
+            else 0,
+            "jobs": int(session.scalar(select(func.count()).select_from(Job)) or 0)
+            if not schema_problem
+            else 0,
             "frontend": (dist / "index.html").is_file(),
         }
 
     @app.get("/api/leads")
     def list_leads(session: Session = Depends(get_session)) -> dict[str, Any]:
         """按 `source_type` 分组返回线索（三态可达性见 `leads_svc.reachability_of`）。"""
+        _require_schema()
         groups: list[dict[str, Any]] = []
         totals = {"leads": 0, "applied": 0, "unchecked": 0}
         for source_type, rows in leads_svc.grouped_leads(session):
@@ -171,6 +194,7 @@ def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> Fa
     @app.get("/api/jobs")
     def list_jobs(session: Session = Depends(get_session)) -> dict[str, Any]:
         """标记投递时要选的岗位（**只读列表**，不是看板页面 —— 看板是 P8）。"""
+        _require_schema()
         rows = session.scalars(select(Job).order_by(Job.id.desc())).all()
         return {
             "jobs": [
@@ -197,6 +221,7 @@ def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> Fa
         session: Session = Depends(get_session),
     ) -> dict[str, Any]:
         """把一条线索记成某岗位的一次投递（幂等 + 如实反馈，见 `leads_svc`）。"""
+        _require_schema()
         lead = session.get(Company, lead_id)
         if lead is None:
             raise HTTPException(status_code=404, detail=f"找不到线索 id={lead_id}")
@@ -231,18 +256,26 @@ def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> Fa
     # ------------------------------------------------------------------
     # 静态页面
     # ------------------------------------------------------------------
-    target = dist_dir or frontend_dist_dir()
+    _mount_frontend(app, dist_dir or frontend_dist_dir())
+    return app
+
+
+def _mount_frontend(app: FastAPI, target: Path) -> None:
+    """把前端产物挂到 `/`；产物不存在时给一张**可操作**的说明页。
+
+    ★ 抽成函数的理由不只是"create_app 太长"：这段是"页面从哪来"的**唯一**描述，
+      与接口逻辑混在一起时最容易在改动中被碰坏（而它的失败形态是"白屏"）。
+    """
     if (target / "index.html").is_file():
         # html=True 让 `/` 直接吃 index.html；SPA 的其它路由由 fallback 处理
         app.mount("/", StaticFiles(directory=str(target), html=True), name="web")
-    else:
-        logger.warning("前端构建产物不存在：%s（%s）", target, BUILD_HINT)
+        return
 
-        @app.get("/", response_class=HTMLResponse)
-        def _missing_frontend() -> HTMLResponse:
-            return HTMLResponse(missing_frontend_html(), status_code=503)
+    logger.warning("前端构建产物不存在：%s（%s）", target, BUILD_HINT)
 
-    return app
+    @app.get("/", response_class=HTMLResponse)
+    def _missing_frontend() -> HTMLResponse:
+        return HTMLResponse(missing_frontend_html(), status_code=503)
 
 
 def _error_status(message: str) -> int:

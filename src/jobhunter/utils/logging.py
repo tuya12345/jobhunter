@@ -143,6 +143,43 @@ class RedactingFilter(logging.Filter):
 _DEFAULT_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
+class _CurrentStreamHandler(logging.StreamHandler):
+    """写日志时**现取** `sys.stdout`，而不是记住 setup 那一刻的那个流。
+
+    ★★ 为什么必须这样（一个真实踩到的坑）
+
+      `logging.StreamHandler(sys.stdout)` 会把流**存下来**。而 CLI 在被测试
+      驱动时（`typer.testing.CliRunner`），`sys.stdout` 会被替换成一个临时缓冲，
+      用完就关；于是"setup 时存下的那个流"在后续调用里是**已关闭**的，
+      任何一条日志都会让 logging 打印：
+
+          --- Logging error ---
+          ValueError: I/O operation on closed file.
+
+      ★ 触发条件很隐蔽：只有当某条命令**在捕获期间真的写了日志**才炸。
+        以前它恰好没炸是因为 `require_db()` 只查"表在不在"（不产生日志）；
+        ISSUES #60 之后它每次都会问一次 Alembic 版本，而 Alembic 会 INFO 打印
+        「Context impl SQLiteImpl.」—— 于是三条简历命令的用例立刻变红，
+        红的样子还是**满屏 Traceback 混在正常输出里**。
+
+      ★ 为什么不是"把 alembic 的日志级别调高"了事：那只治了这一个来源；
+        任何一条 `logger.warning`（比如抓取失败、配置告警）都会撞同一个坑。
+        真正的修法是"别把流存下来"。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(sys.stdout)
+        #: 上一次成功拿到的流（当前流不可用时兜底，尽量别丢日志）
+        self._fallback: object = sys.stderr
+
+    def emit(self, record: logging.LogRecord) -> None:
+        stream = sys.stdout
+        if getattr(stream, "closed", False):
+            stream = self._fallback
+        self.stream = stream
+        super().emit(record)
+
+
 def setup_logging(
     level: str | int | None = None,
     *,
@@ -177,7 +214,7 @@ def setup_logging(
         # Python 3.7+ 支持 reconfigure；某些嵌入式环境没有这个方法，故容错
         with contextlib.suppress(AttributeError, ValueError):
             sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
-        console = logging.StreamHandler(sys.stdout)
+        console = _CurrentStreamHandler()
         console.setFormatter(logging.Formatter(_DEFAULT_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
         root.addHandler(console)
 

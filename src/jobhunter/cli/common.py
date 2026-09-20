@@ -21,7 +21,7 @@ from rich.panel import Panel
 
 from jobhunter import CURRENT_PHASE
 from jobhunter.config.settings import get_settings
-from jobhunter.storage.db import database_ready, get_session_factory
+from jobhunter.storage.db import database_problem, database_ready, get_session_factory
 from jobhunter.utils.logging import setup_logging
 
 __all__ = [
@@ -144,6 +144,17 @@ def require_db() -> tuple[object, object]:
       SQLAlchemy 在表不存在时报的是 `no such table: jobs` ——
       对用户来说完全不知道该怎么办。这里换成一句"请先运行 jh init"。
 
+    ★★ 第二道判据（ISSUES #60）：**库是不是最新的**。
+      改前只查"表在不在"，于是停在旧迁移上的库被放行，然后在第一条 SQL 上
+      炸出 `no such column: http_status` 的原始堆栈（`jh leads import`）
+      或页面里一串 500（`jh leads serve`）—— 正是这句 docstring 想消灭的体验。
+      `database_ready()` 现在两条都查，这里再补上"**为什么**不能用"的说明：
+
+        · 还没建库        → "数据库还没初始化。请先运行 jh init"（原提示）
+        · 结构是旧的      → "数据库结构是旧的（当前 0001，程序需要 0005）→ 跑 jh init"
+        · 结构比程序新    → "你装的是旧版本程序 → 先升级程序，**不要**跑 jh init"
+          （第三种最容易做错：跑 jh init 会把库降到旧结构，反而丢东西）
+
     ★ 为什么它从各命令模块搬到了这里（P3 做的重构）：
       在 P2 时 `job_cmd` 与 `resume_cmd` 各写了一份**几乎一样**的 `_require_db`。
       两份代码的复制本身还能忍，真正的问题是**提示语会漂移**：
@@ -155,7 +166,8 @@ def require_db() -> tuple[object, object]:
     setup_logging()
     settings = get_settings()
     if not database_ready(settings.database_url):
-        err_console.print(INIT_HINT)
+        problem = database_problem(settings.database_url)
+        err_console.print(problem or INIT_HINT)
         raise typer.Exit(code=1)
     return get_session_factory(settings.database_url)
 

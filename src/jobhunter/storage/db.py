@@ -234,12 +234,32 @@ def get_session_factory(
 
 
 def database_ready(url: str | None = None) -> bool:
-    """数据库是否已经初始化过（库文件存在且业务表在）。
+    """数据库是否**可以使用**（库文件存在、业务表在、且迁移版本是最新的）。
 
-    用途：`jh resume add` 等命令在库还没建时给出"请先运行 jh init"，
-    而不是抛一句 `no such table: resumes` —— 后者对用户完全不可读。
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║ 这道关卡原来只问了"表在不在" —— 于是停在旧迁移上的库被放行（ISSUES #60） ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    实测（验证会话在用户真实库上撞到的）：库停在迁移 `0001`，而程序需要 `0005`。
+    `resumes` 表在 → 关卡放行 → 第一条 SQL 就炸 `no such column: http_status`，
+    用户看到的是**原始 SQLAlchemy 堆栈**（`jh leads import`）
+    或页面里**一串 500**（`jh leads serve`）。
+
+    ★ 这正是本函数 docstring 想消灭的那种体验（"no such table 对用户完全不可读"），
+      只是判据只覆盖了它被写出来时的那一个方向 —— 与 #56 是同一个形态：
+      **守卫只守了"登记了的都生效"，守不住"该登记的没登记"**。
+
+    ★ 所以现在两条都查：
+        · 表在不在（旧判据）；
+        · 迁移版本是不是程序认识的 head（新判据）。
+      版本比程序新（用户装的是旧版程序）**也算不可用** —— 那种情况跑 jh init
+      会把库降级，所以必须拦住并给另一个方向的提示（见 `schema_status`）。
+
+    Raises: 不抛异常。任何读不出来的情况都返回 False（退回"请先运行 jh init"）。
     """
     from sqlalchemy import inspect as sa_inspect
+
+    from jobhunter.storage.migrate import schema_status
 
     if url is None:
         from jobhunter.config.settings import get_settings
@@ -252,8 +272,45 @@ def database_ready(url: str | None = None) -> bool:
 
     engine = create_db_engine(url, ensure_directory=False)
     try:
-        return "resumes" in set(sa_inspect(engine).get_table_names())
+        if "resumes" not in set(sa_inspect(engine).get_table_names()):
+            return False
+        status = schema_status(engine, db_url=url)
+        # unknown（库损坏 / 脚本目录读不到）**不当成不可用** ——
+        # 修 #60 不该把"库其实好好的、只是版本读不出来"变成新的拦截点。
+        return status.is_usable or status.state == "unknown"
     except Exception:  # noqa: BLE001 - 库损坏/路径异常都当作"没准备好"
         return False
     finally:
         engine.dispose()
+
+
+def database_problem(url: str | None = None) -> str:
+    """库**为什么**不能用：返回一句中文提示（能用的库返回空串）。
+
+    与 `database_ready()` 分开的理由：判断"能不能用"和解释"为什么不能"
+    是两件事，而调用方（`require_db`）两件都要 —— 只有这样提示语才能
+    区分"还没初始化"与"结构是旧的"与"程序比库旧"。
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    from jobhunter.storage.migrate import schema_status
+
+    if url is None:
+        from jobhunter.config.settings import get_settings
+
+        url = get_settings().database_url
+
+    db_file = _sqlite_file_path(url)
+    if db_file is not None and not db_file.is_file():
+        return ""
+
+    engine = create_db_engine(url, ensure_directory=False)
+    try:
+        if "resumes" not in set(sa_inspect(engine).get_table_names()):
+            return ""
+        status = schema_status(engine, db_url=url)
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        engine.dispose()
+    return status.message()
