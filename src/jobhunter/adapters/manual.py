@@ -38,6 +38,7 @@ from typing import Any
 
 from jobhunter.adapters.base import JobDetail, JobSource
 from jobhunter.adapters.parse_html import (
+    detect_access_wall,
     detect_platform,
     extract_platform_job_id,
     parse_detail_from_html,
@@ -89,18 +90,41 @@ def html_to_detail(html: str, url: str, *, platform: str | None = None) -> JobDe
     return parse_detail_from_html(html, url, platform=platform)
 
 
-def read_html_file(path: str | Path, url: str | None = None) -> JobDetail:
+def read_html_file(
+    path: str | Path,
+    url: str | None = None,
+    *,
+    platform: str | None = None,
+) -> JobDetail:
     """从本地 HTML 文件解析岗位（用于测试、离线重放、以及"另存为网页"的兜底）。
 
     ★ 这条路是**不需要浏览器**的：抓不到/不想抓时，用户可以把页面另存为 HTML
       再走这里。它同时是 mock HTML fixture 测试的入口。
+
+    Args:
+        path: 保存下来的 HTML 文件
+        url: **原始岗位链接**（ISSUES #61）。保存下来的网页没有域名上下文，
+            不传的话只能记成 `file:///…` —— 那样 `jh job list` 点不回去，
+            第一层去重（`platform_job_id`）也用不上。
+            CLI 的 `--url` 就是给它用的。
+        platform: **强制指定平台**（ISSUES #61）。同样是"本地文件没有域名"的问题：
+            工具无从判断这是 BOSS 还是别的站，而用户是知道的（他也显式传了
+            `--platform`）。所以这里必须让它生效，而不是静默丢掉。
     """
     from jobhunter.utils.io import read_text
 
     target = Path(path)
     html = read_text(target)
     resolved_url = url or f"file:///{target.as_posix()}"
-    return html_to_detail(html, resolved_url)
+    # ★ 没有 `--platform` 时**不要**让 `detect_platform()` 去猜：它按域名判断，
+    #   而本地文件没有域名 → 会落到兜底的 `official`（"公司官网"）。
+    #   那是个**误导**：一份从 BOSS 另存下来的网页会被记成"公司官网"，
+    #   然后出现在 `jh job list --platform official` 与渠道统计里。
+    #   本地文件的事实是"我手动存下来的" → 记成 `manual` 才如实。
+    #   （用户在命令行上知道得更清楚，所以 `--platform boss` 优先级最高。）
+    if platform is None:
+        return html_to_detail(html, resolved_url, platform="manual" if url is None else None)
+    return html_to_detail(html, resolved_url, platform=platform)
 
 
 class ManualAdapter(JobSource):
@@ -108,8 +132,27 @@ class ManualAdapter(JobSource):
 
     platform = "manual"
 
-    def __init__(self, settings: AppSettings | None = None) -> None:
+    def __init__(self, settings: AppSettings | None = None, *, platform: str | None = None) -> None:
+        """Args:
+        settings: 配置（不传用单例）
+        platform: **强制指定的平台**（CLI 的 `--platform`，ISSUES #61）。
+
+            ★ 为什么需要它：`--help` 里写的是"强制指定平台（默认按域名判断）"，
+              但改前它**只对手动文本生效**，对链接抓取完全没用 —— 用户显式给出的
+              选项被静默忽略（与 #34 / #50 同一类毛病：静默忽略比报错危险得多）。
+              现在三条路（链接 / 本地 HTML / 手动文本）都认它。
+
+            ★ 为什么放在 `__init__` 而不是给 `fetch_detail()` 加参数：
+              `fetch_detail(url)` 是 `JobSource` 的抽象契约，加参数就得改 ABC
+              （而其它适配器并不需要"覆盖平台"这件事）。平台是"这次抓取的上下文"，
+              放在构造器里语义正确，也不污染接口。
+        """
         self.settings = settings or get_settings()
+        self._platform_override = platform
+
+    def _resolve_platform(self, url: str) -> str:
+        """这次抓取该用哪个平台：显式指定的优先，否则按域名判断。"""
+        return self._platform_override or detect_platform(url)
 
     # -- JobSource 接口 --------------------------------------------------
     def fetch_detail(self, url: str) -> JobDetail | None:
@@ -135,7 +178,7 @@ class ManualAdapter(JobSource):
             )
             return None
 
-        platform = detect_platform(url)
+        platform = self._resolve_platform(url)
         self._polite_delay()
 
         try:
@@ -170,6 +213,17 @@ class ManualAdapter(JobSource):
             detail.platform_job_id = extract_platform_job_id(url, platform)
         if detail.platform == "manual":
             detail.platform = platform
+
+        # ★★ 再过一道"这是不是登录墙"（ISSUES #62）：渲染**之后**能拿到的证据
+        #   比只看 HTML 多（登录页的正文往往是客户端渲染出来的）。
+        #   命中就把状态压成 failed 并清掉正文 —— 绝不让登录页文本入库。
+        if detail.fetch_status != "failed":
+            wall_note = detect_access_wall(html, rendered_text=rendered_jd or "", platform=platform)
+            if wall_note:
+                detail.fetch_status = "failed"
+                detail.fetch_note = wall_note
+                detail.jd_text = ""
+                detail.raw["access_wall"] = True
 
         if detail.fetch_status == "failed":
             logger.warning(

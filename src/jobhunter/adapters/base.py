@@ -66,6 +66,16 @@ class JobDetail:
     url: str | None = None
     # ok / failed / partial —— 抓取失败必须留痕（否则后面会基于空 JD 乱打分）
     fetch_status: str = "ok"
+    # ★ 「为什么失败 + 接下来怎么办」的一句中文说明（ISSUES #62）。
+    #
+    #   为什么要有它：抓取失败的原因不同，用户该做的事也不同 ——
+    #     · 登录墙（BOSS 详情页需要登录）→ 去浏览器另存 HTML，或改用 --manual；
+    #     · 页面改版/超时 → 重试或手动粘贴。
+    #   只给一句"没找到 JD 正文"，用户不知道下一步该干什么。
+    #
+    #   ★ 它**只存在于内存里**（不落库）：这是给"这一次失败"的解释，
+    #     而库里那一列 `jd_fetch_status` 只回答"抓到了没有"。
+    fetch_note: str | None = None
     # 原始数据（HTML/JSON），用于离线调试与解析规则迭代
     raw: dict[str, Any] = field(default_factory=dict)
 

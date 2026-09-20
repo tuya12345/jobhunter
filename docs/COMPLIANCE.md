@@ -39,13 +39,16 @@ git grep -n --untracked -E "httpx\.|requests\.|playwright|page\.(click|fill|pres
 | 调用点 | 类型 | 判定 |
 |---|---|---|
 | `llm/deepseek.py`（`httpx.Client` / `AsyncClient`） | 向 **LLM 服务商**发请求 | ✅ 合规：这是用户自己的 API Key、用户自己付钱；只发提示词，不发投递动作 |
-| `adapters/manual.py`（`sync_playwright` + `page.goto`） | 打开**用户自己粘贴的岗位链接**并读取正文 | ✅ 合规：**只读**。`goto` 是唯一的页面动作，没有任何 `click`/`fill`/`press` |
+| `adapters/manual.py`（`sync_playwright` + `page.goto`） | 打开**用户自己粘贴的岗位链接**并读取正文 | ✅ 合规：**只读**。`goto` 是唯一的页面动作，没有任何 `click`/`fill`/`press`。★ 撞到**登录墙 / 安全验证页**时**不去绕过**：识别出来（页面有登录特征词且无岗位结构）→ 标 `failed`、清空正文、一条都不入库，并告诉用户走"浏览器另存为网页 + `--html --url --platform`"或 `--manual`（ISSUES #62） |
 | `utils/clipboard.py`（`subprocess.run(["clip"])`） | 把文本写入**本机剪贴板** | ✅ 合规：本机操作，不涉及任何外部服务 |
 | `cli/commands/leads_cmd.py`（`uvicorn.run(...)`）+ `web/app.py`（FastAPI 路由） | `jh leads serve` 起一个**本机 HTTP 服务**（浏览器里看线索 / 标记投递） | ✅ 合规：**默认只绑 `127.0.0.1`**（`uvicorn.run(create_app(), host="127.0.0.1", port=8787)`，不是 `0.0.0.0`）；页面**只读 + 一个写动作**，且该写动作由**人工点击**触发、走 `apply_svc.set_status`（与 CLI **同一个写入口**）；**不做自动投递、不做批量**、不增删线索。为什么不做鉴权见 §5.6 |
 | `adapters/boss.py`（自动搜索） | —— | ❌ **未实现**（P2 的 spike 结论：自动翻页会撞风控，主路径改成"人给链接"） |
 | `adapters/app/`（模拟器侧） | —— | ➡️ **已移出本仓库**：采集端（含模拟器）独立部署在 `projects/leadhunter`（命令 `lh`）。本仓库 `src/` 里**没有** `import uiautomator2`，也没有 `jh leads add / probe / capture / export` 这些命令 —— 所以"模拟器侧的只读承诺"要在那个仓库里单独自检 |
 
 **没有任何调用会**：提交投递、发送消息、点赞/关注、绕过验证码、伪造签名、批量遍历岗位列表。
+**也不会绕过登录**：需要登录的岗位页（BOSS 详情页）**如实报失败并拒绝入库**，
+不伪造 Cookie / Referer / 指纹，不把登录页正文当成 JD（ISSUES #62 —— 那是"不报错却存垃圾"，
+比抓不到糟得多）。
 线索页也一样：它**唯一的写动作**是"人点一下 → 往**本机库**里记一笔投递"，不向任何平台发请求，
 也不存在"批量"这个入口。
 

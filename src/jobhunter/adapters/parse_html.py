@@ -372,6 +372,128 @@ def _longest_meaningful(texts: list[str], *, min_length: int = _MIN_JD_LENGTH) -
     return max(candidates, key=len)
 
 
+# ===========================================================================
+# "这页不是岗位页" 的识别（ISSUES #62）
+# ===========================================================================
+#: 登录墙 / 安全验证页在**标题**上的特征词
+_ACCESS_WALL_TITLE_MARKERS: tuple[str, ...] = (
+    "注册登录",
+    "登录",
+    "安全验证",
+    "验证码",
+    "sign in",
+    "log in",
+    "verify",
+)
+
+#: 登录墙 / 安全验证页在**正文**上的特征词（比标题更硬的证据）
+_ACCESS_WALL_TEXT_MARKERS: tuple[str, ...] = (
+    "APP扫码登录",
+    "扫码登录",
+    "验证码登录",
+    "发送验证码",
+    "登录/注册",
+    "微信登录",
+    "登录后查看",
+    "请先登录",
+    "安全验证",
+    "异常访问行为",
+    "拖动滑块",
+)
+
+#: "这确实是一个岗位页"的结构证据 —— 这些出现任意一个，就不判成墙。
+_JOB_STRUCTURE_MARKERS: tuple[str, ...] = (
+    "job-sec",
+    "job-title",
+    "job-primary",
+    "job-detail",
+    "job-desc",
+    'data-test="jobTitle"',
+    "data-test='jobTitle'",
+    "job-banner",
+    "company-info",
+)
+
+
+def detect_access_wall(
+    html: str,
+    *,
+    rendered_text: str | None = None,
+    platform: str | None = None,
+) -> str | None:
+    """判断"这一页不是岗位页，而是登录墙 / 安全验证页"，返回**可操作**的说明。
+
+    ★★ 为什么必须有这个函数（ISSUES #62，🔴）
+
+      BOSS 的岗位详情页**需要登录**才给看。抓取路径的表现是：
+
+        · 渲染后"最长文本块"是 0（真正的 JD 根本没渲染出来）；
+        · 于是 `jd_text` 走了"整页文本兜底"，把**登录页的正文**当成了 JD（312 字）；
+        · 公司 / 职位 / 城市全空，`fetch_status=partial` —— 而 CLI 只在
+          `failed` 时才拦下来 → **partial 照常入库，还打印「✓ 入库完成」**。
+
+      后果比"没抓到"严重得多：这段登录页文本会被 `jh match run` 打分、
+      被 `jh today` 拿去生成开场白、被 `jh tailor` 拿去做定制简历，
+      而**用户从输出里看不出任何异常**。这是本项目最不能接受的一类：
+      「不报错、报成功、存的却是垃圾」。
+
+    ★ 判据是**组合**的（单看哪一条都会误伤）：
+
+        ① 命中登录/验证特征词（标题或正文）；
+        ② **且**页面里没有任何岗位结构证据（`job-sec` / `job-title` /
+           `data-test=jobTitle` / company-info …）。
+
+      只满足 ① 不算墙：真实岗位页的正文里完全可能出现"登录后投递"这种句子 ——
+      而它有岗位结构，所以不会被误判。反过来，只有 ② 也不算：抓取失败/改版的
+      页面同样没有这些 class，但它不是"墙"，该走原来的"没抽到正文"提示。
+
+    Args:
+        html: 原始 HTML（本地文件或抓回来的都行）
+        rendered_text: 浏览器渲染后的正文（可选）。有它更准 ——
+            登录墙的"正文"往往是客户端渲染出来的，原始 HTML 里可能一个字都没有。
+        platform: 已知平台（只用于把提示写得更具体，比如"BOSS直聘"）
+
+    Returns:
+        命中时返回一句**中文可操作**的说明（给 CLI 直接打印），没命中返回 None。
+    """
+    body = strip_html(html or "")
+    if rendered_text:
+        body = f"{body}\n{rendered_text}"
+
+    title = _page_title(html or "") or ""
+
+    hit_title = [marker for marker in _ACCESS_WALL_TITLE_MARKERS if marker in title]
+    hit_text = [marker for marker in _ACCESS_WALL_TEXT_MARKERS if marker in body]
+    if not hit_title and not hit_text:
+        return None
+
+    lowered = (html or "").lower()
+    if any(marker.lower() in lowered for marker in _JOB_STRUCTURE_MARKERS):
+        # 有岗位结构 → 这是一张真岗位页（正文里出现"登录"是正常的）
+        return None
+    if _pick_jsonld_job(html or "") is not None:
+        return None
+
+    who = _platform_label(platform)
+    signals = "、".join(dict.fromkeys([*hit_title, *hit_text]))[:60]
+    return (
+        f"{who}的岗位详情需要**登录**才能看，抓到的是登录/验证页而不是 JD。\n"
+        f"    识别依据：页面里出现了「{signals}」，且没有任何岗位结构"
+        "（job-sec / job-title / data-test=jobTitle / JSON-LD 都没有）。\n"
+        "    两条不用绕过登录的路：\n"
+        "      · 在浏览器里打开这个岗位 → Ctrl+S 另存为网页 →\n"
+        '          jh job add --html 页面.html --url "<原链接>" --platform boss\n'
+        "      · 或者直接复制 JD 正文 →\n"
+        '          jh job add --manual --url "<原链接>" --platform boss'
+    )
+
+
+def _platform_label(platform: str | None) -> str:
+    """平台名给人看的写法（提示语里用）。"""
+    labels = {"boss": "BOSS直聘", "official": "该公司官网", "manual": "这个页面"}
+    return labels.get(platform or "", "这个站点")
+
+
 def parse_detail_from_html(
     html: str,
     url: str,
@@ -432,6 +554,16 @@ def parse_detail_from_html(
         jd_text = plain
         fetch_status = "partial" if len(plain) >= _MIN_JD_LENGTH else "failed"
 
+    # ---- ★★ 这一步必须在"整页兜底"之后（ISSUES #62）------------------------
+    #   登录墙的正文恰恰是**够长**的（312 字），所以它会安静地走完整页兜底、
+    #   拿到 partial 并被入库。这里在返回之前再判一次"这到底是不是岗位页"，
+    #   命中就把状态压成 failed 并**清掉正文** —— 宁可"没抓到"，
+    #   也不能让登录页文本流进 match / today / tailor。
+    wall_note = detect_access_wall(normalizer, platform=platform)
+    if wall_note:
+        jd_text = ""
+        fetch_status = "failed"
+
     # ---- 结构化字段：JSON-LD 优先，其次 DOM/title/meta 启发式 -----------------
     company, title_text, city_text, salary_source = _resolve_basic_fields(
         normalizer, title, metas, structured
@@ -462,10 +594,15 @@ def parse_detail_from_html(
         salary_max=salary_max,
         url=url,
         fetch_status=fetch_status,
+        # ★ 命中登录墙时把说明带上：CLI 直接打印它（用户看到的必须是
+        #   "为什么没抓到 + 接下来怎么办"，而不是一句笼统的失败）
+        fetch_note=wall_note,
         raw={
             "title_tag": title or "",
             "jd_length": len(jd_text or ""),
             "jsonld": structured is not None,
+            # 留痕：事后排查"这条为什么没入库"时，一眼能看出是登录墙
+            "access_wall": bool(wall_note),
         },
     )
 

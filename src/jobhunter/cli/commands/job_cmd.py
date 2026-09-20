@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ipaddress
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -98,6 +99,17 @@ def job_add(
         Path | None,
         typer.Option("--html", help="从本地保存的网页解析（离线/抓取被拦时的兜底）"),
     ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            "--url",
+            help=(
+                "这条记录的**原始岗位链接**（配合 --html / --manual / --text 用）。"
+                "不传的话，本地网页只能记成 file:///…：列表里点不回去，"
+                "第一层去重（platform_job_id）也用不上"
+            ),
+        ),
+    ] = None,
     keyword: Annotated[
         str | None,
         typer.Option("--keyword", "-k", help="这个岗位来自哪个搜索词/渠道（用于复盘渠道效果）"),
@@ -117,6 +129,7 @@ def job_add(
 ) -> None:
     """录入岗位：给链接 / 批量文件 / 手动粘贴 / 本地 HTML。"""
     settings = get_settings()
+    _check_url_option(url, urls=urls, html_file=html_file, manual=manual, text=text)
 
     details, failures = _collect_details(
         urls=urls,
@@ -124,24 +137,13 @@ def job_add(
         manual=manual,
         text=text,
         html_file=html_file,
+        url=url,
         platform=platform,
         settings=settings,
     )
 
     if not details and not failures:
-        err_console.print(
-            Panel(
-                "没有可录入的内容。四种用法：\n\n"
-                "  [bold]jh job add <url>[/bold]              粘贴岗位链接（主路径）\n"
-                "  [bold]jh job add --file jobs.txt[/bold]    批量（一行一个 URL）\n"
-                "  [bold]jh job add --manual[/bold]           手动粘贴 JD 文本\n"
-                "  [bold]jh job add --html page.html[/bold]   从保存的网页解析\n\n"
-                "[dim]为什么主路径是「人给链接」：BOSS 有签名与字体反爬，"
-                "自动搜索容易撞墙；而「刷到岗位 → 存下来」本来就是真实工作流。[/dim]",
-                title="缺少录入目标",
-                border_style="yellow",
-            )
-        )
+        _print_missing_input_help()
         raise typer.Exit(code=1)
 
     # ---- 打印解析结果（dry-run 到此为止）--------------------------------
@@ -152,38 +154,35 @@ def job_add(
         warn("--dry-run：以上结果没有写入数据库")
         return
 
-    engine, factory = require_db()
-    try:
-        with factory() as session:
-            created = refreshed = unchanged = 0
-            for detail in details:
-                result = job_svc.upsert_job(session, detail, source_keyword=keyword)
-                if result.outcome == "created":
-                    created += 1
-                elif result.outcome == "refreshed":
-                    refreshed += 1
-                else:
-                    unchanged += 1
-            session.commit()
-            totals = job_svc.count_by_status(session)
-    finally:
-        engine.dispose()
+    outcome = _upsert_everything(details, keyword=keyword)
 
     # ---- 汇总 ------------------------------------------------------------
     console.print()
+    stored = outcome.created + outcome.refreshed + outcome.unchanged
     parts = []
-    if created:
-        parts.append(f"[green]新增 {created}[/green]")
-    if refreshed:
-        parts.append(f"[cyan]重复遇到 {refreshed}（已刷新抓取字段）[/cyan]")
-    if unchanged:
-        parts.append(f"[dim]已存在 {unchanged}（内容无变化）[/dim]")
+    if outcome.created:
+        parts.append(f"[green]新增 {outcome.created}[/green]")
+    if outcome.refreshed:
+        parts.append(f"[cyan]重复遇到 {outcome.refreshed}（已刷新抓取字段）[/cyan]")
+    if outcome.unchanged:
+        parts.append(f"[dim]已存在 {outcome.unchanged}（内容无变化）[/dim]")
     if failures:
         parts.append(f"[red]失败 {len(failures)}[/red]")
-    success("入库完成：" + "　".join(parts))
 
-    if totals:
-        summary = "　".join(f"{status} {count}" for status, count in sorted(totals.items()))
+    # ★★ 一条都没入库时**不许打印 ✓**（ISSUES #62 的同类毛病）
+    #
+    #   改前这里无条件 `success("入库完成：…")`：全部失败时印出来的是
+    #   「✓ 入库完成：失败 1」—— 一个绿色的对勾配一句"完成"，用户扫一眼就走了。
+    #   而"报成功、其实什么都没做成"正是 #62 被定为 🔴 的理由。
+    #   现在的规矩：**有东西进库才有 ✓**；一条都没有就是明确的失败。
+    if stored:
+        success("入库完成：" + "　".join(parts))
+    else:
+        warn("没有入库任何岗位：" + "　".join(parts))
+        console.print("  [dim]上面每一条的失败原因都写在下面了。[/dim]")
+
+    if outcome.totals:
+        summary = "　".join(f"{status} {count}" for status, count in sorted(outcome.totals.items()))
         console.print(f"  [dim]库里现有：{summary}[/dim]")
 
     if failures:
@@ -202,7 +201,7 @@ def job_add(
     # ★ 一条都没入库 → 以非 0 退出。
     #   为什么较真：批量导入时如果"全部失败"却返回 0，脚本/CI 会以为成功了 ——
     #   这正是"静默失败"最典型的形态（用户第二天才发现清单是空的）。
-    if created == 0 and refreshed == 0 and unchanged == 0:
+    if outcome.created == 0 and outcome.refreshed == 0 and outcome.unchanged == 0:
         raise typer.Exit(code=1)
 
 
@@ -293,7 +292,7 @@ def job_show(
                 "抓取情况": job.jd_fetch_status or "—",
                 "来源搜索词": job.source_keyword or "—",
                 "JD 字数": str(len(job.jd_text or "")),
-                "URL": job.url or "—",
+                "URL": _display_url(job.url),
                 "内容 hash": (job.jd_hash or "—")[:16],
             }
             text = job.jd_text or ""
@@ -338,9 +337,122 @@ def job_skip(
     console.print("[dim]这条不会再出现在待投清单里；后续抓取也不会覆盖这个决定。[/dim]")
 
 
+def _display_url(url: str | None) -> str:
+    """URL 的展示写法（ISSUES #61 的第 3 条）。
+
+    ★ 为什么要专门处理 `file://`：用 `--html` 录入时，库里存的是
+      `file:///D:/…/saved.html` —— 那是**本机文件路径**，不是岗位链接。
+      直接印出来，用户会以为"这个岗位的地址就是这个"，而它点不回去、
+      也解释不了"我明明是从 BOSS 存下来的"。
+      所以标成「（本地保存的页面）+ 路径」，一眼能看出这是本地文件。
+
+      ★ 更好的做法是录入时就用 `--url "<原链接>"` 把真链接记下来 ——
+        这时这里显示的就是那个真链接（本函数只在它确实缺的时候兜底）。
+    """
+    if not url:
+        return "—"
+    if url.startswith("file:///"):
+        return f"（本地保存的页面）{url.removeprefix('file:///')}"
+    return url
+
+
 # ---------------------------------------------------------------------------
 # 内部：收集待录入的详情
 # ---------------------------------------------------------------------------
+@dataclass
+class _UpsertOutcome:
+    """一次 `jh job add` 写库后的计数（只给汇总那几行用）。"""
+
+    created: int = 0
+    refreshed: int = 0
+    unchanged: int = 0
+    totals: dict[str, int] = field(default_factory=dict)
+
+
+def _upsert_everything(details: list[JobDetail], *, keyword: str | None) -> _UpsertOutcome:
+    """把解析好的详情逐条入库，返回各类计数。
+
+    ★ 抽出来的理由不只是"函数太长"：这段是**唯一写库的地方**，
+      与上面"解析/打印"分开之后，"打印成功"与"真的写进去了"之间就没有别的分支了
+      （ISSUE #62 的教训：报成功与实际入库必须一一对应）。
+    """
+    engine, factory = require_db()
+    try:
+        with factory() as session:
+            outcome = _UpsertOutcome()
+            for detail in details:
+                result = job_svc.upsert_job(session, detail, source_keyword=keyword)
+                if result.outcome == "created":
+                    outcome.created += 1
+                elif result.outcome == "refreshed":
+                    outcome.refreshed += 1
+                else:
+                    outcome.unchanged += 1
+            session.commit()
+            outcome.totals = dict(job_svc.count_by_status(session))
+    finally:
+        engine.dispose()
+    return outcome
+
+
+def _print_missing_input_help() -> None:
+    """什么都没给时，把四种用法摆出来（而不是甩一句「参数错误」）。"""
+    err_console.print(
+        Panel(
+            "没有可录入的内容。四种用法：\n\n"
+            "  [bold]jh job add <url>[/bold]              粘贴岗位链接（主路径）\n"
+            "  [bold]jh job add --file jobs.txt[/bold]    批量（一行一个 URL）\n"
+            "  [bold]jh job add --manual[/bold]           手动粘贴 JD 文本\n"
+            "  [bold]jh job add --html page.html[/bold]   从保存的网页解析\n"
+            '  [dim]（后两种可以配 --url "<原链接>" --platform boss，'
+            "把原始链接与平台一起记下来）[/dim]\n\n"
+            "[dim]为什么主路径是「人给链接」：BOSS 有签名与字体反爬，"
+            "自动搜索容易撞墙；而「刷到岗位 → 存下来」本来就是真实工作流。[/dim]",
+            title="缺少录入目标",
+            border_style="yellow",
+        )
+    )
+
+
+def _check_url_option(
+    url: str | None,
+    *,
+    urls: list[str] | None,
+    html_file: Path | None,
+    manual: bool,
+    text: str | None,
+) -> None:
+    """校验 `--url`（ISSUES #61）——**不许静默忽略一个显式给出的选项**。
+
+    `--url` 的语义是"给这条记录补上原始岗位链接"，只在 `--html` / `--manual` /
+    `--text` 下有意义。两种矛盾输入都当场报错，而不是挑一个听：
+
+      · 与位置参数（岗位链接）同时给 → 链接已经由位置参数提供了，两个都听
+        等于静默挑一个；
+      · 单独给（没有任何输入方式）→ 没有任何东西可以挂这条链接。
+
+    ★ 为什么走"报错"而不是"警告后忽略"：这正是 #34 / #50 / #61 反复出现的那一类
+      ——**静默忽略比报错危险得多，因为用户不会知道自己少了什么**。
+    """
+    if not url:
+        return
+    if urls:
+        err_console.print(
+            "[red]--url 与位置参数（岗位链接）不能同时用[/red]：\n"
+            "  · 抓链接：直接给位置参数 —— [bold]jh job add <url>[/bold]\n"
+            "  · 补链接：配合 --html / --manual / --text —— "
+            '[bold]jh job add --html 页面.html --url "<原链接>"[/bold]'
+        )
+        raise typer.Exit(code=1)
+    if not (html_file or manual or text):
+        err_console.print(
+            "[red]--url 需要配合一种输入方式[/red]：\n"
+            '  · jh job add --html 页面.html --url "<原链接>" --platform boss\n'
+            '  · jh job add --manual --url "<原链接>" --platform boss'
+        )
+        raise typer.Exit(code=1)
+
+
 def _collect_details(
     *,
     urls: list[str] | None,
@@ -348,6 +460,7 @@ def _collect_details(
     manual: bool,
     text: str | None,
     html_file: Path | None,
+    url: str | None,
     platform: str | None,
     settings: object,
 ) -> tuple[list[JobDetail], list[str]]:
@@ -355,6 +468,12 @@ def _collect_details(
 
     ★ 分批处理的顺序即"优先级"：显式给的链接 → 批量文件 → 本地 HTML → 手动文本。
       用户的真实用法通常只走其中一条，但允许混用（比如"给两个链接 + 粘一段文本"）。
+
+    ★★ `platform` 现在对**三条路都生效**（ISSUES #61）：
+      改前它只在手动文本那条路上被传下去，链接抓取与本地 HTML 都静默忽略它 ——
+      而 `--help` 写的是"强制指定平台"。本地 HTML 恰恰是最需要它的场景：
+      保存下来的网页**没有域名上下文**，工具无从判断是 BOSS 还是别的站，
+      用户显式说了却被丢掉。现在：**要么真的用它，要么明确报错**，不许两者都不做。
     """
     from jobhunter.adapters.manual import ManualAdapter, read_html_file
 
@@ -366,15 +485,20 @@ def _collect_details(
         targets.extend(_read_url_file(file))
 
     if targets:
-        adapter = ManualAdapter(settings)  # type: ignore[arg-type]
-        for url in targets:
-            console.print(f"  [dim]抓取中… {url}[/dim]")
-            detail = adapter.fetch_detail(url)
+        # 平台覆盖经构造器传进去（见 ManualAdapter.__init__ 的说明）
+        adapter = ManualAdapter(settings, platform=platform)  # type: ignore[arg-type]
+        for target in targets:
+            console.print(f"  [dim]抓取中… {target}[/dim]")
+            detail = adapter.fetch_detail(target)
             if detail is None:
-                failures.append(f"{url}（打开失败/超时）")
+                failures.append(f"{target}（打开失败/超时）")
                 continue
             if detail.fetch_status == "failed":
-                failures.append(f"{url}（页面里没找到 JD 正文，可改用 --manual 粘贴）")
+                # ★ 失败原因不同、用户该做的事也不同：适配器给了 `fetch_note`
+                #   就直接用它（登录墙会带上"两条不用绕过登录的路"）；
+                #   没有 note 的（页面改版/超时）才退回那句通用提示。
+                reason = detail.fetch_note or "页面里没找到 JD 正文，可改用 --manual 粘贴"
+                failures.append(f"{target}\n    {reason}")
                 continue
             details.append(detail)
 
@@ -383,9 +507,16 @@ def _collect_details(
             failures.append(f"{html_file}（文件不存在）")
         else:
             try:
-                details.append(read_html_file(html_file))
+                # ★ 把 url 与 platform 一起传下去（#61 的两个缺口就在这里）
+                parsed = read_html_file(html_file, url=url, platform=platform)
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{html_file}（解析失败：{exc}）")
+            else:
+                if parsed.fetch_status == "failed":
+                    reason = parsed.fetch_note or "这个网页里没解析出 JD 正文"
+                    failures.append(f"{html_file}\n    {reason}")
+                else:
+                    details.append(parsed)
 
     content = text
     if manual and content is None:
@@ -395,7 +526,13 @@ def _collect_details(
         if not content.strip():
             failures.append("手动粘贴的内容是空的")
         else:
-            details.append(parse_detail_from_text(content, platform=platform or "manual"))
+            details.append(
+                parse_detail_from_text(
+                    content,
+                    url=url,
+                    platform=platform or "manual",
+                )
+            )
 
     return details, failures
 
