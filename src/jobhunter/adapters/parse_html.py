@@ -259,6 +259,23 @@ def _pick_jsonld_job(html: str) -> dict[str, Any] | None:
     return best
 
 
+#: "看起来像薪资"的判断（用于解析不出月薪数值时，仍把原文留在 `salary_text` 里）
+_SALARY_HINT_RE = re.compile(r"\d")
+
+
+def _looks_like_salary_text(text: str) -> bool:
+    """这段文字像不像薪资？
+
+    ★ 门槛刻意定得低（有数字 + 有个薪资单位/字），因为它的用途是
+      "**留原文**"而不是"算数"：日薪（`100-180元/天`）、年薪、`薪资面议`
+      这类形态算不出月薪，但丢掉就等于告诉用户"页面上没写薪资"。
+      真正需要防的是把"公司规模 20-99人"当薪资 —— 那种不含上面的单位词。
+    """
+    if not text or len(text) > 40 or not _SALARY_HINT_RE.search(text):
+        return False
+    return any(word in text for word in ("元", "K", "k", "万", "薪", "面议", "/天", "/月", "/年"))
+
+
 def _salary_from_dom(html: str) -> str:
     """从页面上"看起来是薪资"的元素里取文本（比全文搜数字可靠）。
 
@@ -575,9 +592,33 @@ def parse_detail_from_html(
     #   美团页面 1.6 MB 的 HTML 里有大量 SVG 路径与内联样式数据，
     #   里面恰好出现 `1k` 这样的片段，于是薪资被抽成 `1k`（1000 元/月）——
     #   而那个岗位页面**根本没写薪资**。先 strip_html 再抽，就不会误判。
+    #
+    # ★★ 城市/经验/学历也一律在**主区域**里抽（ISSUES #64）：
+    #   改前用的是 `normalizer[:4000]` —— 对真实页面那 4000 字符**整个是 <head>**
+    #   （script/link/meta），所以 city / salary 永远是 None。
+    #   BOSS 真实页面上城市与经验就在 `class="info-primary"` 里的
+    #   `<a class="text-desc text-city">深圳</a>` / `<span class="text-desc text-experiece">`。
+    region = _main_job_region(normalizer)
+    region_text = strip_html(region)
+
     if not salary_source:
-        salary_source = _salary_from_dom(normalizer)
-    salary_text, salary_min, salary_max = extract_salary(salary_source or strip_html(normalizer))
+        salary_source = _salary_from_dom(region)
+    # ★ 找不到薪资元素时，退回"主区域文本 + 页面 title" ——
+    #   BOSS 的 `<title>` 就写着 `岗位_公司_15-25K_深圳_招聘`，那是**这个岗位**的薪资；
+    #   而**绝不**退到整页文本：那会把"相似职位"里的薪资抽过来（#64 的教训）。
+    salary_text, salary_min, salary_max = extract_salary(
+        salary_source or f"{region_text}\n{title or ''}"
+    )
+    if not salary_text and salary_source:
+        # ★ 解析不出"月薪数值"时，把**原样的薪资文本**留着（ISSUES #64 顺带修的）：
+        #   实习岗常写日薪（`100-180元/天`）、也有年薪/面议，
+        #   `extract_salary` 只认"能换算成月薪"的形态，于是这些会整条丢掉 ——
+        #   用户在表格里看到的是"薪资 —"，而网页上明明写着。
+        #   数值列（salary_min/max）保持 None 是**对的**（日薪≠月薪，不能硬换），
+        #   但字符串列应当如实留下原文。
+        candidate = strip_html(salary_source).strip().split("\n")[0].strip()
+        if _looks_like_salary_text(candidate):
+            salary_text = candidate
 
     return JobDetail(
         platform=platform,
@@ -585,10 +626,10 @@ def parse_detail_from_html(
         platform_job_id=job_id,
         company=company,
         title=title_text,
-        city=city_text or extract_city(normalizer[:4000]) or extract_city(title or ""),
-        experience=extract_experience(normalizer[:4000]),
-        education=extract_education(normalizer[:4000]),
-        is_intern=looks_intern_from(normalizer, structured, title_text, jd_text),
+        city=city_text or extract_city(region_text) or extract_city(title or ""),
+        experience=extract_experience(region_text),
+        education=extract_education(region_text),
+        is_intern=looks_intern_from(region, structured, title_text, jd_text),
         salary_text=salary_text,
         salary_min=salary_min,
         salary_max=salary_max,
@@ -781,37 +822,114 @@ _SITE_NAMES = (
 
 
 def _is_site_name(text: str) -> bool:
-    """判断一段文字是不是"招聘站点自己的名字"。"""
+    """判断一段文字是不是"招聘站点自己的名字"。
+
+    ★★ 必须是**整段相等**，不能是"包含"（ISSUES #64 踩到的真 bug）：
+
+      改前这里写的是 `any(name in lowered for name in _SITE_NAMES)`，
+      而名单里有 `"招聘"` 这个通用词 —— 于是**任何**含"招聘"两字的段落都被当成站点名丢掉：
+
+          `「AI FDE 实习生【企业 AI 解决方案方向】招聘」_智玩店科技招聘-BOSS直聘`
+          → 三段全被过滤 → 解析结果 `[]` → 公司名退化成"猜不出来"，
+            连带 city / salary 也一起丢了（它们本来靠 title 兜底）。
+
+      真实站点段的形态恰恰是"品牌 + 招聘"（`智联招聘`）或整段就是通用词（`校园招聘`），
+      所以规则分成两条：
+        · 通用词（招聘 / 官网 / 首页 / 校园招聘…）→ **必须整段相等**才算站点段；
+        · 品牌名（BOSS直聘 / 字节跳动…）→ 整段相等，或"以它结尾"（`…BOSS直聘` 这种拼接）。
+    """
     lowered = text.strip().lower()
-    return any(name in lowered for name in _SITE_NAMES)
+    if not lowered:
+        return False
+    if lowered in _GENERIC_TITLE_WORDS:
+        return True
+    # ★ 通用词只能"整段相等"（上面那一行），**不能**参与"结尾匹配"：
+    #   名单里有 `"招聘"`，一参与，"虚构科技招聘"就会被当成站点名丢掉（#64 原症状）。
+    return any(
+        lowered == name or (name not in _GENERIC_TITLE_WORDS and lowered.endswith(name))
+        for name in _SITE_NAMES
+    )
+
+
+#: 这些词在 title 里是**通用词**，整段等于它们才算噪音段（不能"包含"就丢）。
+#: ★ 为什么单独一张表：`招聘` 出现在公司名末尾是极常见的（`智玩店科技招聘`），
+#:   一"包含"就丢会连公司名一起丢掉（#64）。
+_GENERIC_TITLE_WORDS = (
+    "招聘",
+    "官网",
+    "首页",
+    "校园招聘",
+    "社会招聘",
+    "人才招聘",
+    "职位",
+)
+
+
+def _clean_title_segment(part: str) -> str:
+    """把 title 的一个分段清洗成"能当字段用"的样子。
+
+    真实 title 的样式很花（ISSUES #64 的实例）：
+        · 整段被引号包起来：`「AI FDE 实习生【企业 AI 解决方案方向】招聘」`
+        · 末尾挂一个通用词：`智玩店科技招聘`
+
+    所以这里去掉首尾的引号/空白，并剥掉**末尾**的通用词 ——
+    但只在剥完还剩东西时才剥（否则"招聘"本身会被剥成空串）。
+    """
+    cleaned = part.strip().strip("「」『』\"'“”‘’").strip()
+    for word in _GENERIC_TITLE_WORDS:
+        if cleaned.endswith(word) and len(cleaned) > len(word):
+            cleaned = cleaned[: -len(word)].strip("「」『』\"'“”‘’").strip()
+            break
+    return cleaned
 
 
 def _split_page_title(title: str | None) -> list[str]:
     if not title:
         return []
     parts = [part.strip() for part in _TITLE_SPLIT_RE.split(title) if part.strip()]
-    # 去掉明显的噪音段（"招聘""BOSS直聘"这类站点后缀）
-    return [part for part in parts if not _is_site_name(part)]
+    # 去掉站点名分段，再把剩下的清洗干净（去引号、剥末尾通用词）
+    cleaned = [_clean_title_segment(part) for part in parts if not _is_site_name(part)]
+    return [part for part in cleaned if part]
 
 
 def _guess_job_title(html: str, title: str | None) -> str | None:
-    """猜岗位名：① 显式的岗位名容器 → ② 页面 title 的第一段。
+    """猜岗位名：① 主区域里的岗位名容器 → ② 页面 title 的第一段。
 
     ★ 为什么**不**直接取 `<h1>`（实测踩过）：很多站点的第一个 `<h1>` 是
       站点 logo / 导航（字节的岗位页第一个 h1 是"校园招聘"），
       直接把导航词当成岗位名写进库，而它是**完全错的字段**。
 
-      所以这里只认"语义明确的岗位名容器"：
-        · `data-test="jobTitle"`（前端为自动化测试写的属性，最稳）
-        · class 里明确含 `job-title` / `jobTitle` 的元素
-      都没有时，退回页面 `<title>` 的第一段 —— 那是站点给搜索引擎看的，
-      几乎所有招聘站都会写成"岗位名 - 公司 - 站点"。
+    ★★ 为什么还要"限定主区域"（ISSUES #64）：真实 BOSS 页面上，
+      `class` 含 `job-title` 的元素**有好几个都在"相似职位"推荐位里**
+      （推荐卡片的职位名），全页找第一个就可能抽到**别的岗位**的名。
+      而当前岗位的名字在 `class="info-primary"` 里的 `<h1 title="…">` 上。
+
+    所以顺序是：
+        ① `info-primary` 里的 `h1[title]` 或 `h1`（真实 BOSS 结构，最准）
+        ② `data-test="jobTitle"`（前端为自动化测试写的属性，最稳）
+        ③ **主区域**内 class 含 `job-title` / `jobTitle` 的元素
+        ④ 页面 `<title>` 的第一段
     """
+    region = _main_job_region(html or "")
+
+    # ① BOSS：`<div class="info-primary"> … <div class="name"><h1 title="岗位名">`
+    for block in _text_of_elements_with_class(region, "info-primary"):
+        match = re.search(
+            r"""(?is)<h1\b[^>]*\btitle\s*=\s*["'](?P<attr>[^"']{2,120})["']"""
+            r"""|<h1\b[^>]*>(?P<text>.*?)</h1>""",
+            block,
+        )
+        if match:
+            candidate = (match.group("attr") or strip_html(match.group("text") or "")).strip()
+            candidate = candidate.split("\n")[0].strip()
+            if candidate and 2 <= len(candidate) <= 120:
+                return candidate
+
     for pattern in (
         r"""(?is)<[^>]+data-test\s*=\s*["'][^"']*job[-_]?title[^"']*["'][^>]*>(?P<text>.*?)</""",
         r"""(?is)<[^>]+class\s*=\s*["'][^"']*job[-_]?title[^"']*["'][^>]*>(?P<text>.*?)</""",
     ):
-        for match in re.finditer(pattern, html or ""):
+        for match in re.finditer(pattern, region):
             candidate = strip_html(match.group("text")).split("\n")[0].strip()
             # 过滤掉明显不是标题的（空的、或过长的整段文字）
             if candidate and 2 <= len(candidate) <= 80:
@@ -822,25 +940,150 @@ def _guess_job_title(html: str, title: str | None) -> str | None:
 
 
 def _guess_company(html: str, title: str | None) -> str | None:
-    """猜公司名：先看公司区块，再用页面 title 兜底。
+    """猜公司名：**只在当前岗位那一段里找**，最后才用页面 title 兜底。
 
-    ★ title 的两种真实布局（实测）：
-        · `岗位_公司_薪资_城市_招聘-BOSS直聘` → 第二段是公司
-        · `岗位 - 公司 - 站点名`（字节）      → **去掉站点名后，最后一段是公司**
-      站点名（"字节跳动""BOSS直聘"…）会被 `_split_page_title` 滤掉，
-      所以规则可以统一成：**取"去掉站点名之后"的最后一段**。
-      （第一段永远是岗位名，取最后一段对两种布局都成立。）
+    ★★ 为什么必须限定"当前岗位那一段"（ISSUES #64，真实 BOSS 页面实测）
+
+      改前是"全页找第一个 class 含 company-info / company-name 的元素"。
+      而真实 BOSS 页面上：
+
+        · `class="company-info"` 的**第一个**命中出现在"相似职位"推荐位里，
+          它的内层文本以 `<div class="name">`（**那张卡片的职位名**）开头 ——
+          于是公司名被抽成了**职位名**（`company == title`，看起来还挺像对的）；
+        · `class="company-name"`（6 处）**全是推荐位里的别家公司**，
+          一处都不是当前岗位的公司；
+        · 真正的公司名在 `class="sider-company"` 里，而且写在 `<a title="…">` 属性上。
+
+      所以规则改成"按可靠性排序 + 限定区域"：
+
+        ① `sider-company` 里 `<a title="X">` 的 title 属性（BOSS 真实页面，最准）
+        ② `sider-company` 的内层文本（去掉"公司基本信息"这类标签行）
+        ③ **主区域**内的 company-info / company-name / company / cname
+        ④ 页面 `<title>` 的公司段（`岗位_公司_招聘-BOSS直聘` 这种）
+
+      `_main_job_region()` 会把推荐位切掉，所以 ③ 再也不会读到"别家公司"。
     """
-    for token in ("company-info", "company-name", "company_name", "cname", "company"):
-        for text in _text_of_elements_with_class(html or "", token):
-            cleaned = strip_html(text)
-            if cleaned:
-                return cleaned.split("\n")[0].strip() or None
+    region = _main_job_region(html or "")
 
+    # ① BOSS 真实页面：公司名在 sider 里的 a[title] 属性上
+    #   （`_text_of_elements_with_class` 返回的是**内层 HTML**，所以能读属性）
+    sider = "".join(_text_of_elements_with_class(region, "sider-company"))
+    if sider:
+        match = re.search(r'(?is)<a\b[^>]*\btitle\s*=\s*["\'](?P<name>[^"\']{2,80})["\']', sider)
+        if match:
+            candidate = _clean_company(match.group("name"))
+            if candidate:
+                return candidate
+
+    # ② sider 的内层文本（跳过"公司基本信息"这类标签行）
+    if sider:
+        for line in strip_html(sider).split("\n"):
+            candidate = _clean_company(line)
+            if candidate:
+                return candidate
+
+    # ③ 主区域内的候选 token（顺序即优先级）
+    for token in ("company-info", "company-name", "company_name", "cname", "company"):
+        for text in _text_of_elements_with_class(region, token):
+            candidate = _clean_company(strip_html(text).split("\n")[0])
+            if candidate:
+                return candidate
+
+    # ④ 页面 title 的公司段
     parts = _split_page_title(title)
     if len(parts) >= 2 and parts[-1]:
-        return parts[-1]
+        return _clean_company(parts[-1])
     return None
+
+
+#: 公司名里不该出现的"标签行"（真实页面里它们是同一个容器里的标题）
+_COMPANY_LABEL_WORDS = ("公司基本信息", "公司简介", "基本信息", "公司信息", "工商信息")
+
+
+def _clean_company(text: str) -> str | None:
+    """把候选文本整理成公司名；明显不是公司名的返回 None。
+
+    ★ 为什么要有它：真实页面里同一个容器里往往混着"公司基本信息"这种标题、
+      以及"未融资 20-99人 互联网"这类规模信息。直接当公司名存进去，
+      会污染 `name_norm`（去重键）—— 那正是 #64 说"公司名是去重键"的意思。
+    """
+    cleaned = text.strip().strip("「」『』\"'“”‘’").strip()
+    if not cleaned or cleaned in _COMPANY_LABEL_WORDS:
+        return None
+    if len(cleaned) > 60:
+        return None
+    # 规模/融资信息（"未融资 20-99人 互联网"）不是公司名
+    if re.search(r"\d+\s*-\s*\d+\s*人", cleaned) or "未融资" in cleaned or "已上市" in cleaned:
+        return None
+    return cleaned
+
+
+#: 推荐位 / 相似职位的标志。它们**之后**的内容不是当前岗位的信息。
+#: ★ 实测来源（ISSUES #64）：BOSS 真实页面上 `company-name` 全在推荐位里。
+_RECOMMEND_MARKERS: tuple[str, ...] = (
+    "similar-job",
+    "job-recommend",
+    "recommend-job",
+    "job-list-wrapper",
+    "guess-like",
+    "job-card-wrapper",
+)
+
+#: 主区域最多截多长（真实页面 450KB，主区域通常几 KB；这个上限只防病态输入）
+_MAIN_REGION_LIMIT = 400_000
+
+#: 主区域可能的起点（按"最先出现"取）。
+#: ★ 名单要**宽**一些：各站的容器名不同（BOSS 用 `job-primary`/`info-primary`，
+#:   其它站用 `job-banner` / `job-header` / `job-box`），漏一个就会把
+#:   "薪资/城市"这类字段切到区域之外（实测踩过：fixture 用的是 `job-banner`）。
+_MAIN_REGION_STARTS: tuple[str, ...] = (
+    'class="job-primary',
+    "class='job-primary",
+    'class="info-primary',
+    "class='info-primary",
+    'class="job-banner',
+    "class='job-banner",
+    'class="job-header',
+    "class='job-header",
+    'class="job-box',
+    "class='job-box",
+    'class="job-detail',
+    "class='job-detail",
+    'class="job-sider',
+    "class='job-sider",
+    'class="job-sec',
+    "class='job-sec",
+)
+
+
+def _main_job_region(html: str) -> str:
+    """截出"当前岗位"那一段（把相似职位/推荐位排除在外）。
+
+    ★ 为什么需要它（ISSUES #64）：真实招聘页把"当前岗位"和"相似职位推荐"
+      放在同一个文档里，而且**两边的类名会撞**（BOSS 上 `company-name`
+      只出现在推荐位里，`company-info` 的第一处命中也在推荐位）。
+      正则解析没有 DOM 作用域，所以只能靠"区域切分"来补这一课。
+
+    实现：从第一个主区域标志开始，切到**其后**第一个推荐位标志之前。
+    找不到起点就返回整页（保持旧行为，不会更差）；找不到推荐位标志就切到结尾。
+    """
+    if not html:
+        return ""
+
+    start = -1
+    for marker in _MAIN_REGION_STARTS:
+        index = html.find(marker)
+        if index >= 0 and (start < 0 or index < start):
+            start = index
+    if start < 0:
+        return html[:_MAIN_REGION_LIMIT]
+
+    end = len(html)
+    for marker in _RECOMMEND_MARKERS:
+        index = html.find(marker, start)
+        if index >= 0:
+            end = min(end, index)
+    return html[start : min(end, start + _MAIN_REGION_LIMIT)]
 
 
 #: 用户手写字段：`公司：xxx` / `职位：xxx` / `岗位：xxx`
