@@ -49,14 +49,17 @@ jobs:
         # 如果有人改了依赖却忘了提交 uv.lock，这里会红 —— 防止"我这儿能跑"
         run: uv lock --check
 
-      - name: 安装依赖（含 dev 组与 docx extra）
+      - name: 安装依赖（含 dev 组与 docx / web extra）
         # ★ `--extra docx` 不能省（ISSUES #16，实测踩到）：
         #   `tests/unit/test_docx_reader.py`、`test_resume_svc.py`、`test_resume_cli.py`
         #   顶部都是 `pytest.importorskip("docx")` —— 不装这个 extra 时
         #   **73 条简历解析测试会被整体静默跳过**，而 CI 依然显示绿。
         #   那等于"CI 在 Windows 上真验证简历解析"这件事从来没有发生过。
+        # ★ `--extra web`（P7，ISSUE #59）：`tests/unit/test_leads_api.py` 用 FastAPI 的
+        #   TestClient 测接口。不装的话那一整个文件会被 importorskip 跳过 ——
+        #   又是"CI 绿着、但其实没测"的同一种坑。
         #   （其余 extra 不用装：browser/emulator 的测试带 marker，默认排除。）
-        run: uv sync --locked --python ${{ matrix.python-version }} --extra docx
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra docx --extra web
 
       - name: ruff 检查（默认规则集）
         run: uv run ruff check .
@@ -115,3 +118,48 @@ jobs:
       - name: 报告 SQLite 版本（排查"外键/WAL 行为差异"时有用）
         # SQLite 版本会影响 PRAGMA 与 batch 迁移行为，出问题时第一个要看的就是它
         run: uv run python -c "import sqlite3; print('sqlite', sqlite3.sqlite_version)"
+
+  frontend:
+    name: 前端构建（web/）
+    # ★ 为什么单开一个 job、而不是塞进上面的矩阵（P7 / ISSUE #59）：
+    #   · 上面那个 job 在 ubuntu + windows 各跑一遍，Node 步骤塞进去会跑两次，
+    #     而前端构建与操作系统无关（它就是 tsc + vite）；
+    #   · 前端失败与后端失败是**两件事**，分开显示更容易看出该去修哪边。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # ★ 24：`npm test` 用 `node --test` 直接跑 `.ts`
+          #   （Node 的原生类型擦除，需要 ≥ 22.18）。钉大版本、不钉小版本，
+          #   与"前端零测试框架依赖"这个取舍配套。
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 装依赖（严格按锁文件）
+        working-directory: web
+        run: npm ci
+
+      - name: 纯函数测试（三态可达性 / 投递反馈）
+        # 不引 vitest/jest：两条最容易做错的逻辑（可达性三态、投递结果文案）
+        # 被抽成纯函数，`node --test` 就能跑 —— 零新依赖换来"这两条真有测试"。
+        working-directory: web
+        run: npm test
+
+      - name: 构建（tsc --noEmit + vite build）
+        working-directory: web
+        run: npm run build
+
+      - name: 构建产物不进仓库
+        # 与 `.gitignore` 里的 `web/dist/` 配套：**源码进仓库、产物不进**。
+        # 这条断言是"规则真的生效"的证据（只看 .gitignore 不够 ——
+        # 有人 `git add -f` 就绕过去了）。
+        run: |
+          if [ -n "$(git ls-files web/dist)" ]; then
+            echo "web/dist 里有被跟踪的文件，构建产物不该进仓库："
+            git ls-files web/dist
+            exit 1
+          fi
+          echo "web/dist 未被跟踪 ✓"

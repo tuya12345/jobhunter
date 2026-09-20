@@ -65,6 +65,15 @@ coverage.xml
 #   notes/2026-09-06-JobHunter-开发与验证双会话说明.md §二）。
 .workbuddy-ai/
 
+# ---- P7 消费端的前端（`web/`，React + Vite）---------------------------------
+# 前端**源码进仓库**（能复现），**构建产物不进仓库**（体积大、且每次构建都不一样）。
+# `dist/` 上面已经有一条通用规则覆盖了 `web/dist/`；这里显式再写一条，
+# 是为了让"为什么 dist 不在仓库里"这件事在 .gitignore 里也看得见 ——
+# CI 里还有一条 `git ls-files web/dist` 必须为空的检查（见 .github/workflows/ci.yml）。
+web/node_modules/
+web/dist/
+web/.vite/
+
 # ---- 编辑器 / 系统 ----------------------------------------------------------
 .idea/
 .vscode/

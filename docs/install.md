@@ -83,6 +83,7 @@ Installed 46 packages in 7.30s
 │ resume      简历：导入解析 / 列表 / 拆分方向（P1）                          │
 │ job         岗位：给链接抓详情 / 批量 / 手动粘贴 / 列表（P2）               │
 │ match       匹配打分：跑分 / 明细解释 / 人工裁决（P3）                      │
+│ cache       LLM 缓存：看命中率/成本（stats）、清缓存（clear）               │
 │ gap         反向技能缺口分析：跨岗位聚合，告诉你该补什么（P3）              │
 │ today       今日待投清单：打分排序 / 一键复制开场白 / 额度检查（P4）        │
 │ apply       投递打标：批量(3=applied) / 模糊匹配 / 单条 / 待处理列表 /      │
@@ -92,7 +93,8 @@ Installed 46 packages in 7.30s
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-能看到这张表，就说明装好了。
+能看到这张表，就说明装好了。（`leads` 就是 P7 消费端：`jh leads import` / `jh leads serve`，
+见 [§9](#9-p7-消费端导入线索快照--打开本机线索页)。）
 
 ### 用 uv 的三条注意
 
@@ -171,6 +173,7 @@ pip install pytest pytest-asyncio pytest-cov ruff mypy
 
 ```powershell
 pip install -e ".[docx,browser]"
+pip install -e ".[web]"          # 只想用 jh leads serve 的线索页时
 ```
 
 其他与方式一的差异：
@@ -190,10 +193,11 @@ pip install -e ".[docx,browser]"
 
 | extra | 装了什么 | 什么时候需要 | 不装会怎样 |
 |---|---|---|---|
-| `browser` | `playwright>=1.45` | `jh job add <链接>` 从页面抓 JD 正文（P2 主路径）；也是 P7 抓屏的前提 | 抓取失败：日志里出现"没装 Playwright，无法抓取"，汇总里计入"失败 N"。**仍可**用 `--manual` / `--text` / `--html` 录入岗位 |
+| `browser` | `playwright>=1.45` | `jh job add <链接>` 从页面抓 JD 正文（P2 主路径） | 抓取失败：日志里出现"没装 Playwright，无法抓取"，汇总里计入"失败 N"。**仍可**用 `--manual` / `--text` / `--html` 录入岗位 |
 | `docx` | `python-docx>=1.1` | 读 `.docx` 简历（`jh resume add`）、导出 docx（`jh tailor export`） | `jh resume add 简历.docx` → `导入失败：读取 .docx 需要 python-docx…`；导出 → `导出 docx 需要 python-docx，但当前环境没装`，可改用 `--format md` 或先转 `.txt` |
+| `web` | `fastapi>=0.115` + `uvicorn>=0.30` | **只有 `jh leads serve`**（P7 消费端的本机线索页，见 [§9](#9-p7-消费端导入线索快照--打开本机线索页)） | `jh leads serve` 报「缺少 Web 依赖」并告诉你装哪条命令。★ **`jh leads import` 不受影响**：导入只用主依赖里的 pydantic |
 | `llm` | `openai>=1.30` | 目前**不需要**（见下） | 实测**不影响任何功能** |
-| `emulator` | `uiautomator2==3.2.2`（钉死版本） | P7 的 App 线索**技术验证**（尚未实现，见 [§9](#9-模拟器p7-才需要现在可以先跳过)） | 现在不需要装 |
+| `emulator` | `uiautomator2==3.2.2`（钉死版本） | 现在**用不到**：模拟器/抓屏属于**采集端**（独立部署 `projects/leadhunter`，命令 `lh`，见 [§9](#9-p7-消费端导入线索快照--打开本机线索页)） | 装不装都不影响本仓库的任何命令（`src/` 里没有 `import uiautomator2`） |
 
 **关于 `[llm]` 的实话**：这一组声明的是 OpenAI SDK，但当前的 DeepSeek Provider 是
 用 `httpx` **手写**的（`src/jobhunter/llm/deepseek.py` 开头解释了为什么：只用两个请求字段、
@@ -202,7 +206,9 @@ pip install -e ".[docx,browser]"
 这一组是留给将来（function calling / 流式工具调用）的。
 
 装完 `[browser]` 必须再下浏览器内核（命令见 [§1](#1-方式一uv推荐可复现) / [§2](#2-方式二标准-venv--pip)）。
-`[emulator]` 的额外步骤见 [§9](#9-模拟器p7-才需要现在可以先跳过)。
+`[web]` 除了两个 Python 包，还要**构建一次前端产物**（否则页面打不开，接口照常）——
+两步都在 [§9](#9-p7-消费端导入线索快照--打开本机线索页) 里。
+`[emulator]` 在本仓库用不到：模拟器那套在采集端 `leadhunter`，同一个 §9 里有说明。
 
 ---
 
@@ -286,7 +292,7 @@ JobHunter 初始化
 
 ③ 数据库自检
   数据库：D:\...\jobhunter\data\jobhunter.db
-  迁移版本：0002
+  迁移版本：0005
   业务表数量：11 张
   表：application_events, applications, assessments, companies, interview_questions, interviews, jobs, llm_cache, offers, resume_versions, resumes
 
@@ -297,6 +303,10 @@ JobHunter 初始化
 
 ✓ 初始化完成。下一步：`jh --help` 看全部命令（其余命令将在后续阶段实现）
 ```
+
+> ★ 最后那句"（其余命令将在后续阶段实现）"是 P0 留下的**固定文案**，别被它误导：
+> 现在 `jh --help` 里列出的命令都是能跑的（含 P7 消费端的 `jh leads import` / `jh leads serve`）。
+> 迁移版本以 `jh init` 实际打印的为准 —— 当前是 **0005**（P7 消费端加的那几列，§9 会用到）。
 
 没配密钥时会**多一行**提醒（不影响使用）：
 
@@ -492,6 +502,9 @@ jh today --export md       # 导出到 output/（md 或 csv，只写新文件）
 `jh job add <链接>` → `jh match run` → `jh today` → 投完 `jh apply 1 --status applied`。
 完整命令清单见 [README](../README.md) 的「快速开始」。
 
+> 线索消费端（P7：`jh leads import` + `jh leads serve`）不在这个主流程里 —— 它面对的是
+> **另一个仓库**（采集端 `leadhunter`）导出的快照，怎么用见下一节 [§9](#9-p7-消费端导入线索快照--打开本机线索页)。
+
 ---
 
 ## 6. 数据落在哪里
@@ -500,7 +513,7 @@ jh today --export md       # 导出到 output/（md 或 csv，只写新文件）
 
 | 目录 | 放什么 | 能否删 |
 |---|---|---|
-| `data/` | **SQLite 数据库** `data/jobhunter.db`（+ WAL 的 `-wal` / `-shm`）；P7 的抓屏产物在 `data/leads/` | 删了 = 所有投递记录没了 |
+| `data/` | **SQLite 数据库** `data/jobhunter.db`（+ WAL 的 `-wal` / `-shm`）。`jh leads import` 导进来的线索（`companies` 表）也在这里 | 删了 = 所有投递记录、线索都没了 |
 | `output/` | 导出产物：待投清单 md/csv、简历建议、周报、`.ics`、定制简历 docx | 可以删，重新导出即可（导出**只写新文件**，不覆盖旧文件） |
 | `state/` | 运行时状态，例如今日额度 `state/today-2026-09-19.json` | 可以删，会自动重建 |
 
@@ -553,7 +566,7 @@ source .venv/bin/activate && jh --help    # macOS / Linux
 
 全都失败 → 用兜底入口（`src/jobhunter/__main__.py` 就是为这种情况留的）：
 `.\.venv\Scripts\python.exe -m jobhunter --version`，应该输出
-`JobHunter 0.1.0 (phase P6)`。若这一步也失败，说明依赖没装：回到 [§1](#1-方式一uv推荐可复现) / [§2](#2-方式二标准-venv--pip)。
+`JobHunter 0.1.0 (phase P9)`。若这一步也失败，说明依赖没装：回到 [§1](#1-方式一uv推荐可复现) / [§2](#2-方式二标准-venv--pip)。
 
 ### 2）PowerShell 报"禁止运行脚本"，激活不了虚拟环境
 
@@ -687,16 +700,58 @@ Linux 桌面默认可能都没装。
 或者 `config.yaml` 里 `show_reminders: false` / 你加了 `--no-remind`。
 **解决**：确认方式 —— 投完标后过几天再看；`jh apply --pending` 可以主动看清单。
 
-### 15）`jh leads …` 报"该功能尚未实现"
+### 15）`jh leads serve` 报"缺少 Web 依赖"
 
-**现象**：跑 `jh leads probe` / `jh leads add <file>` / `jh leads capture`，出来一个黄色面板
-写着"该功能尚未实现 / 计划阶段：P7"，命令以退出码 2 结束。
-**原因**：P7 还没实现，这几个是**占位命令**（本项目的约定：占位命令**不假装成功**，
-会明确说明阶段并用非 0 退出码结束）。
-**解决**：现在用不到它，跳过即可；真到 P7 落地时再看 [§9](#9-模拟器p7-才需要现在可以先跳过)。
-和它无关的功能（`jh job add` / `jh match run` / `jh today` …）**不受影响**。
+**现象**：`jh leads serve` 直接退出（退出码 1），实测逐字是这样：
 
-### 16）一启动就报 `配置错误`（config.yaml 里有写错的项）
+```text
+缺少 Web 依赖：uvicorn
+  · 装一下：uv sync --extra web（或 pip install -e "."）
+  · 只导入、不打开页面的话，`jh leads import` 不需要这些依赖。
+```
+
+**原因**：`fastapi` / `uvicorn` 放在可选的 `[web]` extra 里，当前环境没装。这是**刻意的取舍**：
+`jh job add` / `jh match run` / `jh today` 这些主路径一点都不需要 Web 框架，
+不该因为它们而多装两个包。
+
+★ 第二行那个 `pip install -e "."` 看着奇怪 —— 那是**提示文本里的 `[web]` 被 rich 的标记语法吃掉了**
+（源码里写的是 `pip install -e ".[web]"`）。**请照下面这一节的命令装**，
+别照那句抄：`pip install -e "."` 等于什么都没多装。
+
+**解决**：
+
+```powershell
+uv sync --extra web                      # 方式一
+pip install -e ".[web]"                  # 方式二
+uv run --extra web jh leads serve        # 想写明就带上 --extra（见 §1 第 2 条）
+```
+
+★ **`jh leads import` 不需要这个 extra**（导入只用主依赖里的 pydantic）：
+实测把 `uvicorn` / `fastapi` 的 import 全挡住之后，`jh leads import … --dry-run` 照常
+退出码 0、照常报数。只想导线索、不看页面的人可以一直不装它。
+
+### 16）打开 `http://127.0.0.1:8787` 看到"页面还没构建"
+
+**现象**：`jh leads serve` 起来了，终端也打印了「注意：前端还没构建：在 web/ 目录跑
+`npm ci && npm run build`」，但浏览器打开 `http://127.0.0.1:8787` 是一张写着"页面还没构建"的
+说明页（HTTP 503）。
+**原因**：**这是正常状态，不是坏了**。前端源码（`web/`）进仓库，但**构建产物 `web/dist/` 不进仓库**
+（体积大、每次构建都不一样）—— 所以刚 clone 下来时它本来就不存在。此时**后端是好的**：
+`/api/leads`、`/api/health` 照常返回 JSON。
+**解决**：
+
+```powershell
+cd web
+npm ci                # 第一次（或依赖变过）才需要
+npm run build         # 产物落在 web/dist/
+cd ..
+jh leads serve        # 重新起一次；已经开着的话，构建完直接刷新浏览器也行
+```
+
+需要 Node（CI 里用的是 Node 24）。**只调接口**、不想构建前端也可以：`GET /api/leads` 直接可用
+（返回的就是页面要的那份 JSON，契约见 [P7-消费端API.md](P7-消费端API.md)）。
+
+### 17）一启动就报 `配置错误`（config.yaml 里有写错的项）
 
 **现象**：任何命令都以 `配置错误` + 一段中文说明结束（退出码 1）。
 **原因**：这是**故意的** —— 配置写错时"静默无效"比"启动报错"坏得多。当前会拦下这些：
@@ -712,7 +767,7 @@ Linux 桌面默认可能都没装。
 **先**在 `skill_aliases` 里把它写成规范名（这样它才会进词表、也才能从 JD 里抽出来），**再**放进白名单。
 参考 [config.md](config.md) 的 §3 / §4。
 
-### 17）设置了 `greeting_banned_words` / `learning_whitelist`，但感觉"没生效"
+### 18）设置了 `greeting_banned_words` / `learning_whitelist`，但感觉"没生效"
 
 **现象**：改了这两个配置，重跑 `jh today`，开场白看起来没变化。
 **原因**：多数情况下是**真的生效了，只是你看到的不是新生成的文案** —— 命中缓存时不会再调模型。
@@ -747,7 +802,7 @@ Remove-Item -Recurse -Force $env:TEMP\jh-demo-*
 
 | 位置 | 内容 |
 |---|---|
-| `<仓库>/data/` | 数据库（投递记录、简历结构化数据、LLM 缓存）+ `data/leads/` 抓屏产物 |
+| `<仓库>/data/` | 数据库（投递记录、简历结构化数据、LLM 缓存、`jh leads import` 导进来的线索） |
 | `<仓库>/output/` | 所有导出物（清单、周报、定制简历、`.ics`） |
 | `<仓库>/state/` | 今日额度等运行时状态 |
 | `<仓库>/.env` | 密钥与本机路径 |
@@ -757,67 +812,153 @@ Remove-Item -Recurse -Force $env:TEMP\jh-demo-*
 
 ---
 
-## 9. 模拟器（P7 才需要，现在可以先跳过）
+## 9. P7 消费端：导入线索快照 + 打开本机线索页
 
-> ### ⚠️ 这部分**尚未实现**，下面的命令**现在跑不通**
->
-> `jh leads probe` / `jh leads capture` / `jh leads add` / `jh leads export`
-> 目前都是**占位命令**：执行后只会打印一个"该功能尚未实现"的面板，并以**退出码 2** 结束。
-> 实测（面板里的"现在就可用：…"那一长串已省略）：
+> P7 在 2026-09-19 改了架构：**采集端与消费端拆成两个部署**。本仓库只有**消费端**，
+> 所以 `jh leads` **只有 `import` 与 `serve` 两个子命令**。
 
 ```text
-┌───────────────────────────────── 🚧 未实现 ─────────────────────────────────┐
-│ 该功能尚未实现                                                              │
-│                                                                             │
-│   功能：jh leads probe（serial=None）                                       │
-│   计划阶段：P7                                                              │
-│   当前阶段：P6                                                              │
-│   ……（下面列的是当前可用的命令）                                          │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─ 采集端（独立部署，**不在本仓库**）──────────────────┐
+│  projects/leadhunter        命令 `lh`                │
+│  lh leads add / list / export / apply                │
+│  lh leads probe / capture（模拟器，只读）            │
+│  → 产出线索，导出成 JSON 快照                        │
+└──────────────────┬──────────────────────────────────┘
+                   │  你手动把文件拷过来（两边不共用数据库）
+                   ▼
+┌─ 消费端（本仓库 jobhunter）─────────────────────────┐
+│  jh leads import <快照.json>  → companies 表（幂等） │
+│  jh leads serve               → 本机线索页           │
+└─────────────────────────────────────────────────────┘
 ```
 
-**本节只说明"将来要用 App 线索功能时，届时需要准备什么"**，不是现在要做的事。
-现在装 `[emulator]` extra 不会有任何用处 —— 但也不会有坏处（它只是个 Python 包）。
+**为什么要这么拆**：采集端要装安卓模拟器那一套依赖（`uiautomator2`）、要连设备、要在本机跑；
+消费端只要一个库和一张网页。混在一个仓库里，等于让"看线索"这件事也背上那份环境负担。
+所以 `jh leads add / probe / capture / export` **不在本仓库**了 —— 要采集请去 leadhunter 用 `lh`
+（见 [§9.5](#95-采集端在哪本仓库没有采集命令)）。
 
-### 届时会需要的东西
+### 9.1 装依赖（只有页面需要 `[web]`）
 
-1. **一个安卓模拟器**。最省事的是 Android Studio 自带的 AVD（ADB 是现成的）；
-   第三方模拟器（MuMu、夜神、雷电之类）也能用，但它们各自用自己的 ADB 端口，
-   要按它自己的文档 `adb connect 127.0.0.1:<它告诉你的端口>` —— **端口随版本变化，
-   别照抄网上的数字**。
-2. **打开 ADB 调试并能看到设备**：
+```powershell
+uv sync --extra web        # fastapi + uvicorn：★ 只有 jh leads serve 需要
+```
 
-   ```powershell
-   adb devices
-   # 期望看到类似（emulator-5554 是你的设备序列号）
-   # List of devices attached
-   # emulator-5554   device
-   ```
+`jh leads import` **不需要**这个 extra（它只用主依赖里的 pydantic）。没装时 `jh leads serve`
+会直接给一句中文提示告诉你怎么装 —— 见 [§7 第 15 条](#7-常见问题)。
 
-3. **装 extras 并把 ATX 推到设备上**：
+### 9.2 构建前端产物（第一次必做）
 
-   ```powershell
-   uv sync --extra emulator                       # uiautomator2==3.2.2（钉死版本）
-   uv run --extra emulator python -m uiautomator2 init   # 首次把 ATX-agent 推进模拟器
-   adb devices                                    # 再确认一次设备还在
-   uv run --extra emulator jh leads probe --serial emulator-5554
-   #   ↑ 现在会报"未实现"，P7 之后才会 dump 控件树
-   ```
+前端源码在 `web/`（React + Vite），**构建产物 `web/dist/` 不进仓库**（体积大、每次构建都不一样，
+`.gitignore` 挡着，CI 里现场构建一遍）：
 
-   `[emulator]` 里 `uiautomator2` 的版本是**钉死**的（`==3.2.2`）：上游改动频繁，
-   不钉版本会导致"半年前能跑的脚本突然失灵"，而这类环境问题最难排查。
+```powershell
+cd web
+npm ci                 # 第一次（或依赖变过）才需要
+npm run build          # = tsc --noEmit && vite build，产物落在 web/dist/
+cd ..
+```
 
-4. **知道抓屏产物落在哪**：`data/leads/`（一次抓屏一个子目录）。
+**不构建会怎样**：`jh leads serve` 照常起得来、`/api/leads` 接口照常可用，只是打开
+`http://127.0.0.1:8787` 会看到一张写着"页面还没构建"的说明页（HTTP 503 —— 不是白屏、也不是裸 500），
+那句话就是让你回来跑上面这三条命令。详见 [§7 第 16 条](#7-常见问题)。
 
-### 这个阶段已知的现实难点（项目自己的记录）
+### 9.3 `jh leads import <快照.json>` —— 把快照导进库
 
-控件 id 不稳定甚至不存在、WebView 里的内容取不到、部分国内 ROM 装不上 ATX、
-无线 ADB 容易掉线。所以 P7 的路线是"**人工操作 + 机器抓屏**"而不是全自动
-（`jh leads capture` 就是这个意思：你在模拟器里手动操作，按回车抓一屏）。
+先看一眼"会改什么"（**一个字都不写库**），确认没问题再真导：
 
-**合规红线（P7 也一样）**：只读、不做任何写操作（不点赞、不私信、不关注）、
-不做批量抓取、不绕风控；建议用备用账号。
+```powershell
+jh leads import leads.json --dry-run     # 只报数，不写库
+jh leads import leads.json               # 真导
+```
 
-> P7 真正落地时会补一份 `docs/emulator.md`（模拟器 / ADB / uiautomator2 的完整教程，
-> 见 [`docs/architecture.md`](architecture.md) 的目录规划）。**现在这个文件还不存在** ——
-> 如果你在仓库里找不到它，那是正常的。
+实测输出（用仓库里的真实样例 [leads-snapshot-sample.json](leads-snapshot-sample.json)，
+库指到一个全新临时目录）：
+
+```text
+> jh leads import docs/leads-snapshot-sample.json --dry-run
+dry-run：（dry-run：什么都没写库）共 4 条 → 新增 4 条、更新 0 条
+处理    公司      变化
+新增    星澜科技  —
+新增    云枢智能  —
+新增    明澈数据  —
+新增    虚构网络  —
+  库里没有任何改动（连一次 UPDATE 都没发）。去掉 --dry-run 才会真的导入。
+
+> jh leads import docs/leads-snapshot-sample.json
+✓ 共 4 条 → 新增 4 条、更新 0 条
+（下面这张表与 dry-run 那张逐字一样：四行都是"新增"，此处不重复）
+  看线索 / 标记投递：jh leads serve
+
+> jh leads import docs/leads-snapshot-sample.json      # 同一份文件再导一次
+✓ 共 4 条 → 新增 0 条、更新 4 条（其中 0 条内容有变化）
+处理    公司      变化
+不变    星澜科技  —
+不变    云枢智能  —
+不变    明澈数据  —
+不变    虚构网络  —
+```
+
+★ **幂等是硬要求，也是最容易做错的一条**：采集端会反复导出（采到新的就导一次），
+"导两次变成两条"会让线索池慢慢变成一团重复数据 —— 而且**不报错**，属于本项目最不想要的
+"静默错误"。匹配口径是**公司名去掉所有空白**（与采集端内部一字不差，库里还有 UNIQUE 索引兜底），
+`external_id` **只做溯源、不当唯一键**（采集端换台机器 id 就会变）。
+
+★ **坏输入给的是中文可操作提示**，不是 Python 堆栈：文件不存在会顺带列出同目录的 json 文件、
+不是合法 JSON 会指出第几行第几列、`schema_version` 不认识会提示"采集端可能比本仓库新，请一起升级"
+（**刻意不猜** —— 字段错位入库比直接失败糟得多）、时间没带时区会告诉你怎么写。
+完整清单见 [leads-snapshot.md](leads-snapshot.md) 第 6 节；快照的字段契约与空值语义见同一份文档。
+
+### 9.4 `jh leads serve` —— 在浏览器里看线索（+ 标记投递）
+
+```powershell
+jh leads serve                        # 默认 → http://127.0.0.1:8787
+jh leads serve --port 8899            # 换端口（8765 被别的工具占着，默认才用 8787）
+```
+
+起来时终端打印（实测）：
+
+```text
+线索页： http://127.0.0.1:8787
+  只读 + 标记投递；不做自动投递、不做批量（红线）。Ctrl+C 结束。
+```
+
+页面上能做的就两件事：
+
+- **看线索**：按「官网 / 内推 / HR直招 / 未分类」分组；每条显示公司名、投递方式、来源平台、
+  可达性、官网链接、备注、**原始那句话**。可达性是**三态**：「可达（HTTP 200）」「HTTP 404」
+  「**未检查**」—— "未检查"**不等于**"失效"，它自己还会说明原因（没有官网网址 / 有网址但当时没检查）。
+- **标记投递**：选一个岗位，点一下 → 记一次投递。★ 必须落在**某个岗位**上
+  （`applications.job_id` 是 NOT NULL），所以库里一个岗位都没有时按钮是灰的 ——
+  先用 `jh job add <链接>` 录一个岗位。
+
+★★ **两条红线，请务必记住**：
+
+1. **默认只绑 `127.0.0.1`，不要改成 `--host 0.0.0.0`。** 这个页面**没有鉴权**，绑到 `0.0.0.0`
+   等于让同一个 Wi-Fi 下的任何人都能打开它：看到你的线索原文（备注里常有 HR 的邮箱/微信），
+   甚至替你点"标记投递"。真要给别人看，先读
+   [COMPLIANCE.md](COMPLIANCE.md) §5.6 里那三个替代方案（截图 / SSH 端口转发 / 自己加带鉴权的反代）。
+2. **标记投递是人工点击**：点一下才记一次，**不做自动投递、不做批量**，页面也不能新增/删除线索
+   （线索的唯一来源是 `jh leads import`）。它走的是与 `jh apply` **同一个写入口**，
+   所以重复点不会多记一条，而且页面会**如实告诉你**"这次是新建 / 更新了什么 / 什么都没变"。
+
+### 9.5 采集端在哪（本仓库没有采集命令）
+
+| 你想做的事 | 去哪 | 命令 |
+|---|---|---|
+| 采集线索（加 / 看 / 导出 / 标记投递 / 探测 / 抓屏） | 独立部署 `projects/leadhunter` | `lh leads add / list / export / apply / probe / capture` |
+| 把快照导进本仓库 | 本仓库 | `jh leads import <快照.json>` |
+| 看线索 / 标记投递 | 本仓库 | `jh leads serve` |
+
+- **两边不共用数据库**，唯一的接口就是那份 JSON 快照（契约 [leads-snapshot.md](leads-snapshot.md)，
+  真实样例 [leads-snapshot-sample.json](leads-snapshot-sample.json)）。
+- ⚠️ **两边对齐提示（2026-09-20 实测）**：本仓库这侧的帮助文本写的是快照来自
+  `lh leads export --format json`，但 `projects/leadhunter` 那份代码里 `lh leads export`
+  只支持 `--format md|csv`（导出的是投递清单），**JSON 快照导出还没落地到那个命令上**。
+  这不影响本仓库：`jh leads import` 只认符合契约的 JSON —— 采集端把导出补齐之前，
+  先用手上任何能产出该 JSON 的方式（脚本也行）即可。这条差异属于**跨仓库契约要对齐的事**，
+  记在这里免得下一个人以为是这边导错了。
+- 采集端侧的准备（安卓模拟器、ADB、`uiautomator2`）照 leadhunter 自己的文档做 ——
+  本仓库的 `[emulator]` extra 目前**没有任何代码用到**（`src/` 里没有 `import uiautomator2`）。
+- **采集类命令不会再搬回本仓库**：它们要模拟器依赖，这是 P7 架构变更时定下的红线；
+  同理，"不做批量抓取 / 不绕风控 / 不做任何写操作"这三条合规约束对采集端同样成立，
+  由那个仓库的文档负责自检。

@@ -5,6 +5,9 @@
 >
 > 每一条都附**可复现的证据**（命令 + 结果），不是"我认为没问题"。
 > 生成日期：2026-09-19（P9 收尾）｜ 复跑方式见每节末尾。
+> ★ 2026-09-20 增补：**P7 消费端落地**后的本机服务边界（§0 结论表新增"本机服务边界"一行、
+> §1 新增线索页调用点、§2 新增"标记投递"、§5.3 改成实测的 `--dry-run`、
+> **新增 §5.6（为什么不做鉴权）**、§8 边界改写）。
 
 ---
 
@@ -14,6 +17,7 @@
 |---|---|
 | 自动化边界 | ✅ 代码里**没有任何**"向招聘平台写入"的调用（投递/点赞/私信/关注/自动翻页） |
 | 频率克制 | ✅ 抓取路径带**随机延时（2–5 秒，可配）+ 出错即停**，且默认路径只抓"用户给的单个链接"（**无自动翻页**，见 §5.2） |
+| 本机服务边界 | ✅ `jh leads serve` 起的线索页是**本机**服务：默认只绑 `127.0.0.1`（**不是 `0.0.0.0`**）、**不做鉴权**（前提正是"只监听回环"，见 §5.6）；页面只读 + 一个写动作，而且那个写动作**只能由人点击**触发 |
 | 隐私（工作区） | ✅ 真实姓名/手机/邮箱/学校/项目名**都不在仓库里**（本轮清掉了最后 2 处真实项目名） |
 | 隐私（git 历史） | ⚠️ **真实姓名仍在历史里**（22 个提交 / 2 个文件 + 2 条提交信息）→ 见 §4，**需要发布前决策** |
 | 依赖与迁移 | ✅ `uv.lock` 已提交；`upgrade→downgrade→upgrade` 三连通过；PRAGMA（WAL/外键/busy_timeout）已开 |
@@ -26,7 +30,10 @@
 扫描命令（对 `src/` 做模式匹配，人工逐条看上下文）：
 
 ```powershell
-git grep -n -E "httpx\.|requests\.|playwright|page\.(click|fill|press|goto|type)|uiautomator2|\badb\b|subprocess\." -- src/
+# ★ 必须带 --untracked：P7 新增的 src/jobhunter/web/ 等文件在提交前属于"未跟踪"，
+#   裸 git grep 只搜已跟踪文件 —— 会正好漏掉这次新加的"对外服务"那一层。
+#   （本次更新文档时实测：不带它时 src/jobhunter/web/app.py 完全不出现在结果里。）
+git grep -n --untracked -E "httpx\.|requests\.|playwright|page\.(click|fill|press|goto|type)|uiautomator2|\badb\b|subprocess\.|fastapi|uvicorn" -- src/
 ```
 
 | 调用点 | 类型 | 判定 |
@@ -34,15 +41,25 @@ git grep -n -E "httpx\.|requests\.|playwright|page\.(click|fill|press|goto|type)
 | `llm/deepseek.py`（`httpx.Client` / `AsyncClient`） | 向 **LLM 服务商**发请求 | ✅ 合规：这是用户自己的 API Key、用户自己付钱；只发提示词，不发投递动作 |
 | `adapters/manual.py`（`sync_playwright` + `page.goto`） | 打开**用户自己粘贴的岗位链接**并读取正文 | ✅ 合规：**只读**。`goto` 是唯一的页面动作，没有任何 `click`/`fill`/`press` |
 | `utils/clipboard.py`（`subprocess.run(["clip"])`） | 把文本写入**本机剪贴板** | ✅ 合规：本机操作，不涉及任何外部服务 |
+| `cli/commands/leads_cmd.py`（`uvicorn.run(...)`）+ `web/app.py`（FastAPI 路由） | `jh leads serve` 起一个**本机 HTTP 服务**（浏览器里看线索 / 标记投递） | ✅ 合规：**默认只绑 `127.0.0.1`**（`uvicorn.run(create_app(), host="127.0.0.1", port=8787)`，不是 `0.0.0.0`）；页面**只读 + 一个写动作**，且该写动作由**人工点击**触发、走 `apply_svc.set_status`（与 CLI **同一个写入口**）；**不做自动投递、不做批量**、不增删线索。为什么不做鉴权见 §5.6 |
 | `adapters/boss.py`（自动搜索） | —— | ❌ **未实现**（P2 的 spike 结论：自动翻页会撞风控，主路径改成"人给链接"） |
-| `adapters/app/`（模拟器侧） | —— | ❌ **未实现**（P7 未做，`jh leads *` 现在是占位命令） |
+| `adapters/app/`（模拟器侧） | —— | ➡️ **已移出本仓库**：采集端（含模拟器）独立部署在 `projects/leadhunter`（命令 `lh`）。本仓库 `src/` 里**没有** `import uiautomator2`，也没有 `jh leads add / probe / capture / export` 这些命令 —— 所以"模拟器侧的只读承诺"要在那个仓库里单独自检 |
 
 **没有任何调用会**：提交投递、发送消息、点赞/关注、绕过验证码、伪造签名、批量遍历岗位列表。
+线索页也一样：它**唯一的写动作**是"人点一下 → 往**本机库**里记一笔投递"，不向任何平台发请求，
+也不存在"批量"这个入口。
 
 > 这条边界还有一道**机器守卫**：`tests/verify/test_v_checklist12.py` 里有一条 AST 扫描用例
 > （`test_no_auto_apply_or_platform_write_calls_in_source`），把 `client.post` / `page.click` /
 > `locator.fill` / `d.swipe` 这类写操作方法列进禁用名单，出现即测试失败。
 > 我在 P4.5 曾因内部函数名叫 `check` 撞上这份名单而改名 —— **改的是我的代码，不是那条守卫**。
+>
+> ★ P7 加了页面之后复核过一遍（2026-09-20）：两条守卫用例**仍然通过**。原因是判定口径分得清
+> 方向 —— `web/app.py` 里的 `@app.post("/api/leads/{lead_id}/apply")` 是**入站**路由，
+> 而守卫认的是**出站** HTTP 客户端的接收者名（`_HTTP_CLIENT_RECEIVERS`：`client` / `http` /
+> `httpx` / `requests` / `session_http` / `aiohttp` / `resp` / `request`），`app` 不在其中；
+> 真正的写库调用在 `services/` 里，页面只是调用它。复跑：
+> `uv run pytest tests/verify/test_v_checklist12.py -q -k "write_calls_in_source or network_write_endpoints"` → `2 passed`。
 
 ---
 
@@ -54,6 +71,7 @@ git grep -n -E "httpx\.|requests\.|playwright|page\.(click|fill|press|goto|type)
 | 发送开场白/追问话术 | **只生成，不发送**；剪贴板是唯一出口 | `greeting_svc` / `followup_svc` 没有网络发送路径；`jh followup` 结尾打印"本工具不会替你发送任何消息" |
 | 发送简历 | 导出**新文件**，由人上传 | `tailor_svc.export_version` 只写文件 |
 | 打标"已投/已读/已回复" | 必须人手敲 `jh apply` | `apply_svc.set_status` 的唯一调用方是 CLI 命令 |
+| **线索页上的"标记投递"** | 必须**人在页面上点一下** —— 没有自动、没有批量 | 页面唯一的写接口是 `POST /api/leads/{id}/apply`，只由前端点击触发（`web/app.py` 里没有定时器/循环/批量入口）；它调 `leads_svc.link_lead_to_application` → `apply_svc.set_status`，**与 `jh apply` 同一个写入口**。页面**不向任何招聘平台发请求**：这一步只是往本机库记一笔"我投了" |
 | 修改状态机（拒绝/接受 Offer） | 必须人手敲 | `OFFER_STATUSES` 只被 CLI 写入 |
 
 > 换句话说：**工具的终点是"把该发的东西写好、把该记的事记下"，中间那一下永远由人点。**
@@ -167,7 +185,21 @@ git push --force --all; git push --force --tags
 ### 5.3 `--dry-run`
 
 `jh job add --dry-run`：只解析并打印，**不写库**（`job_cmd.py:120-125`）。
-`jh leads add --dry-run` 已预留（P7 未实现）。
+`jh leads import --dry-run`（P7 消费端）：**连一次 UPDATE 都不发** —— 它先在内存里把"要做什么"
+算成一份计划（`ImportPlanRow` 列表），再决定是执行还是只报出来，
+所以 dry-run 与真跑走的是**同一段判定逻辑**（不会"dry-run 说没事、真跑写坏了"）。
+实测（2026-09-20，库指到全新临时目录）：
+
+```text
+> jh leads import docs/leads-snapshot-sample.json --dry-run
+dry-run：（dry-run：什么都没写库）共 4 条 → 新增 4 条、更新 0 条
+新增    星澜科技  —
+…（4 条）
+  库里没有任何改动（连一次 UPDATE 都没发）。去掉 --dry-run 才会真的导入。
+```
+
+真跑两次则是「第一次 新增 4 条 / 第二次 新增 0 条、更新 4 条（其中 0 条内容有变化）」——
+**库里始终是 4 行**（幂等，验收会真的去数行数）。
 
 ### 5.4 导出只写新文件
 
@@ -216,6 +248,36 @@ P9 复查时把这一条单独记下来（ISSUES #19），因为**"设了一个�
 写出来的理由：**不写，读者只能猜**——而"我们设了 UA"和"我们为什么设 UA"是两件事，
 后者才是取舍。
 
+### 5.6 线索页（`jh leads serve`）：为什么不做鉴权
+
+`jh leads serve` 会在本机起一个 HTTP 服务（默认 `http://127.0.0.1:8787`），页面上是你的线索：
+公司名、**原始那句话**、来源平台、备注（备注里常常有 HR 的邮箱或微信）。它**没有登录、
+没有口令、没有任何鉴权** —— 这是**刻意**的，而这个做法只在**一个前提下**成立：
+**它只监听回环地址（`127.0.0.1`）**。
+
+| 问题 | 答案 |
+|---|---|
+| 谁能访问到它？ | 只有**这台机器**上的人/进程。默认值就是回环：`DEFAULT_HOST = "127.0.0.1"`（`cli/commands/leads_cmd.py`），`uvicorn.run(create_app(), host=host, port=port)`。实测（2026-09-20）：服务起来后 `Get-NetTCPConnection -LocalPort 8787 -State Listen` 显示 `LocalAddress = 127.0.0.1`，**不是 `0.0.0.0`** |
+| 为什么不做鉴权？ | 三条，缺一条这个决定就不成立：① **单机个人工具** —— 只有你一个人用，没有"第二个用户"需要区分；② **数据不出本机** —— 页面读写的都是本机 SQLite，前端也不引用任何外部 CDN/接口，没有任何一条请求把你的线索发出去；③ 加鉴权要多维护一套会话/令牌代码，多一个你会忘记的密码，而它挡不住"能坐到你电脑前的人"。**所以"不做鉴权"不是"来不及做"，而是它的安全模型本来就是"回环地址即边界"**（P8 的设计文档也写明本地工具不做用户系统） |
+| 它会不会替我干点什么？ | 不会。页面**只读 + 一个写动作**：人点"标记投递"才记一笔，**没有自动投递、没有批量**，也不能新增/删除线索（§1、§2） |
+| 那风险在哪？ | 在你**主动把它开出去**的时候 —— 见下 |
+
+**如果改成 `--host 0.0.0.0`，等于把这个页面给同一个局域网里的人看**：同一个 Wi-Fi
+（宿舍 / 咖啡厅 / 公司网络）下任何人扫到这个端口，就能看到你的线索原文、备注里的联系方式，
+还能替你点"标记投递"（往你的库里写记录）。**这一步没有任何技术护栏**：页面没有登录，
+能连上的人就是"你"。文档不推荐这么做，也不会为它补一个"更宽松的默认值"。
+
+真要给别人演示，按下面顺序选（越靠前越安全）：
+
+1. **截图 / 录屏** —— 最省事，也不会多开一个口子；
+2. **保持默认 `127.0.0.1`**，用 SSH 端口转发让对端经你这条加密通道看
+   （`ssh -L 8787:127.0.0.1:8787 <你的机器>`）—— 服务本身**始终没有对外监听**；
+3. 非要绑 `0.0.0.0`：至少放在**你自己的、带鉴权的反向代理**后面，并换掉默认端口。
+   **风险由你承担** —— 页面上没有登录，任何能连上的人都能读能写。
+
+> 顺带一句：验收里那条「实际起服务，确认监听的**不是** `0.0.0.0`」验的正是这件事 ——
+> 不是"我们记得写了 `127.0.0.1`"，而是**这个默认值真的没有被改坏**。
+
 ---
 
 ## 6. 依赖、迁移与工程底座
@@ -224,7 +286,7 @@ P9 复查时把这一条单独记下来（ISSUES #19），因为**"设了一个�
 |---|---|
 | `uv.lock` 已提交 | ✅ `git ls-files uv.lock` 命中；CI 里 `uv lock --check` 守住"改了依赖没提交锁" |
 | 迁移可逆 | ✅ `upgrade→downgrade→upgrade` 三连：11 表 → 0 表 → 11 表（`tests/unit/test_smoke.py`） |
-| 当前版本 | `0002`（P6 的 `interview_questions.job_id` / 可空改造） |
+| 当前版本 | `0005`（P7 消费端：`companies` 加 `http_status` / `checked_at` / `external_id` / `collected_at` / `name_norm`（唯一索引）；`applications` 加 `company_id`）。实测 `jh init` 打印「迁移版本：0005」 |
 | PRAGMA | ✅ `journal_mode=wal`、`foreign_keys=1`、`busy_timeout=5000`（每个连接都挂） |
 | 时区 | 库里一律 naive UTC，显示转北京时间（`utils/time.py`） |
 | 编码 | 启动即 `force_utf8_output()`；所有文件读写显式 `encoding`（ruff `PLW1514`） |
@@ -264,8 +326,13 @@ $env:JH_PII_SAMPLES = "<真名>,<学校>,<打码手机号>"
 ## 8. 已知边界（诚实登记）
 
 1. **真实姓名/项目名仍在 git 历史**（§4）—— 等用户决策。
-2. **`jh leads`（App 线索）未实现**，所以"模拟器侧"的合规承诺还只是设计意图，不是已实现的约束；
-   P7 落地时必须回来更新本文档（尤其"不做批量抓取/不绕风控/不做任何写操作"三条）。
+2. **模拟器 / 采集侧不归本仓库**：P7 在 2026-09-19 拆成了采集端（独立部署
+   `projects/leadhunter`，命令 `lh`）与消费端（本仓库）。本仓库只有 `jh leads import`
+   与 `jh leads serve`，`src/` 里没有模拟器依赖、也没有 `jh leads add / probe / capture / export`
+   这些命令 —— 所以"不做批量抓取 / 不绕风控 / 不做任何写操作"这三条对**采集端**的约束，
+   要在那个仓库里单独自检（由那边的文档负责）。
+   本仓库这一侧的边界已按 P7 的落地更新：§1（本机服务只绑回环 + 唯一写动作）、
+   §2（标记投递必须人工点击）、§5.3（`--dry-run` 不写库）、§5.6（不做鉴权的前提）。
 3. **`adapters/boss.py` 是空的**：计划书里的自动搜索在 P2 就降级成了 spike，
    spike 的 `--live` 我从未跑过（`spikes/boss_search_spike.py` 默认干跑）。
 4. **`.ics` 覆盖同名文件**是唯一偏离"只写新文件"的地方，理由见 §5.4。

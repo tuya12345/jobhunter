@@ -59,8 +59,26 @@
 | P5 | **AI 定制简历** + `FidelityGuard`（代码强制不编造） | `jh tailor brief / analyze / approve / export` |
 | P6 | 看板时间轴 / 面试 / 问题记录 / 笔试 / Offer 比较 / 转化率 / 周报 / 日历 | `jh interview · question · weak · assessment · offer · followup · stats · report · cal` |
 | **P9** | **`jh demo`（离线假数据全流程）+ 合规自检** | `jh demo`、[COMPLIANCE.md](docs/COMPLIANCE.md) |
-| P7 | App 线索（技术验证）—— **尚未实现**，`jh leads *` 仍是占位 | — |
-| P8 | Web 界面 —— 移出主线 | — |
+| **P7** | 线索**消费端**：导入采集端的 JSON 快照 → 本机线索页（看线索 / 标记投递） | `jh leads import <快照.json>`、`jh leads serve` |
+| P8 | Web 界面（其余页面移出主线）—— ★ 线索页已随 P7 消费端落地，是 P8 的第一次落地 | `jh leads serve` |
+
+> ★ **P7 在 2026-09-19 拆成了"采集端"和"消费端"两个部署**，本仓库只有**消费端**，
+> 所以这里的 `jh leads` **只有 `import` 与 `serve` 两个子命令**：
+>
+> | | 在哪 | 命令 |
+> |---|---|---|
+> | **采集端** | **不在本仓库**：独立部署 `projects/leadhunter` | `lh leads add / list / export / apply / probe / capture` |
+> | **消费端** | 本仓库 | `jh leads import <快照.json>`、`jh leads serve` |
+>
+> 两边**不共用数据库**，唯一的接口是采集端导出的那份 JSON 快照
+> （契约见 [docs/leads-snapshot.md](docs/leads-snapshot.md)，样例见
+> [docs/leads-snapshot-sample.json](docs/leads-snapshot-sample.json)）：采集端导出 → 你把文件拷过来 →
+> `jh leads import` 入库 → `jh leads serve` 在浏览器里看。
+>
+> **为什么这么拆**：采集端要装安卓模拟器那一套依赖（`uiautomator2`）、要连设备、要在本机跑；
+> 消费端只要一个库和一张网页。混在一个仓库里，等于让"看线索"这件事也背上那份环境负担。
+> 所以 `add / probe / capture / export` **已经不在这里了**（原来的占位命令已删除）——
+> 要采集请去 leadhunter 用 `lh`。
 
 ### 先看演示（不需要 API Key、不需要真去投简历）
 
@@ -145,7 +163,15 @@ jh --help
 |---|---|---|
 | `uv sync --extra browser` | Playwright 抓岗位详情 | P2 |
 | `uv sync --extra docx` | 解析/导出 Word 简历 | P1 / P5 |
-| `uv sync --extra emulator` | 安卓模拟器抓屏（技术验证） | P7（**尚未实现**） |
+| `uv sync --extra web` | `fastapi` + `uvicorn`：本机线索页 | P7 消费端（**只有 `jh leads serve` 需要**） |
+| `uv sync --extra emulator` | 安卓模拟器抓屏（技术验证） | **不在本仓库**了：采集端独立部署在 `projects/leadhunter`（命令 `lh`） |
+
+> ★ **`jh leads import` 不需要 `[web]` extra**：导入只用 pydantic（主依赖）读 JSON、写
+> `companies` 表；只有 `jh leads serve` 要起 FastAPI 服务。所以"只想导不想看页面"的人
+> 不用装这两个包 —— 反过来，没装时 `jh leads serve` 会给一句中文提示告诉你装哪条命令。
+> ★ **`[emulator]` 现在在本仓库用不到**：`src/` 里没有任何 `import uiautomator2`，
+> 抓屏那套（`probe` / `capture`）在 leadhunter 里。这个 extra 留着是为了将来，
+> 装不装都不影响本仓库的任何命令。
 
 > ★ **没有 `llm` extra 要装**：DeepSeek 是用 `httpx` 手写的（`httpx` 是主依赖），
 > 不需要任何额外包就能跑 LLM 精评。（`pyproject.toml` 里保留了一个 `[llm]` extra，
@@ -292,6 +318,33 @@ jh init → jh resume add → jh job add <链接> → jh match run → jh gap
        → 之后每天随便敲任何一条 jh 命令，顶部都会告诉你"有几条该跟进了"
 ```
 
+### 线索消费端（P7）：导入快照 + 本机线索页
+
+线索的**采集**在另一个仓库（独立部署 `projects/leadhunter`，命令 `lh`），本仓库只负责**消费**：
+
+```bash
+uv sync --extra web                      # 只有 jh leads serve 需要（import 只用 pydantic）
+
+cd web                                   # ★ 前端产物不进仓库，第一次要先构建
+npm ci
+npm run build
+cd ..
+
+jh leads import leads.json --dry-run     # ★ 先看"会改什么"：一个字都不写库
+jh leads import leads.json               # 幂等：同一份文件导两次 → 新增 0 条、更新 N 条
+jh leads serve                           # 打开 http://127.0.0.1:8787（只读 + 标记投递）
+```
+
+两件必须知道的事：
+
+- **别用 `--host 0.0.0.0`**：线索页默认只监听 `127.0.0.1`，而且**没有鉴权** ——
+  绑到 `0.0.0.0` 等于把线索（公司名、原始那句话、备注里可能有的邮箱/微信）给同一个
+  Wi-Fi 下的人看。理由写在 [docs/COMPLIANCE.md](docs/COMPLIANCE.md) §5.6。
+- **标记投递是人工点击**：页面上点一下才记一次，**不做自动投递、不做批量**（合规红线）。
+
+细节（`--dry-run` 的真实输出、页面没构建时怎么办、导入是不是幂等）见
+[docs/install.md §9](docs/install.md#9-p7-消费端导入线索快照--打开本机线索页)。
+
 > **顶部提醒**（P4.5）挂在 Typer 全局 callback 上，所以**任何** `jh` 命令开头都会显示：
 > ```
 > 📌 待处理：投后 3 天未跟进 3 条 ｜ 投后 7 天无动静 2 条 ｜ 投后 14 天建议放弃 1 条
@@ -313,9 +366,10 @@ jh init → jh resume add → jh job add <链接> → jh match run → jh gap
 > ★ 判不出来的维度（比如 JD 太短、一个技能词都没抽到）会把权重**让给**其余维度，
 > 而不是给 0 分；`jh match explain` 里会写明 `redistributed`。
 
-> 当前进度：**P0–P6 已完成**，其余命令仍是**占位**，
-> 执行时会明确提示"该功能在 PX 阶段实现"，不会假装成功。
-> （P7 是 App 线索的技术验证，P8 是 Web 界面，P9 是开源收尾。）
+> 当前进度：**P0–P6 + P9 已完成，P7 的消费端（`jh leads import` / `jh leads serve`）也已落地** ——
+> `jh --help` 里列出的命令现在都是真能跑的，本仓库**没有占位命令**了。
+> 线索的**采集端**是另一个独立部署（`projects/leadhunter`，命令 `lh`），不在本仓库；
+> P8 的其余页面（今日清单 / 看板 / 面试问题 / 统计）仍未做 —— 线索页是 P8 的第一次落地。
 
 ### 转化率为什么可信（P6 的统计口径）
 
@@ -398,12 +452,14 @@ jh init → jh resume add → jh job add <链接> → jh match run → jh gap
 | **P5** | AI 定制简历（`tailor brief` → 完整版 + **FidelityGuard** 代码强制不编造） | ✅ |
 | **P6** | 看板时间轴 + 面试 + 问题记录 + 笔试/Offer + 统计 + 周报 + `.ics` | ✅ |
 | **P9** | 开源收尾（README 定稿 / `jh demo` 独立库 / LICENSE / **COMPLIANCE.md** / CI coverage / tag） | ✅ |
-| P7 | App 线索（降级为技术验证：1 平台 + `probe` + 手动抓屏）—— **尚未实现，`jh leads *` 是占位** | ⬜ |
-| P8 | Web 界面（移出主线，可延后） | ⬜ |
+| P7 | 线索：**消费端**（`jh leads import` 幂等导入 JSON 快照 + `jh leads serve` 本机线索页）已落地；**采集端独立部署** `projects/leadhunter`（命令 `lh`），采集命令不在本仓库 | ✅ |
+| P8 | Web 界面（其余页面移出主线，可延后）—— ★ 线索页（`jh leads serve`）已作为 P8 的第一次落地 | ⬜ |
 
-> **当前状态**：P0–P6 + P9 已完成（`jh --version` 会打印阶段标记）。
-> 剩下的 `jh leads`（P7）是**技术验证性质**的可选项；它未实现之前，README 与
-> `docs/COMPLIANCE.md` 都不会声称"支持 App 线索采集"。
+> **当前状态**：P0–P6 + P9 已完成，P7 消费端已落地（`jh --version` 打印 `phase P9`）。
+> 本仓库**只有消费端**：`jh leads import`（导快照）+ `jh leads serve`（看线索 / 标记投递）。
+> **采集类命令（`add` / `probe` / `capture` / `export`）不在这里**，它们在独立部署的
+> `projects/leadhunter`（命令 `lh`）里 —— 所以 README 与 `docs/COMPLIANCE.md` 都不会声称
+> 本仓库"支持 App 线索采集"（它连模拟器依赖都没有：`src/` 里没有 `import uiautomator2`）。
 
 ---
 
@@ -419,6 +475,8 @@ jh init → jh resume add → jh job add <链接> → jh match run → jh gap
 | 定位不到库 / 想把库搬到别的盘 | 路径解析 | 设 `JH_DATA_DIR`（见 [docs/config.md](docs/config.md) §8） |
 | 简历是 `.doc` / `.pdf` | 不支持解析 | 用 Word 另存为 `.docx`，或复制成 `.txt` |
 | 导出 docx 报缺 python-docx | 没装 `[docx]` extra | `uv sync --extra docx`，或 `--format md` |
+| `jh leads serve` 报"缺少 Web 依赖" | 没装 `[web]` extra（`jh leads import` 不需要它） | `uv sync --extra web`（或 `pip install -e ".[web]"`） |
+| 打开线索页看到"页面还没构建" | 前端产物 `web/dist` 不存在（**不进仓库，是正常状态**） | 在 `web/` 里 `npm ci && npm run build`；只调接口可以用 `/api/leads` |
 | 担心隐私 / 是否违规 | —— | 见 [docs/COMPLIANCE.md](docs/COMPLIANCE.md)（含实测扫描结果） |
 
 更多（含 8 条以上）见 [docs/install.md](docs/install.md#常见问题)。
@@ -452,6 +510,7 @@ src/jobhunter/
 │                 greeting_svc（开场白：提示词 + 四道闸门 + 模板兜底）
 │                 fidelity（防编造校验，P5 的 FidelityGuard 复用）
 │                 today_svc / apply_svc / export_svc（待投清单 / 投递打标 / 导出）
+│                 leads_svc（★ P7 消费端：快照导入（幂等）+ 线索→投递的唯一写入口）
 │                 reminder_svc（顶部待处理提醒，挂在全局 callback 上）
 ├── adapters/     外部世界：manual.py（人给 URL 抓详情，主路径）
 │                 + parse_html.py / parse_text.py（抓取与解析分开，见下）
@@ -460,7 +519,11 @@ src/jobhunter/
 ├── storage/      engine / session / PRAGMA / Alembic 调用
 ├── models/       11 张表的 ORM 定义
 ├── config/       pydantic-settings 配置（config.yaml + .env）+ direction_profiles.yaml
+├── web/          ★ P7 消费端：FastAPI 应用（只搬运 —— 把 services 的结果变 JSON、
+│                 把页面上的点击变成一次服务调用；接口契约见 docs/P7-消费端API.md）
 └── utils/        io（强制 UTF-8）/ time（UTC）/ logging（脱敏）/ docx（Word 读取）
+
+web/              ★ P7 消费端的前端（React + Vite）：**源码进仓库、构建产物 `web/dist` 不进**
 ```
 
 **一条值得说明的分层取舍**：抓取（`adapters/manual.py`，需要浏览器与网络）
@@ -485,6 +548,10 @@ src/jobhunter/
   只忽略 `*.db` 等于把真实投递记录提交上去。）
 - 日志自动脱敏（手机号/邮箱打码），且**不打印简历原文**。
 - 导出简历**只写新文件**，绝不覆盖原件。
+- ★ **线索页（`jh leads serve`）只监听 `127.0.0.1`，而且没有鉴权** —— 它就是个"给你自己看的
+  本机页面"。所以**不要**用 `--host 0.0.0.0` 把它暴露到局域网：那等于把线索（公司名、
+  原始那句话、备注里可能有的邮箱/微信）给同一个 Wi-Fi 下的人看，他们还能替你点"标记投递"。
+  「为什么不做鉴权」写在 [docs/COMPLIANCE.md](docs/COMPLIANCE.md) §5.6。
 
 ## 开发
 
@@ -492,7 +559,10 @@ src/jobhunter/
 uv run ruff check .                  # lint（含 PLW1514 强制显式编码）
 uv run pytest                        # 确定性测试（默认排除 live/emulator）
 uv run pytest -m live                # 需要真实网络/LLM 的测试（nightly）
-uv run pytest -m emulator            # 需要模拟器的测试（P7）
+uv run pytest -m emulator            # 需要模拟器/设备的测试（★ 本仓库现在没有这类测试：
+                                     #   抓屏在采集端 leadhunter，marker 留着是为了将来）
+cd web && npm test                   # 前端纯函数测试（node --test，零额外依赖）
+cd web && npm run build              # 构建 web/dist（CI 里也跑这一步；产物不进仓库）
 ```
 
 ## License

@@ -539,9 +539,11 @@ DEEPSEEK_MODEL=deepseek-chat
 
 ### `data_dir` / `output_dir` / `state_dir`
 
-- **是什么**：三个数据目录。默认布局（`config/paths.py:19-23, 97-112`）：
-  `data/`（SQLite 库 + 抓屏产物 `data/leads/`）、`output/`（导出的 md/csv/docx）、
+- **是什么**：三个数据目录。默认布局（`config/paths.py:19-27`）：
+  `data/`（SQLite 库）、`output/`（导出的 md/csv/docx）、
   `state/`（运行时状态，如 `today-<日期>.json`）。三个都被 `.gitignore` 排除。
+  ★ 曾经还有 `data/leads/`（P7 抓屏产物）；P7 采集端搬去独立部署后已删除
+  （ISSUE #59），本仓库的 `data/` 只剩数据库。
 - **默认值**：`None` —— 不写就用 `<项目根>/data`、`<项目根>/output`、`<项目根>/state`。
   项目根 = 含 `pyproject.toml` 的那一层；用 `--config` 指定了 config.yaml 时，根取
   **config.yaml 所在目录**（`settings.py:362-375`）—— 这正是"把整个项目搬走还能继续用"的原因。
