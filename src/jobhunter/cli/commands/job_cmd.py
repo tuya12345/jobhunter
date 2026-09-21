@@ -1,7 +1,7 @@
-"""`jh job` —— 岗位录入（P2：**主路径是"人给链接"**）。
+"""`jh job` —— 岗位录入（P2：**主路径是"人给链接"**；2026-09-21 加了自动搜索）。
 
 ═══════════════════════════════════════════════════════════════════════════
-四种录入口子，覆盖"网络好/网络差/批量/离线"四种真实情况
+五种录入口子，覆盖"网络好/网络差/批量/离线/不想手动找"五种真实情况
 ═══════════════════════════════════════════════════════════════════════════
 
     jh job add <url>              主路径：粘贴岗位链接 → 抓详情 → 入库
@@ -10,12 +10,14 @@
     jh job add --manual           手动粘贴：从标准输入读 JD 文本（网络不通也能用）
     jh job add --html page.html   从本地保存的网页解析（不想联网 / 抓取被拦）
     jh job add --text "…"         直接给一段文本（脚本化调用）
+    jh job crawl -q Python --city 东莞 --pages 2
+                                  ★ 自动搜索 + 批量抓取（2026-09-21 用户授权放开）
 
 ★ `--file` 的三道闸门（都在**读取阶段**，见 `_read_url_file`）：
   只收 http/https、按归一化 URL 去重、一次最多 20 条 —— 跳过的每一类都会打印出来。
   理由：抓取之间要等 2~5 秒随机延时，"重复行/几千行清单"会直接变成对外连发。
 
-另外两个查询/操作命令：
+另外几个查询/操作命令：
 
     jh job list [--status] [--platform]   看录入结果
     jh job show <id>                      看某条岗位的完整字段与 JD 正文
@@ -25,9 +27,16 @@
   真正要看的信息（公司/职位/城市/薪资/抓到多少字）反而被淹没。
   要看正文用 `jh job show <id>`。
 
-★ 合规提醒（也写在 README 里）：本命令只做"读取页面内容"，
-  **不会**点击投递按钮、不会自动搜索翻页。抓取之间有随机延时；
-  批量导入时失败即跳过，不会重试轰炸对方站点。
+★★ 合规状态（2026-09-21 更新，全文见 docs/COMPLIANCE.md §5.8）
+
+    **已被用户授权放开**：自动搜索 / 批量抓取（原 P2 红线 1）。
+    用户原话："我做这个就是为了爬岗位的"，并明确"红线什么的先不管"。
+
+    **仍然守着的**：
+      · 不点击页面 —— 翻页靠 URL 的 `page=` 参数，不点"下一页"；
+      · 不绕风控 —— 命中验证页就停，不处理验证码/签名/指纹；
+      · **不自动投递**（项目最高红线）—— 只产出岗位清单，投递按钮永远由人点；
+      · 频率克制 —— 抓取之间有随机延时；批量时失败即跳过，不重试轰炸对方站点。
 """
 
 from __future__ import annotations
@@ -174,9 +183,16 @@ def job_add(
         warn("--dry-run：以上结果没有写入数据库")
         return
 
-    outcome = _upsert_everything(details, keyword=keyword)
+    _print_upsert_summary(_upsert_everything(details, keyword=keyword), failures)
 
-    # ---- 汇总 ------------------------------------------------------------
+
+def _print_upsert_summary(outcome: _UpsertOutcome, failures: list[str]) -> None:
+    """入库结果的统一收尾（`job add` 与 `job crawl` 共用）。
+
+    ★ 抽出来的理由：这段里每一条注释都是踩出来的规矩（"有东西进库才有 ✓"、
+      "一条都没入库要以非 0 退出"）。两处各写一份的话，迟早有一处忘了 ——
+      而"报成功、其实什么都没做成"正是 ISSUES #62 被定为 🔴 的理由。
+    """
     console.print()
     stored = outcome.created + outcome.refreshed + outcome.unchanged
     parts = []
@@ -215,6 +231,146 @@ def job_add(
     #   这正是"静默失败"最典型的形态（用户第二天才发现清单是空的）。
     if outcome.created == 0 and outcome.refreshed == 0 and outcome.unchanged == 0:
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# crawl —— 自动搜索 + 批量抓取（2026-09-21 用户授权放开）
+# ---------------------------------------------------------------------------
+#: `jh job crawl` 一次最多抓多少条详情。
+#:
+#: ★ 为什么有这道护栏（与 `URL_FILE_MAX_ITEMS` 同一个理由）：
+#:   抓详情之间要等 2~5 秒随机延时，100 条就是 5~10 分钟的连续对外请求。
+#:   让用户一次点下去就发出几百个请求，等于把"频率克制"变成一句空话。
+#:   要更多就分批跑 —— 每批的结果、失败原因也看得更清楚。
+CRAWL_MAX_ITEMS = 100
+
+
+@app.command("crawl")
+def job_crawl(
+    query: Annotated[
+        str,
+        typer.Option("--query", "-q", help="搜索关键词，例如 Python / 数据分析 / AI Agent"),
+    ],
+    city: Annotated[
+        str,
+        typer.Option(
+            "--city",
+            help=(
+                "城市（北京/上海/广州/深圳/东莞/杭州/成都/武汉/南京），"
+                "也可以直接给 BOSS 的城市编码（例如 101281600）"
+            ),
+        ),
+    ] = "全国",
+    pages: Annotated[
+        int,
+        typer.Option(
+            "--pages", help="读几页搜索结果（1 页大约 30 个岗位）。页数由你定，不做「翻到没有为止」"
+        ),
+    ] = 1,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", help=f"本次最多抓多少条详情（上限 {CRAWL_MAX_ITEMS}）"),
+    ] = 20,
+    keyword: Annotated[
+        str | None,
+        typer.Option(
+            "--keyword", "-k", help="记进库里的渠道标签（默认用 --query，用于复盘渠道效果）"
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="只搜索并列出链接，**不抓详情、不写库**"),
+    ] = False,
+) -> None:
+    """自动搜索岗位并批量抓取详情（**2026-09-21 用户授权放开**）。
+
+    ★★ 这条命令与 `jh job add` 的区别只有一处：**链接是它自己搜来的**。
+      抓详情、判据、入库走的都是同一套代码（`_collect_details` / `_upsert_everything`），
+      所以"什么算抓到了"的标准不会因为入口不同而不一致。
+
+    ★ 合规边界（没被放开的那几条）：
+
+        · **不点击**：翻页靠 URL 的 `page=` 参数，不点"下一页"；
+        · **不绕风控**：命中验证页就停，不处理验证码、不伪造签名、不换 IP；
+        · **不自动投递**（项目最高红线）：只产出岗位清单，投递按钮永远由人点。
+    """
+    settings = get_settings()
+
+    if pages < 1:
+        err_console.print("[red]--pages 至少是 1[/red]")
+        raise typer.Exit(code=1)
+    if not 1 <= limit <= CRAWL_MAX_ITEMS:
+        err_console.print(f"[red]--limit 要在 1~{CRAWL_MAX_ITEMS} 之间[/red]")
+        raise typer.Exit(code=1)
+
+    from jobhunter.adapters.discover import JobDiscovery, build_search_url
+
+    console.print(f"[bold]自动搜索[/bold]　关键词={query}　城市={city}　页数={pages}")
+    for index in range(1, pages + 1):
+        console.print(f"  [dim]{build_search_url(query, city, page=index)}[/dim]")
+
+    console.print("\n[bold]① 读搜索结果[/bold]")
+    discovery = JobDiscovery(settings, use_cdp=True, cdp_endpoint=_prepare_cdp(settings))
+    page_results = discovery.search(query, city, pages=pages)
+
+    # 跨页去重：用 `job_svc.url_dedup_key`（与 `--file` 那条路同一个判据，
+    # 不另写一套 —— 否则"什么算同一个链接"会有两种答案）。
+    seen: dict[str, str] = {}
+    for result in page_results:
+        if result.note:
+            warn(f"{result.page_url}\n    {result.note}")
+        for url in result.job_urls:
+            key = job_svc.url_dedup_key(url)
+            if key and key not in seen:
+                seen[key] = url
+
+    targets = list(seen.values())
+    if not targets:
+        err_console.print(
+            "[red]一个岗位链接都没读到。[/red]\n"
+            "  · 先确认那个专用窗口里**已经登录** BOSS（见 `jh job add --cdp --help`）\n"
+            "  · 也可能是这一页确实没有结果，或站点给了验证页"
+            "（本工具**不绕风控**，遇到就停）"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(f"  读到 [bold]{len(targets)}[/bold] 个不重复的岗位链接")
+    if len(targets) > limit:
+        console.print(f"  [dim]按 --limit {limit} 截断（剩下的换一次跑）[/dim]")
+        targets = targets[:limit]
+
+    if dry_run:
+        console.print("\n[bold]--dry-run：以下链接没有被抓取[/bold]")
+        for url in targets:
+            console.print(f"  · {url}")
+        console.print()
+        warn("--dry-run：以上结果没有抓详情、也没有写入数据库")
+        return
+
+    console.print("\n[bold]② 逐条抓详情[/bold]")
+    details, failures = _collect_details(
+        urls=targets,
+        file=None,
+        manual=False,
+        text=None,
+        html_file=None,
+        url=None,
+        platform=None,
+        cdp=True,
+        settings=settings,
+        # ★ 批量路径：每条抓完收拾掉自己那个标签页（一次几十条会把窗口堆满）。
+        #   单条路径（`jh job add --cdp`）仍然是"什么都不关"。
+        release_page=True,
+    )
+
+    _print_details(details, failures)
+    if failures:
+        _print_failures(failures)
+
+    _print_upsert_summary(
+        _upsert_everything(details, keyword=keyword or query),
+        failures,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +670,7 @@ def _collect_details(
     url: str | None,
     platform: str | None,
     cdp: bool = False,
+    release_page: bool = False,
     settings: object,
 ) -> tuple[list[JobDetail], list[str]]:
     """把各种输入统一收集成 `(成功解析的详情列表, 失败说明列表)`。
@@ -540,7 +697,11 @@ def _collect_details(
         # 平台覆盖经构造器传进去（见 ManualAdapter.__init__ 的说明）
         cdp_endpoint = _prepare_cdp(settings) if cdp else None
         adapter = ManualAdapter(  # type: ignore[arg-type]
-            settings, platform=platform, use_cdp=cdp, cdp_endpoint=cdp_endpoint
+            settings,
+            platform=platform,
+            use_cdp=cdp,
+            cdp_endpoint=cdp_endpoint,
+            release_page=release_page,
         )
         for target in targets:
             console.print(f"  [dim]抓取中… {target}[/dim]")

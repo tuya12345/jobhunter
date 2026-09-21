@@ -21,22 +21,29 @@ BOSS 直接给登录页，于是工具「抓到了登录页」（#62 已修成�
     ② 那个专用目录里会有**真实登录态**（Cookie 等）。
        → 它必须落在 `state/` 下（`.gitignore` 已覆盖），并有测试守住这一点。
 
-🔴 红线（有测试守着，验证会话也会用 AST 扫）
+🔴 边界（2026-09-21 用户明确授权后调整，见 docs/COMPLIANCE.md §5.8）
 
-    1. **只读、只抓用户手动给的那一个链接**：CDP 让"翻页"技术上更容易，
-       但本项目从 P2 起就不做批量/自动搜索 —— 这里**没有任何**"下一页"入口。
-    2. **不自动登录、不填表单、不点任何东西**：本模块只做
-       `connect_over_cdp` / `new_page` / `goto` / 读取内容。
-    3. **不自动投递**（项目最高红线）。
-    4. 不碰 `uiautomator2` / 模拟器那一套。
+    1. ~~只抓用户手动给的那一个链接~~ → **已授权放开**：现在支持"自动搜索并批量抓取"
+       （`jh job crawl`）。这是用户 2026-09-21 的明确决定（原话："我做这个就是为了爬岗位的"），
+       推翻了 P2 的"不做批量/自动搜索"。**放开的是"发现岗位"，不是"替人投递"。**
+    2. **仍然不点击、不填表、不自动登录**：本模块只做
+       `connect_over_cdp` / `Target.createTarget` / `goto` / 读取内容。
+       ★ 翻页靠**改 URL 参数**（`page=`），不靠点"下一页" —— 这既是纪律，也更稳。
+    3. **不自动投递**（项目最高红线，**没有**被授权放开）：不点"立即沟通/投递"、
+       不点赞/关注/私信。抓下来的岗位只是清单，投递按钮永远由人点。
+    4. 不碰 `uiautomator2` / 模拟器那一套；不绕验证码/签名（不处理 `__zp_stoken__`、
+       不伪造指纹、不注入反检测脚本）。
 
-    ★ 第 1、2 条不只是"注释里承诺"：`tests/unit/test_cdp.py` 用假的 Playwright
-      断言这些方法**从来没有被调用过**，另有一条 AST 守卫扫 `src/`。
+    ★ 第 2、3 条不只是"注释里承诺"：`tests/unit/test_cdp.py` 与
+      `tests/verify/test_v_checklist12.py` 用假的 Playwright + AST 守卫扫 `src/`，
+      断言 `click` / `fill` / `press` / `swipe` 这些**从来没有被调用过**。
 """
 
 from __future__ import annotations
 
 import contextlib
+import http.client
+import json
 import shutil
 import socket
 import subprocess
@@ -44,6 +51,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 from jobhunter.config.settings import AppSettings, get_settings
 from jobhunter.utils.logging import get_logger
@@ -54,9 +62,12 @@ __all__ = [
     "CdpEndpoint",
     "CdpProfileError",
     "cdp_profile_dir",
+    "close_page_if_not_last",
+    "create_target",
     "ensure_cdp_browser",
     "find_browser_executable",
     "is_cdp_listening",
+    "open_target_page",
 ]
 
 #: 连上 CDP 之后等多久（毫秒）。给得宽松些：专用实例第一次启动要建 profile。
@@ -316,6 +327,189 @@ def cdp_page(playwright: Any, endpoint: CdpEndpoint) -> Any:
     if pages:
         return context, pages[0]
     return context, context.new_page()
+
+
+# ---------------------------------------------------------------------------
+# ★★ 以目标 URL"出生"的标签页 —— 2026-09-21 加，这是"能抓到 BOSS 岗位页"的关键
+# ---------------------------------------------------------------------------
+#: 调 CDP 的 HTTP 接口时的超时
+_CDP_HTTP_TIMEOUT_SECONDS = 15.0
+#: 等新标签页出现在 `context.pages` 里的上限
+_TARGET_READY_TIMEOUT_SECONDS = 12.0
+#: 轮询间隔
+_TARGET_POLL_SECONDS = 0.25
+
+
+def _page_key(url: str) -> str:
+    """URL 的"主体"（scheme + host + path），用来在标签页列表里认出"我们刚开的那个"。
+
+    ★ 为什么要丢掉查询串：站点会改写它 —— 实测 BOSS 把
+      `…/jobs?query=Python&city=101281600&page=2` 改写成 `…/jobs?query=Python`。
+      丢掉之后，同一条搜索的第 1 页与第 2 页的 key **完全一样**，所以真正的判据是
+      "key 对得上、而且**不是我开之前就存在的那一页**"，见 `open_target_page`。
+    """
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def create_target(port: int, url: str) -> str | None:
+    """让浏览器**以 `url` 为第一项历史**新建一个标签页，返回它的 target id。
+
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║ ★★ 为什么必须"以目标 URL 出生"，而不是"开空白页再 goto 过去"          ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    BOSS 的岗位页里有个定时器在反复执行 **`history.back()`**：只要标签页存在
+    "上一页"，页面渲染 1~4 秒后就会被**退走**（退回 `about:blank` 或站点首页）。
+    2026-09-20 实测三种开页方式（登录态，同一台机器、同一个站点）：
+
+        · 复用已有标签页 + `goto`   → `history.length = 2` → **被退走**
+        · `new_page()` + `goto`     → `history.length = 2` → **被退走**
+        · ★ **以目标 URL 出生**     → `history.length = 1` → **退无可退，稳定 14 秒+**
+
+    机制证明（三步）：被退走后 `history.length` 不变（**不是 push**）；
+    `go_forward()` 能前进回岗位页（**说明是 `back()` 而不是 `location.replace`**）；
+    前进回去 2 秒后又被退走（**是反复触发的定时器**）。
+
+    ★ 这里用 CDP 的 **HTTP** 接口 `PUT /json/new?<url>` 而不是再拉一条 CDP 会话：
+      `Target.createTarget{url}` 等价，但 HTTP 版更省事（不用管 session 生命周期），
+      而且打的是 `127.0.0.1`，不产生任何对外请求。
+
+    ★ 注意 `PUT`（不是 GET）：较新的 Chromium 对 `/json/new` 只接受 PUT，
+      GET 会返回 405。这个细节踩过一次。
+
+    ★ 用 `http.client` 而不是 `urllib`：它**从不经过代理**（本机回环没必要绕代理），
+      而且调用名不会撞上"文本 IO 必须显式写 encoding"那道 AST 守卫 ——
+      `opener.open(...)` 会被那条守卫当成"裸 `open()` 文件"，实测被误报过一次
+      （`tests/unit/test_encoding_lint_guard.py`）。守卫认名字，那就换个不歧义的名字。
+    ★★ 目标 URL 必须**百分号编码**（2026-09-21 实测踩到的坑）：
+      `/json/new?<url>` 里的 `<url>` 是**查询串的值**，所以第一个 `&` 会被当成
+      "下一个参数"的分隔符 —— URL 在那里被**截断**。
+      实测：`…/jobs?query=Python&city=101281600&page=2` 开出来的标签页停在
+      `…/jobs?query=Python`（`city` / `page` 全丢），搜索条件根本没生效。
+      编码之后 Chrome 会自己解回来。
+    """
+    encoded = quote(url.split("#", 1)[0], safe="")
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=_CDP_HTTP_TIMEOUT_SECONDS)
+    try:
+        connection.request("PUT", f"/json/new?{encoded}")
+        response = connection.getresponse()
+        status = response.status
+        raw = response.read()
+    finally:
+        connection.close()
+
+    if status != 200:
+        raise RuntimeError(f"新建标签页失败：HTTP {status}")
+
+    payload = json.loads(raw.decode("utf-8"))
+    target_id = payload.get("id") if isinstance(payload, dict) else None
+    return target_id if isinstance(target_id, str) else None
+
+
+def open_target_page(playwright: Any, endpoint: CdpEndpoint, url: str) -> tuple[Any, Any]:
+    """开一个"以 `url` 出生"的标签页并返回 `(context, page)`（见 `create_target` 的说明）。
+
+    ★ 与 `cdp_page()` 的区别：`cdp_page()` 复用**已有**页面（那页面必然带着历史），
+      这个函数开的是**新页、且第一项历史就是 `url`** —— 差别就是"能不能抓到"。
+
+    ★★ 顺序很关键：**必须先建标签页、再连 Playwright**。
+
+      实测（`_diag-newtarget.py`）：`connect_over_cdp` **之后**再 `PUT /json/new`
+      建出来的 target，Playwright **看不见** —— `context.pages` 里 12 秒都没有它。
+      反过来（先建后连）就能看到，因为连上去时会枚举一遍已存在的 target。
+
+    ★★ 认页用 **target id**（`create_target` 的返回值），不靠 URL、不靠顺序：
+
+        · **URL 不可靠**：站点会改写查询串 —— 实测 BOSS 把
+          `…/jobs?query=Python&city=101281600&page=2` 改写成 `…/jobs?query=Python`，
+          于是"我们刚开的页"和"上一次留下的页"URL **一模一样**；
+        · **顺序不可靠**：实测 Playwright 报的 `pages[0]` 与 HTTP `/json/list`
+          的 `[0]` 不是同一个目标。
+
+      `create_target` 返回的 id 是这个标签页唯一的身份，`Target.getTargetInfo`
+      又能问出每一页的真实 id —— 两边对得上就一定是它。
+
+    ★ 拿不到就**抛异常**（而不是静默返回一个别的页）—— 调用方会回退到老路径，
+      并把这件事记进日志（见 `manual._render_page_via_cdp`）。
+    """
+    wanted = _page_key(url)
+    target_id = create_target(endpoint.port, url)
+
+    browser = playwright.chromium.connect_over_cdp(endpoint.url)
+    contexts = list(getattr(browser, "contexts", []) or [])
+    context = contexts[0] if contexts else browser.new_context()
+    pages = list(getattr(context, "pages", []) or [])
+
+    candidates = [page for page in pages if wanted and wanted in (getattr(page, "url", "") or "")]
+
+    # ① 只有一个 URL 对得上 → **直接用**，不查 target id。
+    #    ★ 为什么要省这一下：BOSS 的搜索页渲染出来约 1 秒后就把标签页关掉
+    #      （见 `discover._wait_for_job_cards` 的实测），而每个 `_target_id_of()`
+    #      都是一次 CDP 往返 —— 多花的时间就是"抢不到"的概率。
+    #      "只有一个候选"时 URL 已经足够确定，没必要再问一次。
+    if len(candidates) == 1:
+        return context, candidates[0]
+
+    # ② 多个候选（或 URL 一个都对不上）→ 才用 **target id** 精确认页
+    if target_id:
+        for page in candidates or pages:
+            if _target_id_of(context, page) == target_id:
+                return context, page
+
+    # ③ 兜底：拿不到 target id 时（假 context / 老浏览器）取最后一个候选
+    if candidates:
+        return context, candidates[-1]
+
+    raise RuntimeError(f"新标签页没有就绪（target id={target_id}，页数={len(pages)}）：{url}")
+
+
+def _target_id_of(context: Any, page: Any) -> str | None:
+    """问出这个页面真实的 CDP **target id**（拿不到就返回 None）。
+
+    ★ 为什么必须用 target id 认页 —— 见 `open_target_page` 的说明：
+      URL 会被站点改写、列表顺序也不保证，只有 target id 是唯一身份。
+    """
+    try:
+        session = context.new_cdp_session(page)
+    except Exception:  # noqa: BLE001 - 假 context / 老浏览器都可能没有这个能力
+        return None
+    try:
+        info = session.send("Target.getTargetInfo")
+        value = (info or {}).get("targetInfo", {}).get("targetId")
+        return value if isinstance(value, str) else None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            session.detach()
+
+
+def close_page_if_not_last(context: Any, page: Any) -> bool:
+    """关掉**我们自己刚开的**那个标签页；**它是最后一个就不关**。
+
+    ★★ 这条规则的由来（缺口 ① 的教训，别改回去）：
+      Edge/Chrome **关掉最后一个标签就整个退出**。所以"抓完把页面关掉"看着干净，
+      实际会把用户刚登录好的专用窗口一起关掉。判据因此是
+      **"关了之后还剩不剩标签页"**，而不是"这个页是不是我们开的"。
+
+    ★ 为什么批量抓取需要它：`--cdp` 抓一条时"什么都不关"是对的（用户能看见
+      工具读了哪个页面）；但自动搜索一次几十条，每条留一个标签页会把窗口堆满
+      （实测一个 BOSS 页几十兆内存）。所以**批量路径**在每条抓完后收拾自己那一页，
+      单条路径仍然什么都不关。
+
+    Returns:
+        真的关掉了 → True；因为"是最后一个"或出错而没关 → False。
+    """
+    try:
+        if len(list(getattr(context, "pages", []) or [])) <= 1:
+            return False
+        page.close()
+        return True
+    except Exception:  # noqa: BLE001 - 关不掉不是错误，最坏就是多留一个标签页
+        return False
 
 
 def safe_close(page_or_context: Any) -> None:

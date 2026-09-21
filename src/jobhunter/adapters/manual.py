@@ -15,11 +15,24 @@
 改成"人给链接"之后：风险降一个数量级、工期砍半、而且更贴合真实使用方式。
 自动搜索降级成**可选适配器**，且必须先通过 `spikes/boss_search_spike.py` 验证。
 
+★★ 2026-09-21 更新：**用户明确授权放开"自动搜索"这一条**（原话："我做这个就是为了
+爬岗位的"）。原决定里的三条理由现在这样处理：
+
+    · **技术风险** → 已解决。spike 当年担心的 `history.back()` 反制已经查清并绕过
+      （以目标 URL 新建标签页，见 `cdp.create_target`）；
+    · **合规风险** → 用户已知情并拍板。**但"不自动投递"没有被放开** ——
+      抓下来的岗位只是清单，投递按钮永远由人点；
+    · **工作流不匹配** → 由用户自己判断，他明确说了要批量。
+
+    实现放在**独立模块** `adapters/discover.py`（不塞进本模块）：这样
+    `JobSource.search()` 仍然明确抛 `NotImplementedError`（那条守卫还在），
+    "发现岗位"与"抓取详情"两件事的边界一眼可见。
+
 ★ 本模块的合规边界（写在这里因为这里是唯一能"接触外部世界"的地方）
 
-    1. **只读**：只 `goto` 页面并读取内容。**绝不**点击"立即沟通/投递"、
-       绝不点赞/关注/私信，不做任何写操作。
-    2. **不绕风控**：不处理验证码、不伪造签名、不模拟登录态；
+    1. **不写操作**：只打开页面并读取内容。**绝不**点击"立即沟通/投递"、
+       绝不点赞/关注/私信。翻页也**不点按钮**，靠改 URL 参数（`page=`）。
+    2. **不绕风控**：不处理验证码、不伪造签名、不模拟登录态、不注入反检测脚本；
        遇到验证页/登录墙就**如实失败**，让用户改用 `--manual` 粘贴文本。
     3. **频率克制**：每次抓取前有随机延时；批量导入时逐个抓、失败即跳过并记录。
     4. **失败可降级**：抓不到就返回 `None`，上层提示"请用手动粘贴"，
@@ -140,6 +153,7 @@ class ManualAdapter(JobSource):
         platform: str | None = None,
         use_cdp: bool = False,
         cdp_endpoint: Any = None,
+        release_page: bool = False,
     ) -> None:
         """Args:
         settings: 配置（不传用单例）
@@ -159,11 +173,16 @@ class ManualAdapter(JobSource):
             （ISSUES #65，CLI 的 `--cdp`）。需要登录的站点只有这条路能抓到正文。
         cdp_endpoint: 已经准备好的 CDP 端点（CLI 先 `ensure_cdp_browser()` 拿到它，
             顺便打印"去那个窗口登录一次"的提示）。不传则抓取时自己确保。
+        release_page: **批量路径**用（`jh job crawl`）。为 True 时每条抓完就关掉
+            **我们自己新开的**那个标签页（是最后一个就不关，见
+            `cdp.close_page_if_not_last`）。默认 False —— 单条抓取"什么都不关"，
+            用户能看见工具读了哪个页面。
         """
         self.settings = settings or get_settings()
         self._platform_override = platform
         self._use_cdp = use_cdp
         self._cdp_endpoint = cdp_endpoint
+        self._release_page = release_page
 
     def _resolve_platform(self, url: str) -> str:
         """这次抓取该用哪个平台：显式指定的优先，否则按域名判断。"""
@@ -299,24 +318,35 @@ class ManualAdapter(JobSource):
 
         ★ 它**不是**绕风控：#62 修好之后，"抓到登录页"是会明确报错的；
           这条路只是让"用户在浏览器里能看到的页面"也能被抓到 ——
-          没有伪造 Cookie / Referer / 指纹，没有登录自动化，没有翻页。
+          没有伪造 Cookie / Referer / 指纹，没有登录自动化。
 
-        ★ 与 `_render_page` 共用 `_collect_from_page`：等待序列、取 HTML、
-          取最长文本块、清正文的规则**只有一份** —— 否则两条路会慢慢跑偏
-          （本项目已经因为"同一件事两份实现"吃过好几次亏）。
+        ★★ 2026-09-21 改：开页方式从"复用已有页面 + `goto`"换成
+          **"以目标 URL 新建标签页"**（`cdp.open_target_page`）—— 原因是实测发现
+          BOSS 的岗位页会反复 `history.back()`，只要标签页有"上一页"就被退走。
+          详见 `cdp.create_target` 的说明与 `docs/COMPLIANCE.md` §5.8。
+          新页已经**停在目标 URL 上**，所以这里**不能再 `goto`** ——
+          再导航一次就等于又给自己加了一个"上一页"，白改。
 
-        ★★ 抓完**什么都不关**（实测踩到的坑，缺口 ①）
+        ★ 拿不到新页时**回退**到老路径（`cdp_page` + `goto`）并记一条 WARNING：
+          老路径在会 `history.back()` 的站点上抓不到，但在别的站点仍然可用，
+          而且浏览器版本不支持 `/json/new` 时也得有条活路。
 
-          初版在 `finally` 里关了刚用过的那个页面。看起来"很干净"，后果却是：
-          那个专用窗口**只有一个标签页**，而 Edge/Chrome **关掉最后一个标签就退出**
-           —— 用户刚登录好、跑一次抓取，窗口就没了（实测 CDP 端口随后不再监听）。
-          而他下次还得重新开、重新等。
+        ★ 取内容的规则仍然**只有一份**（`_longest_rendered_text` / `_data_test_title` /
+          `_finish_detail` 都是两条路共用的）—— 但**等待策略有意分叉**：
+          headless 那条路走 `_collect_from_page`（耐心等 `networkidle`），
+          这条走 `_grab_live_page`（抢读）。理由见 `_grab_live_page` 的实测：
+          BOSS 的页面渲染出来 1~2 秒后会把标签页自己关掉，耐心等必然等到死页面。
 
-          所以现在的规矩是：**连过去的浏览器，我们什么都不关** ——
-            ① 页面留着，停在刚抓完的那个 URL 上（用户能看见工具读了哪个页面，
-               这是透明度，也让"它到底干了什么"可核对）；
-            ② 下次抓取**复用同一个标签页**（`cdp_page()` 优先复用已有页面）；
-            ③ 只有"我们自己创建的 context"才可以关（见 `safe_close` 的说明）。
+        ★★ 抓完关不关页面，取决于走的是哪条路
+
+          · **单条抓取（默认）什么都不关** —— 缺口 ① 的教训：初版在 `finally` 里
+            关掉刚用过的页面，看着"很干净"，后果是那个专用窗口**只有一个标签页**，
+            而 Edge/Chrome **关掉最后一个标签就退出** —— 用户刚登录好、跑一次抓取
+            窗口就没了。所以页面留着，停在刚抓完的 URL 上（用户能看见工具读了哪个页面，
+            这是透明度），下次抓取也能复用。
+          · **批量抓取（`release_page=True`）会收拾自己那一页** —— 一次几十条的话，
+            每条留一个标签页会把窗口堆满（实测一个 BOSS 页几十兆内存）。
+            关之前先确认"关了还剩不剩标签页"，是最后一个就不关（同一条教训）。
         """
         from playwright.sync_api import sync_playwright
 
@@ -327,9 +357,29 @@ class ManualAdapter(JobSource):
             endpoint = cdp_module.ensure_cdp_browser(self.settings)
 
         with sync_playwright() as playwright:
-            _context, page = cdp_module.cdp_page(playwright, endpoint)
+            opened: tuple[Any, Any] | None = None
+            with contextlib.suppress(Exception):
+                opened = cdp_module.open_target_page(playwright, endpoint, url)
+
+            if opened is None:
+                logger.warning(
+                    "以目标 URL 新建标签页没成功，回退到「复用已有页面 + goto」——"
+                    "这条路在会 history.back() 的站点（如 BOSS）上抓不到正文"
+                )
+                context, page = cdp_module.cdp_page(playwright, endpoint)
+                _prepare_page(page)
+                return _collect_from_page(page, url)
+
+            context, page = opened
             _prepare_page(page)
-            return _collect_from_page(page, url)
+            try:
+                # ★★ **抢读**，不是"耐心等"：BOSS 的页面渲染出来 1~2 秒后会把标签页
+                #    自己关掉，等 7 秒必然等到死页面（见 `_grab_live_page` 的实测）。
+                #    新页已经停在目标 URL 上，所以这里**也不 goto**（见上面的说明）。
+                return _grab_live_page(page, url)
+            finally:
+                if self._release_page:
+                    cdp_module.close_page_if_not_last(context, page)
 
 
 def _finish_detail(
@@ -608,6 +658,9 @@ def _prepare_page(page: Any) -> None:
 def _collect_from_page(page: Any, url: str) -> tuple[str, str | None, str | None, str | None]:
     """导航到 `url` 并取回 `(html, 渲染后的最长文本块, data-test 标题, 最终地址)`。
 
+    ★ 这是**导航 + 耐心等待**那条路（新起 headless 实例时用；CDP 那条路改用
+      `_grab_live_page` 抢读，原因见它的说明）。
+
     ★ 等待序列是**实测调出来的**，两步都不能省：
         · `domcontentloaded` 之后等 `networkidle`（有些页面永远不 idle → 5 秒就放弃）；
         · 再等 1.5 秒让单页应用首屏渲染完（不等的话正文还没出来，
@@ -631,6 +684,76 @@ def _collect_from_page(page: Any, url: str) -> tuple[str, str | None, str | None
     title_hint = _data_test_title(page)
     final_url = getattr(page, "url", None)
     return html, jd_text, title_hint, final_url if isinstance(final_url, str) else None
+
+
+#: 抢读的轮询间隔（秒）。**要快**：BOSS 的页面渲染出来约 1~2 秒后就把标签页关掉。
+_GRAB_POLL_SECONDS = 0.2
+#: 抢读的总上限（秒）
+_GRAB_TIMEOUT_SECONDS = 20.0
+#: 连续几次快照一样就认为"渲染完了"（给不会关页面的正常站点用，免得白等满 20 秒）
+_GRAB_STABLE_READS = 2
+
+
+def _grab_live_page(page: Any, url: str) -> tuple[str, str | None, str | None, str | None]:
+    """**趁页面还活着赶紧读**，返回 `(html, 渲染文本, 标题线索, 最终地址)`。
+
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║ ★★ 为什么不走 `_collect_from_page` 那套"耐心等待"（2026-09-21 实测）   ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    实测（同一个浏览器实例、同样用 `cdp.create_target` 让标签页"以目标 URL 出生"）：
+
+        · **搜索结果页**：0 秒时已有 249K HTML / 19 个岗位链接 → **1 秒时标签页被关掉**
+        · **岗位详情页**：0~1 秒有 2161 字正文（含「职位描述」）→ **2 秒时标签页被关掉**
+        · 对照组 `example.com`：**活满 15 秒**
+
+    → **BOSS 的页面会把自己关掉**。`/json/new` 建出来的标签页算"脚本打开的"，
+      所以页面有权调 `window.close()` —— 这是和岗位页那个反复 `history.back()`
+      同一类的反自动化，只是手法不同。
+
+    → 而 `_collect_from_page` 的序列是 `domcontentloaded` + `networkidle`(≤5s) + 1.5s
+      ≈ **最多 7 秒**，**必然等到一个死页面**。实测的失败信息就是
+      `Page.content: Target page, context or browser has been closed`。
+
+    → 所以改成**抢读**：每 0.2 秒取一次快照，
+      **连续两次一样就收工**（正常站点，渲染完了）、
+      **页面被关掉就立刻用最后一次快照**（BOSS 这种站点）。
+      两个停止条件缺一不可：只有"被关掉"会让正常站点每次白等满 20 秒。
+
+    ★ 读快照**必须整块容错**：`page.content()` / `page.evaluate()` 在页面
+      正在导航或正在被关闭时都会抛。抛了就说明窗口关了，用最后一次快照走人。
+    """
+    deadline = time.monotonic() + _GRAB_TIMEOUT_SECONDS
+    best: tuple[str, str | None, str | None, str | None] | None = None
+    previous: tuple[str, str, str, str] | None = None
+    stable = 0
+
+    while time.monotonic() < deadline:
+        try:
+            html = page.content()
+            rendered = _longest_rendered_text(page)
+            title_hint = _data_test_title(page)
+            final_url = getattr(page, "url", None)
+        except Exception:  # noqa: BLE001 - 页面被站点关掉了（见上面的实测）
+            break
+
+        if html:
+            best = (
+                html,
+                rendered,
+                title_hint,
+                final_url if isinstance(final_url, str) else None,
+            )
+            current = (html, rendered or "", title_hint or "", final_url or "")
+            stable = stable + 1 if current == previous else 0
+            previous = current
+            if stable >= _GRAB_STABLE_READS:
+                break
+        time.sleep(_GRAB_POLL_SECONDS)
+
+    if best is None:
+        raise RuntimeError(f"页面还没读到内容就被关掉了：{url}")
+    return best
 
 
 #: JD 正文的**起始特征词**（出现即认为"从这里开始是正文"）
