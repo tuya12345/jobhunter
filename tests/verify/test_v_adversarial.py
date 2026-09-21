@@ -201,10 +201,6 @@ def test_injection_text_yields_no_skill_keywords(session, settings) -> None:
     assert "score=100" not in str(result.jd_keywords)
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #9（🟡）：无信息量的 JD（连正文都没有）拿到 80 分 ≥ 分数线 60",
-    strict=False,
-)
 def test_uninformative_jd_does_not_reach_the_threshold(session, settings) -> None:
     """★★ 依据：`threshold`（默认 60）的产品语义 —— 达到分数线的岗位才会进待投清单
     （设计文档 §5.1.4「jh today --min-score 60」）。
@@ -467,10 +463,6 @@ def test_url_file_tolerates_empty_and_comment_only(isolated_env) -> None:
     assert "没有可录入的内容" in result.output
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #13（🟡）：--file 读取阶段不去重，同一 URL 会各抓一次",
-    strict=False,
-)
 def test_url_file_does_not_silently_swallow_duplicates(isolated_env, engine) -> None:  # noqa: ARG001
     """加固观察项：`--file` 里的重复 URL 目前会**各抓一次**。
 
@@ -489,10 +481,6 @@ def test_url_file_does_not_silently_swallow_duplicates(isolated_env, engine) -> 
     assert len(urls) == len(set(urls)), f"读取阶段没有去重，会对同一 URL 抓两次：{urls}"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #14（🟡）：--file 不做 scheme 白名单，file:// 与内网地址会进抓取队列",
-    strict=False,
-)
 def test_url_file_reads_arbitrary_scheme_without_validation(isolated_env) -> None:
     """加固观察项：`--file` 不做 scheme 白名单（`file://` / 内网地址会被真的交给浏览器打开）。
 
@@ -512,10 +500,6 @@ def test_url_file_reads_arbitrary_scheme_without_validation(isolated_env) -> Non
     assert not bad, f"非 http(s) 的条目没有被拒绝，会真的进入抓取队列：{bad}"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #14（🟡）：--file 没有条数上限（一次可喂数千条，与'频率克制'冲突）",
-    strict=False,
-)
 def test_url_file_has_no_size_cap(isolated_env) -> None:
     """加固观察项：`--file` 没有条数上限。
 

@@ -1,0 +1,63 @@
+{
+  "schema": "jobhunter.leads",
+  "schema_version": 1,
+  "exported_at": "2026-09-20T01:43:17+00:00",
+  "generator": {
+    "tool": "leadhunter",
+    "version": "0.1.0"
+  },
+  "leads": [
+    {
+      "external_id": 1,
+      "name": "星澜科技",
+      "official_url": "https://example.com/xinglan",
+      "source_platform": "小红书",
+      "source_type": "官网",
+      "evidence_text": "刷小红书看到「星澜科技」在招 AI Agent 方向，官网投递 https://example.com/xinglan",
+      "evidence_url": null,
+      "note": "AI Agent 方向；另有一条重复线索（同公司，官网 https://example.com/xinglan，未提供额外信息）",
+      "http_status": 404,
+      "checked_at": "2026-09-19T10:47:36+00:00",
+      "collected_at": "2026-09-19T10:47:17+00:00"
+    },
+    {
+      "external_id": 2,
+      "name": "云枢智能",
+      "official_url": null,
+      "source_platform": null,
+      "source_type": "内推",
+      "evidence_text": "有人内推「云枢智能」，简历发 hr@example.com，说是 NLP 组，base 深圳",
+      "evidence_url": null,
+      "note": "NLP 组，base 深圳；内推人邮箱 hr@example.com",
+      "http_status": null,
+      "checked_at": null,
+      "collected_at": "2026-09-19T10:47:17+00:00"
+    },
+    {
+      "external_id": 3,
+      "name": "明澈数据",
+      "official_url": null,
+      "source_platform": "知乎",
+      "source_type": "HR直招",
+      "evidence_text": "【知乎】「明澈数据」HR 直招，加微信 hr_mingche，做后端开发，急招",
+      "evidence_url": null,
+      "note": "后端开发，急招；HR 微信 hr_mingche",
+      "http_status": null,
+      "checked_at": null,
+      "collected_at": "2026-09-19T10:47:17+00:00"
+    },
+    {
+      "external_id": 4,
+      "name": "虚构网络",
+      "official_url": "https://example.invalid/careers",
+      "source_platform": "贴吧",
+      "source_type": "官网",
+      "evidence_text": "贴吧看到「虚构网络」招 Python 实习生，招聘页 https://example.invalid/careers",
+      "evidence_url": null,
+      "note": "Python 实习生",
+      "http_status": null,
+      "checked_at": null,
+      "collected_at": "2026-09-19T10:47:17+00:00"
+    }
+  ]
+}

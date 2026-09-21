@@ -73,10 +73,6 @@ def test_401_is_not_retried() -> None:
     assert len(attempts) == 1, f"401 不该重试，却请求了 {len(attempts)} 次"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #10（🟡）：200 + 非 JSON 响应体时抛裸 JSONDecodeError，无法指导排查",
-    strict=False,
-)
 def test_http_200_with_non_json_body_does_not_leak_raw_exception() -> None:
     """边界：网关返回 200 + HTML（真实常见）。
 
@@ -125,10 +121,6 @@ async def test_empty_content_retries_then_degrades_keeping_rule_score(session, s
     assert stats.errors, "降级了却没有记录原因"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #17（🟡）：改简历后重跑规则层，上一次的 llm_score 仍被当成 match_score",
-    strict=False,
-)
 async def test_stale_llm_score_is_dropped_when_resume_changes(session, settings) -> None:
     """★★ 依据：评审采纳项 #3「LLM 缓存 key 错（改简历后仍返回旧分）」
     —— 这条修的是**缓存**层；但**库里已经落下的 llm_score** 走的是另一条路：
@@ -197,10 +189,6 @@ def test_out_of_range_or_wrong_type_score_is_rejected(value: object) -> None:
         match_llm_svc.parse_verdict(f'{{"score": {value!r}}}'.replace("'", '"'))
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #11（🟡）：pydantic 非严格模式把 true 强转成 1 分（静默失真）",
-    strict=False,
-)
 def test_boolean_score_is_rejected_not_coerced() -> None:
     """依据：同上 + 「绝不静默截断/静默转换」。
 
@@ -314,10 +302,6 @@ def test_readers_are_not_blocked_by_an_open_write_transaction(session, db_url) -
 # ===========================================================================
 # ④ 文件损坏 / 编码错误：用户看到的提示能不能指导下一步
 # ===========================================================================
-@pytest.mark.xfail(
-    reason="ISSUE #12（🟡）：非 UTF-8 简历只报裸 UnicodeDecodeError，不给中文的'另存为 UTF-8'指引",
-    strict=False,
-)
 def test_gbk_resume_file_gives_actionable_error(isolated_env, engine) -> None:  # noqa: ARG001
     """依据：`ResumeParseError` 的存在意义（resume_svc.py 的"空文档"分支写了详细原因与建议）
     + 设计文档 §3.2「Windows 上裸 open() 默认 cp936」这条踩坑记录。
@@ -338,10 +322,6 @@ def test_gbk_resume_file_gives_actionable_error(isolated_env, engine) -> None:  
     assert "编码" in output, f"报错没有用中文指出真正的原因（编码）：\n{output}"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #12（🟡）：损坏 docx 只报 PackageNotFoundError，看不出'文件坏了'",
-    strict=False,
-)
 def test_corrupted_docx_gives_actionable_error(isolated_env, engine) -> None:  # noqa: ARG001
     """依据：同 P1 提示词「文件损坏」这类异常必须转成友好错误（docx 解析失败是预期内的）。
 
@@ -361,10 +341,6 @@ def test_corrupted_docx_gives_actionable_error(isolated_env, engine) -> None:  #
     )
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #15（🟡）：纯空白 .txt 被当成'成功导入的空简历'，还会自动变成默认简历",
-    strict=False,
-)
 def test_empty_text_resume_raises_parse_error_with_reason(isolated_env, engine) -> None:  # noqa: ARG001
     """依据：`parse_resume_file` 的 `ResumeParseError` 分支
     「一个文本块都没读到 → 报错并给出原因与建议」。

@@ -64,10 +64,6 @@ def test_skill_adjacency_variants_are_consistent() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #4（🟡）：中文分支左边界 (?<![A-Za-z0-9_]) 否掉 'AI大模型' 这类连写",
-    strict=False,
-)
 def test_ai_compound_word_is_matched() -> None:
     """`AI大模型` / `LLM大模型` 这类连写在中文 JD 里很常见。
 
@@ -81,10 +77,6 @@ def test_ai_compound_word_is_matched() -> None:
 # ===========================================================================
 # ② 技能归一化：同一个写法不能既是规范名又是别人的别名
 # ===========================================================================
-@pytest.mark.xfail(
-    reason="ISSUE #5（🟡）：'大模型' 既是内置规范名又是 LLM 的别名 → 同一句需求抽成两个关键词",
-    strict=False,
-)
 def test_jd_alias_does_not_produce_a_duplicate_canonical_keyword() -> None:
     """依据：设计文档 §5.1.2「技能归一化词表」，以及 `load_skill_vocabulary` 的合并规则。
 
@@ -97,10 +89,6 @@ def test_jd_alias_does_not_produce_a_duplicate_canonical_keyword() -> None:
     assert len(overlapping) == 1, f"同一句'大模型'被抽成了多个规范名：{hits} —— 技能分母会被灌水"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #5（🟡）：别名冲突导致假缺口（简历写了 LLM 却报'缺 大模型'）",
-    strict=False,
-)
 def test_resume_with_llm_does_not_report_a_fake_gap_for_its_alias(session, settings) -> None:
     """依据：`jh gap` 的产品定义（设计文档 §5.1.3）：
     "告诉你该补什么"。如果简历写了 `LLM` 却报"缺 大模型"，
@@ -127,10 +115,6 @@ def test_resume_with_llm_does_not_report_a_fake_gap_for_its_alias(session, setti
 # ===========================================================================
 # ③ 归一化的全半角 / 空白 / 特殊字符
 # ===========================================================================
-@pytest.mark.xfail(
-    reason="ISSUE #6（🟡）：抽词前不做 NFKC，全角英文技能静默漏抽",
-    strict=False,
-)
 def test_fullwidth_english_skill_is_recognized() -> None:
     """边界：全角英文（中文输入法下极易产生，且 `normalize_text` 已经有 NFKC 能力）。
 

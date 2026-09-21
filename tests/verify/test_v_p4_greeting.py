@@ -100,10 +100,6 @@ def test_fidelity_allows_whitelist_only_with_learning_marker() -> None:
     assert not without_marker.passed, "不带'在学习'标注的白名单技能居然放过了"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #30（🟡）：技能词表混入动作词（部署/性能优化/单元测试…）→ 真话被判'编造'",
-    strict=False,
-)
 def test_fidelity_does_not_flag_a_truthful_greeting(session, settings) -> None:
     """★★ 误报率（开发会话在 STATUS §6 明确要求验证的一项）：**真话不能被拦**。
 
@@ -142,10 +138,6 @@ def test_fidelity_does_not_flag_a_truthful_greeting(session, settings) -> None:
     assert job.id is not None
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #30（🟡）：误报的实际后果 —— 一句真话让整个完整版被降级成模板",
-    strict=False,
-)
 async def test_truthful_greeting_is_not_downgraded_to_template(session, settings) -> None:
     """★★ #30 的**用户可见后果**：模型写了一句完全真实的话，
     却因为"部署"这个词被判编造，整条完整版被换成干巴巴的模板。
@@ -442,6 +434,148 @@ async def test_greeting_cache_does_not_collide_with_match_cache(session, setting
 
 
 # ===========================================================================
+# ④b 缓存 key 必须覆盖"进提示词的一切"（ISSUE #24 的同类缺陷，
+#     开发会话只修了 match 那一个调用点 —— 这里盯 greeting）
+# ===========================================================================
+def _greeting_cache_rows(session) -> int:  # noqa: ANN001
+    """`llm_cache` 里 task='greeting' 的行数。
+
+    ★★ 为什么用**行数**而不是"模型被调用了几次"或"输出文本变没变"：
+      · `cache_key` 是这张表的**主键**，所以"不同输入 → 不同 key"这件事
+        唯一可靠的观测量就是**行数**：key 相同会被 UPSERT 掉，行数不涨。
+      · "调了几次模型"会被业务流程干扰 —— `_settle_versions` 在闸门不过时
+        会做**修复调用**（提示词里带 `</previous>`），一次 `generate_greeting`
+        本来就可能调两次。用它当判据会得出错误的结论（我第一版就是这么写错的）。
+      · "输出文本变没变"更弱：模板降级、措辞随机都会影响它。
+    """
+    from sqlalchemy import func, select
+
+    from jobhunter.models.llm_cache import LLMCache
+
+    return session.scalar(
+        select(func.count()).select_from(LLMCache).where(LLMCache.task == "greeting")
+    )
+
+
+def _generate(
+    session, settings, job, candidate, variant: str = "with_project", reply: str | None = None
+):  # noqa: ANN001, ANN202
+    """跑一次 `generate_greeting`（带 session → 会写 `llm_cache`）。"""
+    provider = MockProvider(responses={"greeting": reply or _good_greeting()})
+    return greeting_svc.generate_greeting(
+        job,
+        candidate,
+        session=session,
+        provider=provider,
+        settings=settings,
+        variant=variant,
+    )
+
+
+def _good_greeting() -> str:
+    """一段能过四道闸门的开场白（**长度必须落在 80-150**，否则会降级成模板，
+    那就观测不到"缓存里到底存了什么"了 —— 我第一版就写短了 1 个字）。"""
+    return json.dumps(
+        {
+            "full": (
+                "您好，我是本科应届生。看到岗位要求 Python 与 FastAPI，我在智能问答助手里"
+                "实际用过这两项，也自己写过接口把服务部署起来跑过一段时间。"
+                "方便请教一下这个岗位目前最看重哪一块？"
+            ),
+            "short": "熟悉 Python 与 FastAPI，方便聊聊吗？",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _other_greeting() -> str:
+    """第二段（同样过闸门，但**内容明显不同**）：用来区分"新生成的"与"缓存里的"。"""
+    return json.dumps(
+        {
+            "full": (
+                "您好，我是本科应届生。看到岗位要求 Python 与 RAG，我在智能问答助手里"
+                "用 RAG 做过检索增强，也自己写过接口把服务部署起来跑过一段时间。"
+                "想请教一下这个岗位现在最缺的是哪一块能力？"
+            ),
+            "short": "熟悉 Python 与 RAG，方便聊聊吗？",
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_greeting_cache_is_invalidated_when_the_variant_changes(session, settings) -> None:
+    """★★ `variant` 进了提示词，就必须进缓存 key —— 否则用户切换 A/B 版本，
+    拿到的还是上一版生成的开场白。
+
+    ★ 这一条是我在复验 ISSUE #24 时**顺出来的同类缺陷**（已录为 ISSUE #55）：
+      开发会话把 `prompt_fingerprint` 接到了 `match_llm_svc`（那正是 #24 报的位置），
+      但 greeting 这个调用点仍然只用五个固定成分算 key
+      （`greeting_svc.py:572`：task / prompt_version / model / jd_hash / resume_hash），
+      而它的提示词里显然还有 `variant`、职位名、城市、以及 settings 派生的内容。
+
+    ★★ 实测到的用户后果（不是推理）：第二次带着 `variant="without_project"`
+      调用，返回的却是**第一次 `with_project` 那段文本**，而且 `source` 仍是 `llm`
+      —— 用户看到的是"刚刚生成的"，实际上一个字都没重新生成。
+    """
+    insert_resume(session)
+    job = insert_job(session)
+    score_job(session, job, settings)
+    candidate = _candidate(session, settings)
+
+    first = _generate(session, settings, job, candidate, variant="with_project")
+    assert json.loads(_good_greeting())["full"] == first.full, (
+        f"第一段没被采用（降级成模板了？）source={first.source} issues={first.issues} —— "
+        "用例前提不成立，后面的断言就没有意义"
+    )
+    after_first = _greeting_cache_rows(session)
+    assert after_first == 1, f"第一次生成应留下 1 条 greeting 缓存，实际 {after_first}"
+
+    second = _generate(
+        session, settings, job, candidate, variant="without_project", reply=_other_greeting()
+    )
+    after_second = _greeting_cache_rows(session)
+
+    assert second.full == json.loads(_other_greeting())["full"], (
+        "带着 without_project 调用，返回的却是上一次 with_project 生成的那段文本 —— "
+        "用户切了 A/B 版本，工具把上一版的文案原样给了他，还标着 source='llm'。\n"
+        f"期望：{json.loads(_other_greeting())['full']!r}\n"
+        f"实际：{second.full!r}"
+    )
+    assert after_second == 2, (
+        "换了 variant 却复用了同一条缓存（两者的提示词明确不同："
+        "『请带上一个具体的项目名』vs『不要提项目名字』）。"
+        f"缓存行数：{after_first} → {after_second}（期望 2）"
+    )
+
+
+def test_greeting_cache_is_invalidated_when_the_job_header_changes(session, settings) -> None:
+    """★★ `jd_hash` 只哈希 **JD 正文**（`job_svc.compute_jd_hash`），
+    而开场白提示词里带着 `job.title` 与 `job.city` —— 改了标题/城市，
+    缓存 key 不变，用户会拿到"对着旧职位名写的"开场白。
+
+    岗位标题是从招聘页面抓来的、会改；用户也会自己修它。
+    这是 #24（"缓存 key 不覆盖进提示词的东西"）的同一个洞，只是换了个字段。
+    """
+    insert_resume(session)
+    job = insert_job(session)
+    score_job(session, job, settings)
+    candidate = _candidate(session, settings)
+
+    _generate(session, settings, job, candidate)
+    assert _greeting_cache_rows(session) == 1
+
+    # 只改表头字段：JD 正文一字不动 → jd_hash 不变
+    job.title = "（改过的）后端开发工程师"
+    session.flush()
+
+    _generate(session, settings, job, candidate, reply=_other_greeting())
+    assert _greeting_cache_rows(session) == 2, (
+        "岗位标题改了，缓存却复用了同一条 —— 提示词里写着『岗位：<标题>』，"
+        "用户会拿到对着旧职位名写的开场白（jd_hash 只哈希 JD 正文，覆盖不到表头）"
+    )
+
+
+# ===========================================================================
 # ⑤ 对抗：开场白提示词自身也要防注入
 # ===========================================================================
 def test_greeting_prompt_neutralizes_delimiters(session, settings) -> None:
@@ -494,10 +628,6 @@ def test_greeting_does_not_leak_resume_pii_into_prompt(session, settings) -> Non
     assert "xiaoman.lin@example.com" not in joined, "简历邮箱被送进了第三方提示词"
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #31（🟡）：allowed_skills 传成 keywords|pool，skill_not_in_jd 永不触发",
-    strict=False,
-)
 def test_greeting_skill_not_in_jd_is_flagged(session, settings) -> None:
     """依据：`greeting_svc` docstring 的闸门 ③「只提 `JD 关键词 ∩ 简历技能`」。
 

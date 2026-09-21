@@ -24,10 +24,6 @@ runner = CliRunner()
 # ===========================================================================
 # ① `--copy` 的筛选选项被静默忽略
 # ===========================================================================
-@pytest.mark.xfail(
-    reason="ISSUE #34（🟡）：--copy N 静默忽略 --min-score / --limit",
-    strict=False,
-)
 def test_copy_option_is_not_silently_ignored(session, settings) -> None:
     """🟡 依据：`--copy N`、`--min-score`、`--limit` 是同一条命令的选项，
     用户给 `--copy 2 --min-score 999` 时的合理预期是
@@ -154,10 +150,6 @@ def test_applying_before_generating_does_not_lose_the_greeting(session, settings
 # ===========================================================================
 # ④ "过滤前达线 N 条"的口径
 # ===========================================================================
-@pytest.mark.xfail(
-    reason="ISSUE #35（🟡）：candidates 计数在'排除已投递'之后统计，与 UI 文案'过滤前'不符",
-    strict=False,
-)
 def test_candidates_count_matches_its_label(session, settings) -> None:
     """🟡 依据：`TodayList.candidates` 注释「过滤前达到分数线的数量」（`today_svc.py:90`）
     与 CLI 文案「过滤前达线 N 条」。
@@ -209,10 +201,6 @@ def test_pending_application_greeting_is_not_silently_replaced(session, settings
     )
 
 
-@pytest.mark.xfail(
-    reason="ISSUE #42（🟢）：event_type 无 CHECK 约束，拼错的事件类型会被静默写库",
-    strict=False,
-)
 def test_application_events_rejects_unknown_event_type(session, settings) -> None:
     """🟢 加固观察项：`application_events.event_type` 是自由的 `String(40)`，无 CHECK 约束
     （`models/constants.py:10-11` 说留到 P6）。
