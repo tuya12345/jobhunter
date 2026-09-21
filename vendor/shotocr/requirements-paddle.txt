@@ -1,0 +1,14 @@
+# 截图 OCR —— 高精度引擎依赖（PaddleOCR）
+#
+# 安装：
+#   .venv\Scripts\python.exe -m pip install -r requirements-paddle.txt
+#
+# 说明：
+#   paddlepaddle + paddleocr 精度更高，但体积明显更大（数百 MB）。
+#   装好后用 --engine paddle 或 --engine auto 调用。
+#
+#   如果没有 NVIDIA 显卡，用 CPU 版 paddlepaddle 即可（就是下面这个）。
+#   要用 GPU，把 paddlepaddle 换成 paddlepaddle-gpu，并参考官方安装说明。
+
+paddlepaddle>=3.0.0
+paddleocr>=3.0.0

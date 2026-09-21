@@ -1,0 +1,16 @@
+# 截图 OCR —— 基础依赖（轻量引擎，CPU 可用）
+#
+# 安装：
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# 说明：
+#   rapidocr + onnxruntime 是 CPU 友好的离线引擎，
+#   体积小、启动快，适合日常截图识别。
+#   需要更高精度时再装 requirements-paddle.txt。
+
+pillow>=10.0.0
+numpy>=1.26.0
+opencv-python>=4.9.0
+
+rapidocr>=3.0.0
+onnxruntime>=1.17.0

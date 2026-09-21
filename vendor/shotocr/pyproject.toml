@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shotocr"
+version = "0.1.0"
+description = "本地离线截图 OCR：识别屏幕区域、剪贴板或图片中的文字"
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "opencv-python>=4.9.0",
+]
+
+[project.optional-dependencies]
+# 轻量引擎
+rapid = ["rapidocr>=3.0.0", "onnxruntime>=1.17.0"]
+# 高精度引擎
+paddle = ["paddlepaddle>=3.0.0", "paddleocr>=3.0.0"]
+
+[project.scripts]
+shotocr = "shotocr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -74,6 +74,12 @@ target-version = "py313"
 extend-exclude = [
     "alembic/versions",  # 自动生成的迁移脚本不参与风格检查
     "docs",              # 文档里的示例代码块不该被代码格式化器改写（它会把对齐注释挪乱）
+    # ★ `vendor/` 是**别人的代码**（用户 2026-09-21 接入的截图 OCR 工具 `shotocr`）。
+    #   它有自己的 `pyproject.toml` 与自己的风格，**不该被本项目的 ruff 规则管** ——
+    #   拿我们的行宽与规则集去要求第三方代码，只会得到一堆与本项目无关的红灯，
+    #   而"CI 红的原因和本次改动无关"是最消耗信任的一类红灯（见下面 PLW1514 那段说明）。
+    #   pytest 那边不用额外配：`testpaths = ["tests"]` 已经把它挡在收集范围外了。
+    "vendor",
 ]
 
 [tool.ruff.lint]
