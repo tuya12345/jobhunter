@@ -255,6 +255,16 @@ def database_ready(url: str | None = None) -> bool:
       版本比程序新（用户装的是旧版程序）**也算不可用** —— 那种情况跑 jh init
       会把库降级，所以必须拦住并给另一个方向的提示（见 `schema_status`）。
 
+    ★★ `unknown` 也算**不可用**（只读代码审查 JH-08）：
+
+      修 #60 时这里留了一句"unknown 不当成不可用"（怕把'库其实好好的、只是版本
+      读不出来'变成新的拦截点）—— 结果是**反方向的 fail-open**：
+      迁移脚本目录缺失/不可读、`alembic_version` 表损坏时，命令照常往下跑，
+      直到真正访问到缺失的列/表才炸出一句原始 SQL 错误。那正是本函数要消灭的体验。
+
+      所以现在改为：**确认不了就不放行**，并给一句可操作的话
+      （`SchemaStatus.message()` 对 unknown 会说明"检查迁移脚本 / 跑 jh init"）。
+
     Raises: 不抛异常。任何读不出来的情况都返回 False（退回"请先运行 jh init"）。
     """
     from sqlalchemy import inspect as sa_inspect
@@ -274,10 +284,8 @@ def database_ready(url: str | None = None) -> bool:
     try:
         if "resumes" not in set(sa_inspect(engine).get_table_names()):
             return False
-        status = schema_status(engine, db_url=url)
-        # unknown（库损坏 / 脚本目录读不到）**不当成不可用** ——
-        # 修 #60 不该把"库其实好好的、只是版本读不出来"变成新的拦截点。
-        return status.is_usable or status.state == "unknown"
+        # ok 才可用：behind / ahead / unknown 三种都拦下（各自的提示见 message()）
+        return schema_status(engine, db_url=url).is_usable
     except Exception:  # noqa: BLE001 - 库损坏/路径异常都当作"没准备好"
         return False
     finally:

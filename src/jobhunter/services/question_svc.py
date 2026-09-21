@@ -31,8 +31,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session, aliased
 
 from jobhunter.config.settings import AppSettings, get_settings
 from jobhunter.llm import cache as llm_cache
@@ -40,7 +40,7 @@ from jobhunter.llm.base import LLMMessage, LLMProvider, PromptPayload
 from jobhunter.llm.deepseek import DeepSeekError
 from jobhunter.llm.prompts import PromptFile, PromptFileError, load_prompt_file, render
 from jobhunter.llm.safety import wrap_delimited
-from jobhunter.models import Interview, InterviewQuestion, Job
+from jobhunter.models import Application, Interview, InterviewQuestion, Job
 from jobhunter.models.constants import QUESTION_RATINGS
 from jobhunter.services import cache_stats_svc, match_svc
 from jobhunter.services.match_svc import ResumeCandidate
@@ -148,13 +148,29 @@ def add_question(
         rating: `bad` / `ok` / `good`（3 档，样本小时 5 档全是噪声）。
 
     Raises:
-        QuestionError: 既没给面试也没给岗位、面试/岗位不存在、rating 不认识。
+        QuestionError: 既没给面试也没给岗位、**两个都给了**、面试/岗位不存在、rating 不认识。
     """
     text = (question or "").strip()
     if not text:
         raise QuestionError("问题不能是空的")
     if interview_id is None and job_id is None:
         raise QuestionError("要么给 --interview <面试ID>，要么给 --job <岗位ID>")
+    if interview_id is not None and job_id is not None:
+        # ★★ 二选一是**排他的**（只读代码审查 JH-07）：
+        #   两个都给会写出"既是这场面试的、又是这个岗位的"一条记录 ——
+        #   而 `job_id` 是**直连**岗位、`interview_id` 要经
+        #   `interview → application → job` 才追得到岗位（见 `job_for_question`）。
+        #   两个入口于是可能看到两个不同的事实（同一道题在"按面试看"和"按岗位看"
+        #   里挂到不同岗位），`jh weak` 的聚合也跟着分叉。
+        #   报错而不是"以 interview 为准"：那会把用户**明确给出的**另一个事实
+        #   悄悄丢掉 —— 而他很可能只是参数敲重复了，想知道自己敲了什么。
+        raise QuestionError(
+            "`--interview` 与 `--job` 只能给一个（给了两个就无法确定这道题归属哪里）："
+            f"interview={interview_id}、job={job_id}。\n"
+            "  · 记得是哪一场面试 → 只给 `--interview <面试ID>`（归属最准确，"
+            "`jh weak` 能追到是哪一场）；\n"
+            "  · 只记得岗位 → 只给 `--job <岗位ID>`。"
+        )
     if rating is not None and rating not in QUESTION_RATINGS:
         raise QuestionError(f"自评 {rating!r} 不认识。可用：{'、'.join(QUESTION_RATINGS)}")
 
@@ -484,27 +500,46 @@ def list_questions(
     job_id: int | None = None,
     source: str | None = None,
 ) -> list[QuestionRow]:
-    """列出问题（可按面试 / 岗位 / 来源过滤），新→旧。"""
+    """列出问题（可按面试 / 岗位 / 来源过滤），新→旧。
+
+    ★ 岗位信息要**两条路都能查到**（只读代码审查 JH-07 的后半条）：
+
+      · `interview_questions.job_id`：直接挂岗位的记录（面完忘了哪一场时用）；
+      · `interview_id → interviews.application_id → applications.job_id`：
+        **合法的 interview-only 记录**走这条路。原来这里只 join 了前者，
+        于是"按面试记的题"在列表里公司/职位是空的 —— 岗位过滤（`--job N`）
+        也把它们整批漏掉，同一个库在两个入口里给出不同的事实。
+
+    ★ 过滤口径与显示口径**用同一个解析结果**：`--job N` 同时命中"直连 N 的"
+      与"经面试追到 N 的"，否则又会出现"列表里看得见、过滤时消失"。
+    """
+    direct_job = aliased(Job)
+    via_job = aliased(Job)
     query = (
-        select(InterviewQuestion, Interview, Job)
+        select(InterviewQuestion, Interview, direct_job, via_job)
         .outerjoin(Interview, InterviewQuestion.interview_id == Interview.id)
-        .outerjoin(Job, InterviewQuestion.job_id == Job.id)
+        .outerjoin(direct_job, InterviewQuestion.job_id == direct_job.id)
+        .outerjoin(Application, Interview.application_id == Application.id)
+        .outerjoin(via_job, Application.job_id == via_job.id)
         .order_by(InterviewQuestion.id.desc())
     )
     if interview_id is not None:
         query = query.where(InterviewQuestion.interview_id == interview_id)
     if job_id is not None:
-        query = query.where(InterviewQuestion.job_id == job_id)
+        query = query.where(or_(InterviewQuestion.job_id == job_id, via_job.id == job_id))
     if source is not None:
         query = query.where(InterviewQuestion.source == source)
 
     rows: list[QuestionRow] = []
-    for question, interview, job in session.execute(query).all():
+    for question, interview, direct, via in session.execute(query).all():
+        job = direct if direct is not None else via
         rows.append(
             QuestionRow(
                 question=question,
                 interview_id=question.interview_id,
-                job_id=question.job_id,
+                job_id=question.job_id
+                if question.job_id is not None
+                else (job.id if job else None),
                 company=(job.company if job else "") or "",
                 title=(job.title if job else "") or "",
                 round_=interview.round if interview else None,
@@ -522,8 +557,6 @@ def job_for_question(session: Session, question: InterviewQuestion) -> Job | Non
     interview = session.get(Interview, question.interview_id)
     if interview is None:
         return None
-    from jobhunter.models import Application
-
     application = session.get(Application, interview.application_id)
     if application is None:
         return None

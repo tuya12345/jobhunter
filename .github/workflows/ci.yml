@@ -100,7 +100,7 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
 
-      - name: 隐私扫描（工作区里不许有真实身份标识）
+      - name: 隐私扫描（受跟踪的文件里不许有真实身份标识）
         # 依据：ISSUES #54 —— 把"仓库里没有真实姓名/学校/手机号"从"靠人记得跑"
         # 变成 CI 保证，并且**扫描样本本身不进仓库**。
         #   · 样本来源：repository secret `JH_PII_SAMPLES`（逗号分隔），
@@ -108,11 +108,18 @@ jobs:
         #   · **没配样本时用例会 skip**（不是 pass）—— `-rs` 让它出现在摘要里，
         #     所以"没扫"这件事永远看得见，不会伪装成"扫过了没问题"。
         #   · 报的是命中**位置**，不回显命中内容（内容本身就是隐私）。
+        # ★★ 为什么指向 tests/unit/ 而不是 tests/verify/test_v_p9.py（只读审查 JH-01）：
+        #   后者是**验证会话**的文件，且当时**没有被 git 跟踪** —— 干净 checkout 里
+        #   这个路径不存在，CI 会因为"测试文件缺失"直接失败（远端红、本地绿）。
+        #   现在这条指向受跟踪的 `tests/unit/test_repo_pii_scan.py`；同一文件里的
+        #   `test_ci_step_references_a_tracked_privacy_test` 会**扫这个 workflow**，
+        #   保证这条步骤将来也不会再指到一个仓库里不存在的测试。
+        #   （验证会话那份一旦提交进仓库，可以再补一条 step 一起跑。）
         env:
           JH_PII_SAMPLES: ${{ secrets.JH_PII_SAMPLES }}
         run: >-
           uv run pytest
-          tests/verify/test_v_p9.py::test_working_tree_has_no_real_identifiers
+          tests/unit/test_repo_pii_scan.py
           -rs -v
 
       - name: 报告 SQLite 版本（排查"外键/WAL 行为差异"时有用）

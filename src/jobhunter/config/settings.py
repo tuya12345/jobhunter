@@ -473,14 +473,45 @@ class AppSettings(BaseSettings):
 
         项目根 = config.yaml 所在目录（便于把整个项目搬走）；
         没指定 config.yaml 时退回默认的项目根探测。
+
+        ★★ 显式配置的**相对**路径按 `config.yaml` 所在目录解析（只读代码审查 JH-05）。
+
+        这条 docstring 一直写着"项目根 = config.yaml 所在目录"，但实现只对
+        **默认**目录用了那个 base：显式写 `data_dir: data` 时 `Path("data")` 原样留着，
+        最后相对于**当前工作目录**打开 —— 于是同一份配置在不同目录下运行会打开
+        **不同的库**（"我的数据丢了"），或者把简历/导出物写到用户没预期的位置。
+
+        现在的口径（三处一致：`data_dir` / `output_dir` / `state_dir`）：
+          · 绝对路径 → 原样使用；
+          · 相对路径 → `config.yaml` 所在目录 / 相对路径；
+          · 没配 → 默认布局（`<项目根>/data` 等）。
+
+        ⚠️ 环境变量（`JH_DATA_DIR` 等）里的相对路径语义见 `docs/config.md` §2：
+        它们与 config.yaml 无关，按**当前工作目录**解析（那是进程给的值）。
         """
         base = default_paths(self.config_file.parent if self.config_file else None)
         return PathSet(
             root=base.root,
-            data_dir=self.data_dir or base.data_dir,
-            output_dir=self.output_dir or base.output_dir,
-            state_dir=self.state_dir or base.state_dir,
+            data_dir=self._resolve_dir(self.data_dir) or base.data_dir,
+            output_dir=self._resolve_dir(self.output_dir) or base.output_dir,
+            state_dir=self._resolve_dir(self.state_dir) or base.state_dir,
         )
+
+    def _resolve_dir(self, value: Path | None) -> Path | None:
+        """把配置里显式写的目录解析成绝对路径（相对路径挂到 config.yaml 旁边）。
+
+        ★ 锚点为什么是 `config_file.parent` 而**不是** `find_project_root()`：
+          "把整个项目搬走"这个用法要求配置与它指的数据目录一起搬 ——
+          锚在配置文件旁边，搬完之后相对路径仍然指向搬过去的那份数据。
+        """
+        if value is None:
+            return None
+        if value.is_absolute():
+            return value
+        anchor = (
+            Path(self.config_file).resolve().parent if self.config_file else default_paths().root
+        )
+        return anchor / value
 
     @property
     def database_url(self) -> str:

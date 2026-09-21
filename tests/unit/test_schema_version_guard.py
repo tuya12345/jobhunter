@@ -96,17 +96,27 @@ def test_schema_status_ahead_when_the_database_is_newer(engine, db_url: str, mon
     assert "不要跑 jh init" in message or "不要" in message
 
 
-def test_schema_status_unknown_does_not_block(engine, db_url: str, monkeypatch) -> None:
-    """读不到 head（脚本目录坏了）→ unknown，**不当成不可用**。
+def test_schema_status_unknown_blocks_and_explains(engine, db_url: str, monkeypatch) -> None:
+    """读不到 head（脚本目录坏了 / 库损坏）→ unknown，**拦住命令并说清怎么办**。
 
-    修 #60 不该引入新的拦截点：读不出来时退回原来那句"请先运行 jh init"。
+    ★ 这条原来是反过来的：修 #60 时写的是"unknown 不当成不可用"（怕引入新的拦截点）——
+      那留下了一个**反方向的 fail-open**（只读代码审查 JH-08）：
+      迁移脚本读不到时命令照常往下跑，直到真正访问缺失的列/表才炸原始 SQL 错误。
+      现在改为"确认不了就不放行"，并且 `message()` 必须给出可操作的话。
     """
     from jobhunter.storage import migrate
 
     monkeypatch.setattr(migrate, "head_revision", lambda db_url=None: None)
     status = schema_status(engine, db_url=db_url)
     assert status.state == "unknown"
-    assert status.message() == ""
+    assert not status.is_usable, "unknown 又被当成可用了（fail-open）"
+
+    message = status.message()
+    assert message, "unknown 必须给出中文说明（空串会退化成一句含糊的'请先运行 jh init'）"
+    assert "无法确认数据库结构" in message
+    assert "jh init" in message
+    # ★ 不能把用户往错的方向引：unknown 的病因不是"库旧"
+    assert "结构是旧的" not in message
 
 
 # ===========================================================================
@@ -131,6 +141,31 @@ def test_database_ready_is_false_when_the_file_is_missing(tmp_path: Path) -> Non
     assert database_ready(f"sqlite:///{missing.as_posix()}") is False
     # 文件不存在时 database_problem 给空串 → 调用方退回"请先运行 jh init"
     assert database_problem(f"sqlite:///{missing.as_posix()}") == ""
+
+
+def test_database_ready_is_false_when_the_head_is_unreadable(engine, monkeypatch) -> None:
+    """★★ 回归（JH-08 的正题）：head 读不出来 → **不可用**，并给出"无法确认"的说明。
+
+    ★ 这条与 `database_ready()` 里那句 `status.is_usable` 是**同一件事的两端**：
+      只断言 `schema_status()` 的状态码，守不住"调用方有没有真的把它当回事"。
+    """
+    from jobhunter.storage import db as db_module
+    from jobhunter.storage import migrate
+
+    monkeypatch.setattr(db_module, "_sqlite_file_path", lambda _url: None)
+    monkeypatch.setattr(db_module, "create_db_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(migrate, "head_revision", lambda db_url=None: None)
+
+    # 先让库里真的有表（否则拦它的是"表不存在"那条旧判据，测不到 unknown）
+    from sqlalchemy import Column, Integer, MetaData, Table
+
+    Table("resumes", MetaData(), Column("id", Integer, primary_key=True)).create(
+        engine, checkfirst=True
+    )
+
+    assert db_module.database_ready("sqlite:///:memory:") is False
+    problem = db_module.database_problem("sqlite:///:memory:")
+    assert "无法确认数据库结构" in problem
 
 
 # ===========================================================================

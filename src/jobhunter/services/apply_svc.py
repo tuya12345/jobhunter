@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from jobhunter.models import Application, ApplicationEvent, Job
@@ -151,17 +152,22 @@ def ensure_pending_application(
     ★ 为什么幂等：`jh today` 会被反复执行（每次想看清单就跑一次）。
       不幂等的话，跑 3 次就有 3 条 pending，额度统计与"待处理列表"全部失真。
       判定口径：**同一个岗位只允许存在一条非终态的投递记录**。
+
+    ★★ 两道防线（只读代码审查 JH-11），缺一不可：
+
+      ① 库层：`applications.job_id` 上的 **UNIQUE 索引**（迁移 0006）——
+         两个标签页 / 两个进程 / 重发的请求同时走到这里时，只有一个能插进去；
+      ② 服务层：唯一冲突**不是报错给用户**，而是回到"已有这条"的语义上
+         （重新读出来复用它）—— 用户的意图是"确保有这么一条"，
+         而冲突恰恰说明它已经存在了，此时报错才是错的。
+
+      ⚠️ 为什么用 `begin_nested()`（SAVEPOINT）：冲突只该回滚**这一次 INSERT**，
+      不能把调用方事务里已经写好的别的东西一起回滚（例如 `jh today` 刚写好的
+      开场白）。普通 `session.rollback()` 会连那些一起丢掉 —— 那才是更贵的 bug。
     """
     existing = get_latest_application(session, job.id)
     if existing is not None:
-        # 已有记录：只补空字段，绝不覆盖已有开场白（用户可能已经手改过）
-        if greeting and not existing.greeting_text:
-            existing.greeting_text = greeting
-        if greeting_variant and not existing.greeting_variant:
-            existing.greeting_variant = greeting_variant
-        if resume_id is not None and existing.resume_version_id is None:
-            # resume_version_id 是"定制版简历"（P5 才有），P4 先留空
-            pass
+        _fill_greeting(existing, greeting=greeting, greeting_variant=greeting_variant)
         session.flush()
         return existing, False
 
@@ -173,9 +179,36 @@ def ensure_pending_application(
         greeting_variant=greeting_variant,
         status="pending",
     )
-    session.add(application)
-    session.flush()
+    try:
+        with session.begin_nested():
+            session.add(application)
+            session.flush()
+    except IntegrityError:
+        # 竞态：另一个写入口在我们"查过之后、插入之前"建好了同岗位的记录。
+        # 这不是用户要处理的错误 —— 重新读出来给它，语义与幂等路径完全一致。
+        raced = get_latest_application(session, job.id)
+        if raced is None:  # pragma: no cover - 唯一冲突必然对应一行存在
+            raise
+        logger.info(
+            "岗位 #%s 的投递记录已被另一个写入口建好，复用它（唯一索引挡住的那次插入）", job.id
+        )
+        _fill_greeting(raced, greeting=greeting, greeting_variant=greeting_variant)
+        session.flush()
+        return raced, False
     return application, True
+
+
+def _fill_greeting(
+    application: Application,
+    *,
+    greeting: str | None,
+    greeting_variant: str | None,
+) -> None:
+    """只补空字段，绝不覆盖已有开场白（用户可能已经手改过）。"""
+    if greeting and not application.greeting_text:
+        application.greeting_text = greeting
+    if greeting_variant and not application.greeting_variant:
+        application.greeting_variant = greeting_variant
 
 
 @dataclass

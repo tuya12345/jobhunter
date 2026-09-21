@@ -34,9 +34,10 @@ from jobhunter.storage.migrate import current_revision, downgrade_base, upgrade_
 #   0003（#42）application_events.event_type 加 CHECK（EVENT_TYPES 八取一）
 #   0004（#25）llm_cache 加 hits / last_hit_at（命中率）
 #   0005（#59）P7 消费端：companies 加导入列 + name_norm 唯一 + applications.company_id
+#   0006（JH-11）applications.job_id 改成**唯一**索引（一个岗位只允许一条投递记录）
 # ★ 版本号**写死**是刻意的（见下），但下面那条断言用的是 conftest 的 `alembic_head`
 #   夹具：加迁移时"改这里的注释"仍然是必须的动作，而断言不会因为忘了改而假绿。
-EXPECTED_REVISION = "0005"
+EXPECTED_REVISION = "0006"
 EXPECTED_TABLES = 11
 
 runner = CliRunner()

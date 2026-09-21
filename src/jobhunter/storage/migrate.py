@@ -171,7 +171,7 @@ class SchemaStatus:
     def message(self) -> str:
         """给用户看的中文说明（`require_db` 直接打印它）。
 
-        ★ 三种状态的话**必须不一样** —— 尤其 ahead（程序比库旧）：
+        ★ 四种状态的话**必须不一样** —— 尤其 ahead（程序比库旧）：
           那种情况叫用户"跑 jh init"是**错的方向**（他需要升级程序，不是升级库）。
         """
         if self.state == "behind":
@@ -187,6 +187,22 @@ class SchemaStatus:
                 "  请先升级程序本身（[bold]git pull[/bold] 或 "
                 "[bold]uv sync --upgrade[/bold]），不要跑 jh init：\n"
                 "  那会把库降到旧结构，反而丢东西。"
+            )
+        if self.state == "unknown":
+            # ★ unknown 也要**说清怎么办**（JH-08）：它现在会拦住命令，
+            #   所以不能像原来那样返回空串让调用方去猜（那会退化成一句
+            #   含糊的"请先运行 jh init"，而真正的病因可能完全不是这个）。
+            detail = (
+                f"（程序认识的版本：{self.head}）" if self.head else "（迁移脚本目录读不到版本号）"
+            )
+            return (
+                "无法确认数据库结构，为安全起见先停下：迁移版本读不出来"
+                f"{detail}。\n"
+                "  常见原因：① `alembic/versions/` 不完整（更新程序时漏了文件）；"
+                "② 库文件的 `alembic_version` 表损坏或权限不对；\n"
+                "          ③ 库文件本身损坏。\n"
+                "  怎么办：先在项目根跑 [bold]jh init[/bold]（幂等）—— "
+                "它会重读迁移脚本；若仍报同样的错，看上面那两个原因。"
             )
         return ""
 

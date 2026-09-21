@@ -1,4 +1,4 @@
-import { formatLocalTime, orDash } from '../format.ts';
+import { formatLocalTime, httpUrlOrNull, orDash } from '../format.ts';
 import type { Lead } from '../types.ts';
 import { ReachabilityBadge } from './ReachabilityBadge.tsx';
 
@@ -15,6 +15,9 @@ interface Props {
 export function LeadCard({ lead, canApply, applyDisabledReason, onMarkApplied }: Props) {
   const sourceTypeText = lead.source_type ?? '未分类'; // 接口的 null 就是"未分类"（groups 里也这么写）
   const application = lead.application;
+  // ★ 只有 http/https 才渲染成可点链接（JH-10）；其余按纯文本显示，看得见但点不动。
+  const officialUrl = httpUrlOrNull(lead.official_url);
+  const evidenceUrl = httpUrlOrNull(lead.evidence_url);
 
   return (
     <article className="lead">
@@ -44,10 +47,16 @@ export function LeadCard({ lead, canApply, applyDisabledReason, onMarkApplied }:
           <dd>
             {lead.official_url === null || lead.official_url.trim() === '' ? (
               <span className="muted">—（这条线索没有官网网址）</span>
-            ) : (
-              <a href={lead.official_url} target="_blank" rel="noreferrer noopener">
-                {lead.official_url}
+            ) : officialUrl !== null ? (
+              <a href={officialUrl} target="_blank" rel="noreferrer noopener">
+                {officialUrl}
               </a>
+            ) : (
+              // ★ 非 http(s)（file: / javascript: / data: …）：**只显示，不可点**。
+              //   后端导入时已经拒绝这类值，这里是"旧数据 + 将来有人绕过校验"的兜底。
+              <span className="muted" title="不是 http/https 链接，已按纯文本显示（不可点击）">
+                {lead.official_url}
+              </span>
             )}
           </dd>
         </div>
@@ -70,9 +79,15 @@ export function LeadCard({ lead, canApply, applyDisabledReason, onMarkApplied }:
       {lead.evidence_url !== null && lead.evidence_url.trim() !== '' && (
         <p className="evidence-src">
           原始出处：
-          <a href={lead.evidence_url} target="_blank" rel="noreferrer noopener">
-            {lead.evidence_url}
-          </a>
+          {evidenceUrl !== null ? (
+            <a href={evidenceUrl} target="_blank" rel="noreferrer noopener">
+              {evidenceUrl}
+            </a>
+          ) : (
+            <span className="muted" title="不是 http/https 链接，已按纯文本显示（不可点击）">
+              {lead.evidence_url}
+            </span>
+          )}
         </p>
       )}
 

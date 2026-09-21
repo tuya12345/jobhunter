@@ -117,6 +117,39 @@ test('classifyApplyOutcome：只有真的变了才算更新', () => {
   assert.equal(classifyApplyOutcome({ created: false, channel_changed: false, status_changed: false }), 'unchanged');
 });
 
+test('★ 归属属于另一条线索：必须说成"没记上"，不能混进"更新/没有变化"（JH-02）', () => {
+  const res = response({
+    created: false,
+    owned_by_other_lead: true,
+    channel: '官网',
+    channel_before: '官网',
+    channel_changed: false,
+    status_before: 'applied',
+    status_changed: false,
+    message: '记录 #1 已经属于**另一条线索**，这次的归属没有改动（这条线索仍显示未投）。',
+  });
+  const view = describeApplyOutcome(res);
+
+  assert.equal(view.kind, 'conflict');
+  assert.notEqual(view.className, 'outcome-unchanged');
+  assert.ok(view.chip.includes('没有记上'), `chip 要说清"没记上"：${view.chip}`);
+  assert.equal(view.message, res.message);
+  assert.ok(
+    view.facts.some((f) => f.includes('属于另一条线索')),
+    `facts 里要能看见归属冲突，实际：${JSON.stringify(view.facts)}`,
+  );
+
+  // 四种结果的标签/类名两两不同
+  const views = [
+    describeApplyOutcome(response({ created: true })),
+    describeApplyOutcome(response({ created: false, channel_changed: true })),
+    describeApplyOutcome(response({ created: false, channel_changed: false, status_changed: false })),
+    view,
+  ];
+  assert.equal(new Set(views.map((v) => v.chip)).size, 4);
+  assert.equal(new Set(views.map((v) => v.className)).size, 4);
+});
+
 test('channel 为 null 时不显示成 "null" 字面量', () => {
   const view = describeApplyOutcome(
     response({ created: false, channel: null, channel_before: null, channel_changed: false, status_changed: false }),

@@ -61,7 +61,7 @@
 │ jh init / resume(add|list|split) / job(add|list|skip)                        │
 │ match(run|explain|set) / gap / today / apply / interview / question / weak   │
 │ stats / report / tailor(brief|analyze|diff|approve|export) / followup        │
-│ leads(add|probe|capture|export) / offer(add|compare) / assessment(add|list)  │
+│ leads(import|serve) / offer(add|compare) / assessment(add|list)              │
 │ cal(export) / demo                                                           │
 │ ★ 全局 callback：每条命令开头打印"待处理提醒"（P0 占位，P4.5 实现）             │
 └───────────────────────────────────┬─────────────────────────────────────────┘
@@ -76,9 +76,11 @@
 │  Adapters     │   │  LLM Provider      │   │  Storage                      │
 │ manual.py ★主 │   │ deepseek.py        │   │ SQLAlchemy 2.x + Alembic      │
 │ boss.py(可选) │   │ openai.py / mock   │   │ SQLite: WAL + FK + busy_timeout│
-│ app_*.py(P7)  │   │ + llm_cache 表      │   │ models/ = ORM 定义             │
+│ app_*.py(旧)  │   │ + llm_cache 表      │   │ models/ = ORM 定义             │
 └───────────────┘   └────────────────────┘   └───────────────────────────────┘
        ★ manual.py = 人给 URL 抓详情（主路径）
+       ⚠️ `app_*.py` 是**旧架构**的模拟器适配器：P7 拆分后采集端搬去了独立部署
+          `leadhunter`，本仓库不再有 App 抓取（`[emulator]` extra 只是历史遗留声明）。
 ```
 
 **分层规则（硬约束）**：
@@ -106,16 +108,16 @@ projects/jobhunter/
 ├── config.yaml                       [P0] 个人配置默认值（关键词/城市/分数线…）
 ├── alembic.ini                       [P0] 迁移配置
 ├── data/                             [P0] 运行时数据目录（gitignore；库文件在此）
-│   └── leads/                        [P7] 抓屏产物
+│   └── （只有 jobhunter.db）          ⚠️ 原来的 data/leads/（抓屏产物）已随采集端搬走
 ├── output/                           [P0] 导出产物（gitignore，只写新文件）
-├── state/                            [P0] 运行时状态（gitignore）
+├── state/                            [P0] 运行时状态（gitignore；P7 的 CDP 专用 profile 也在这里）
 ├── docs/
 │   ├── architecture.md               [P0] ★ 本文
 │   ├── data_model.md                 [P0] ★ 全表 schema + 索引理由 + Alembic 方案
 │   ├── roadmap.md                    [P0] ★ P0 实现计划（骨架优先）
 │   ├── config.md                     [P9] config.yaml 逐字段说明
 │   ├── install.md                    [P9] 安装教程（含模拟器那步）
-│   └── emulator.md                   [P7] 模拟器/ADB/uiautomator2 教程
+│   └── emulator.md                   [旧] 模拟器/ADB/uiautomator2 教程（采集端已搬走，留作参考）
 ├── alembic/
 │   ├── env.py                        [P0] 读 settings 的 DB URL，target_metadata = Base.metadata
 │   ├── script.py.mako                [P0]
@@ -155,7 +157,7 @@ projects/jobhunter/
 │   │       ├── stats_cmd.py          [P0 占位 / P6 实现]
 │   │       ├── report_cmd.py         [P0 占位 / P6 实现]
 │   │       ├── followup_cmd.py       [P0 占位 / P6 实现]
-│   │       ├── leads_cmd.py          [P0 占位 / P7 实现]
+│   │       ├── leads_cmd.py          [P0 占位 / P7 消费端实现：import + serve]
 │   │       └── demo_cmd.py           [P0 占位 / P9 实现]
 │   ├── services/
 │   │   ├── __init__.py
@@ -180,13 +182,14 @@ projects/jobhunter/
 │   │   ├── report_svc.py             [P6] 周报 Markdown
 │   │   ├── followup_svc.py           [P6] 追问话术（只生成，不发送）
 │   │   ├── cal_svc.py                [P6] .ics 导出（面试/笔试/Offer 截止）
-│   │   └── leads_svc.py              [P7]
+│   │   └── leads_svc.py              [P7] 消费端：快照导入 + 线索分组/三态 + 标记投递
 │   ├── adapters/
 │   │   ├── __init__.py
 │   │   ├── base.py                   [P0] ★ JobSource / JobDetail 契约（定死接口）
-│   │   ├── manual.py                 [P2] ★ 主路径：人给 URL 抓详情
+│   │   ├── manual.py                 [P2] ★ 主路径：人给 URL 抓详情（含 --cdp 连用户自己的浏览器）
+│   │   ├── cdp.py                    [P7] 本地 CDP：找/起专用 profile 的浏览器（只读那一个链接）
 │   │   ├── boss.py                   [P2 可选] 自动搜索（spike 通过才启用）
-│   │   └── app/                      [P7] 模拟器侧（uiautomator2，可选 extra）
+│   │   └── app/                      [旧] 模拟器侧（uiautomator2）—— 采集端已搬去 `leadhunter`
 │   ├── llm/
 │   │   ├── __init__.py
 │   │   ├── base.py                   [P0] ★ LLMProvider 抽象
@@ -411,6 +414,6 @@ job-002 的 JD / 薪资还会覆盖到 job-001 那条记录上（信息串味）
 | P4.5 | 零手打跟进（批量打标 + 模糊匹配 + 顶部提醒）→ **★ MVP 完成** | ✅ **已完成** |
 | P5 | AI 定制简历（`tailor brief` → 完整版 + FidelityGuard） | ✅ **已完成**（本轮交付；详见 `STATUS.md`） |
 | P6 | 看板 + 面试 + 问题记录 + 笔试/Offer + 统计 + 报告 + .ics | ✅ **已完成**（详见 `STATUS.md`） |
-| P7 | App 线索（技术验证：1 平台 + probe + 抓屏 + YAML 降级链） | 未开始 |
-| P8 | Web 界面（移出主线） | 未开始 |
-| P9 | 开源收尾（README 定稿 / demo 独立库 / LICENSE / COMPLIANCE） | 未开始 |
+| P7 | 线索：**采集端搬去独立部署 `leadhunter`**（`lh`），本仓库只留**消费端**（`jh leads import` / `jh leads serve` + 线索页） | ✅ **消费端已完成**（2026-09-20；采集端不在这里）。⚠️ 本文件里凡是把 P7 描述成"采集端在本仓库（模拟器 / 抓屏 / `app_*.py`）"的段落都是**旧架构**，以 README 与 `docs/P7-消费端API.md` 为准 |
+| P8 | Web 界面（其余页面移出主线；★ 线索页已随 P7 消费端落地，是 P8 的第一次落地） | 🚧 线索页已落地 |
+| P9 | 开源收尾（README 定稿 / demo 独立库 / LICENSE / COMPLIANCE） | ✅ **已完成** |

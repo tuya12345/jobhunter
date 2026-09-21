@@ -69,7 +69,9 @@ __all__ = ["DELIMITED_TAGS", "neutralize_delimiters", "wrap_delimited"]
 #:     举例不要写成"带引号的调用样子"，否则例子本身会被当成真实调用点。
 #: `facts` 是 ISSUES #56 补上的 —— 它被漏了整整三个阶段，
 #: 因为当时的守卫只遍历"已登记的标签"（守得住名单对不对，守不住东西在不在名单里）。
-DELIMITED_TAGS: tuple[str, ...] = ("jd", "resume", "system", "facts")
+#: `previous` 是只读代码审查 JH-09 补上的 —— `greeting_svc` 的"只修字数"那次调用
+#: 一直手拼着这个标签（上一版输出里可能有岗位标题/JD 片段），同样的洞第五次现身。
+DELIMITED_TAGS: tuple[str, ...] = ("jd", "resume", "system", "facts", "previous")
 
 #: 合法的标签名（拼标签时先校验，避免出现 `<a b>` 这种能被解析器玩出花样的写法）。
 _TAG_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")

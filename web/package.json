@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "node --test src/reachability.test.ts src/apply.test.ts",
+    "test": "node --test src/reachability.test.ts src/apply.test.ts src/format.test.ts",
     "mock": "node mock/server.mjs"
   },
   "dependencies": {

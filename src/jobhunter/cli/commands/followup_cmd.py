@@ -27,7 +27,7 @@ import typer
 from jobhunter.cli.common import console, err_console, require_db, success, warn
 from jobhunter.llm.factory import get_provider
 from jobhunter.models import Job
-from jobhunter.services import apply_svc, followup_svc
+from jobhunter.services import followup_svc
 from jobhunter.utils.clipboard import copy_to_clipboard
 
 app = typer.Typer(
@@ -63,12 +63,6 @@ def followup(
                 err_console.print(f"[red]找不到岗位 #{job_id}[/red]")
                 raise typer.Exit(code=1)
 
-            application = apply_svc.get_latest_application(session, job_id)
-            if application is None or application.applied_at is None:
-                warn(
-                    f"岗位 #{job_id} 还没有「已投递」记录 —— 先打标："
-                    f"jh apply --job {job_id} --status applied"
-                )
             try:
                 result = followup_svc.generate_followup(
                     session,
@@ -81,8 +75,11 @@ def followup(
                 if sent:
                     _record_sent(session, job_id, result)
             except followup_svc.FollowupError as exc:
+                # ★ 没有投递时间时**不再"警告一句然后照常生成"**（JH-06）：
+                #   那样生成出来的话术里写着「我前几天投了…」，而库里根本没有这件事。
+                #   报错并给出两条出路（去打标 / 显式 --days），退出码 2（用户要改输入）。
                 err_console.print(f"[red]{exc}[/red]")
-                raise typer.Exit(code=1) from exc
+                raise typer.Exit(code=2) from exc
     finally:
         engine.dispose()
 
@@ -98,6 +95,14 @@ def followup(
     console.print()
     material = "、".join(result.material) or "（无）"
     console.print(f"  [dim]{len(result.text)} 字　｜　用到的素材：{material}[/dim]")
+
+    # ★ 天数如果是用户自己给的，**必须说出来**（JH-06）：
+    #   让「我 7 天前投了」看起来像从库里算出来的，等于替用户声称一件没核对过的事实。
+    if result.days_source == "user":
+        warn(
+            f"话术里的「{result.days} 天前」是你用 --days 指定的，**不是**从投递记录算出来的 —— "
+            "发出去之前请自己对一下真实日期。"
+        )
 
     # ★ 降级原因必须显示（与开场白同一条纪律）
     if result.issues:

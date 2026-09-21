@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import select
@@ -140,6 +141,38 @@ class _SnapshotLead(BaseModel):
                 f"source_type 只能是 {'/'.join(LEAD_SOURCE_TYPES)} 或 null，实际是 {value!r}"
             )
         return value
+
+    @field_validator("official_url", "evidence_url")
+    @classmethod
+    def _only_http_urls(cls, value: str | None) -> str | None:
+        """★ 只接受 `http` / `https`（只读代码审查 JH-10）。
+
+        为什么必须在这一层拦（而不是"页面上小心点"）：
+
+          · 这两个字段会**原样变成页面上的 `href`**（`web/src/components/LeadCard.tsx`）。
+            `file:///C:/secret.txt`、`javascript:…`、`data:text/html,…` 都不是"官网链接"，
+            却都能被浏览器当成可点的东西 —— 快照是**外部输入**（采集端那个仓库导出的
+            JSON），让它决定页面能打开什么协议，是毫无必要的信任；
+          · 字段语义本来就写着"官网地址 / 原始出处"，收下一个 `file:` 值意味着
+            这个契约从第一天起就是假的。
+
+        ★ 报错要给出**正确写法**：写错的九成是采集端把"本地另存的文件路径"
+          当成了官方地址（那是 `evidence_text` 该干的事）。所以消息里直接说清。
+        """
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        scheme = urlsplit(text).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(
+                f"不是 http/https 链接：{text!r}（协议 {scheme or '（没有协议）'}）。\n"
+                "  期望：完整的网址，如 https://example.com/careers/123。\n"
+                "  本地文件路径、file:// 与 data: 都不接受 —— 这不是'官网地址'，"
+                "而且它会被渲染成页面上可点的链接。"
+            )
+        return text
 
     @field_validator("checked_at", "collected_at")
     @classmethod
@@ -591,8 +624,11 @@ class LeadLinkResult:
     status: str
     status_before: str
     status_changed: bool
+    #: ★ 这个岗位的投递记录**已经属于另一条线索**，所以这次没有改它的归属（JH-02）。
+    #:   页面必须把这件事说出来 —— 否则用户会以为"点了标记，这条线索就记上了"。
+    owned_by_other_lead: bool = False
     #: 一句人话，页面原样显示（区分"新建 / 更新了啥 / 什么都没变"）
-    message: str
+    message: str = ""
 
 
 def link_lead_to_application(
@@ -631,10 +667,29 @@ def link_lead_to_application(
     desired_channel = channel or lead.source_type
     application, created = apply_svc.ensure_pending_application(session, job)
 
-    # ★ 记下"这条投递是从哪条线索来的"（迁移 0005 的 applications.company_id）。
+    # ★★ 记下"这条投递是从哪条线索来的"（迁移 0005 的 applications.company_id）。
     #   页面靠它显示"这条线索投过没" —— 用渠道反推是猜，会点错线索（见模型注释）。
-    if lead.id is not None and application.company_id != lead.id:
-        application.company_id = lead.id
+    #
+    #   ⚠️⚠️ 但**绝不改写已经属于另一条线索的归属**（只读代码审查 JH-02）。
+    #
+    #   为什么：`applications.job_id` 上的唯一索引决定"一个岗位只有一条投递记录"
+    #   （JH-11），所以"线索 A 投过岗位 J 之后，再从线索 B 标记同一个 J"
+    #   复用的一定是 A 那条。原来这里无条件 `application.company_id = lead.id`，
+    #   于是 A 的页面从"已投"变成"未投"、B 变成"已投" —— 一次**静默的归属转移**，
+    #   历史被改写，而两个页面各自都显得很正常（最难查的那类失真）。
+    #
+    #   现在的口径：
+    #     · 这条投递本来没有线索（`company_id is None`，`jh apply` 那条路径建的）
+    #       → 认领它（这正是本列存在的意义）；
+    #     · 已经属于**这条**线索 → 幂等，什么都不用改；
+    #     · 已经属于**别的**线索 → 保持原样，并在返回值里如实说出来
+    #       （`owned_by_other_lead=True` + 一句人话），由人来决定要不要改归属。
+    owned_by_other_lead = False
+    if lead.id is not None:
+        if application.company_id is None:
+            application.company_id = lead.id
+        elif application.company_id != lead.id:
+            owned_by_other_lead = True
 
     # ★★ `channel_before` 只在"**已有**记录被改写"时才算一次变化。
     #
@@ -669,6 +724,7 @@ def link_lead_to_application(
         status=result.to_status,
         status_before=result.from_status,
         status_changed=result.changed,
+        owned_by_other_lead=owned_by_other_lead,
     )
     return LeadLinkResult(
         lead_id=lead.id or 0,
@@ -682,6 +738,7 @@ def link_lead_to_application(
         status=result.to_status,
         status_before=result.from_status,
         status_changed=result.changed,
+        owned_by_other_lead=owned_by_other_lead,
         message=message,
     )
 
@@ -697,6 +754,7 @@ def _link_message(
     status: str,
     status_before: str,
     status_changed: bool,
+    owned_by_other_lead: bool = False,
 ) -> str:
     """拼一句**如实**的结果说明（新建 / 更新了什么 / 什么都没变）。"""
     if created:
@@ -709,6 +767,17 @@ def _link_message(
         changes.append(f"渠道 {channel_before or '未指定'} → {channel or '未指定'}")
     if status_changed:
         changes.append(f"状态 {status_before} → {status}")
+    if owned_by_other_lead:
+        # ★ 归属没改 → **必须说出来**（JH-02）。含糊过去的话，用户会以为这条线索
+        #   已经和这次投递挂上了，而页面（按 company_id 反查）会继续显示"未投"。
+        tail = ("；".join(changes) + "；") if changes else ""
+        return (
+            f"记录 #{application_id} 已经属于**另一条线索**，这次的归属没有改动（{tail}"
+            f"这条线索仍显示未投）。\n"
+            "  为什么：一个岗位只有一条投递记录（投递是针对岗位的一次动作，不是每条线索一份）。\n"
+            "  如果你要的就是「这次投递是从这条线索来的」，请先确认那条线索是不是选错了 —— "
+            "归属只能由人来改，工具不替你转移历史。"
+        )
     if not changes:
         return (
             f"没有变化：记录 #{application_id} 已经是"

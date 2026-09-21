@@ -107,7 +107,21 @@ class Application(BaseModel):
     )
 
     __table_args__ = (
-        Index("ix_applications_job_id", "job_id"),
+        # ★★ UNIQUE（迁移 0006，只读代码审查 JH-11）：**一个岗位只允许一条投递记录**。
+        #
+        #   这之前只是一句注释里的约定（"一个岗位理论上只会有一条"），
+        #   靠 `ensure_pending_application()` 先查后插来维持 —— 而"先查后插"在
+        #   两个标签页、两个进程、重发的 HTTP 请求面前都会漏：两边都查不到，
+        #   于是各插一行。后果不是"多一条记录"这么轻：日额度（`count_applied_today`）
+        #   会把同一个岗位算成投了两次，转化率跟着一起假。
+        #
+        #   为什么键是 `job_id` 而不是 `(company_id, job_id)`：投递是**针对岗位**的
+        #   一次动作，线索只是"这次投递是从哪条线索记来的"这个溯源信息
+        #   （`company_id` 可空，绝大多数投递本来就没有线索）。
+        #   把它算进键里，等于允许同一个岗位出现"来自线索 A 的一条 + 来自线索 B 的
+        #   一条"—— 那正是把一次投递算成两次。线索归属的冲突在服务层显式处理
+        #   （见 `leads_svc.link_lead_to_application`：不静默改归属）。
+        Index("ix_applications_job_id", "job_id", unique=True),
         # `jh apply --list-pending` 与批量打标
         Index("ix_applications_status", "status"),
         # ★ 日额度与"投后 N 天"统计都从 applied_at 聚合。

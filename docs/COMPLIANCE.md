@@ -308,7 +308,7 @@ P9 复查时把这一条单独记下来（ISSUES #19），因为**"设了一个�
 |---|---|
 | `uv.lock` 已提交 | ✅ `git ls-files uv.lock` 命中；CI 里 `uv lock --check` 守住"改了依赖没提交锁" |
 | 迁移可逆 | ✅ `upgrade→downgrade→upgrade` 三连：11 表 → 0 表 → 11 表（`tests/unit/test_smoke.py`） |
-| 当前版本 | `0005`（P7 消费端：`companies` 加 `http_status` / `checked_at` / `external_id` / `collected_at` / `name_norm`（唯一索引）；`applications` 加 `company_id`）。实测 `jh init` 打印「迁移版本：0005」 |
+| 当前版本 | `0006`（`0005` P7 消费端：`companies` 加 `http_status` / `checked_at` / `external_id` / `collected_at` / `name_norm`（唯一索引）、`applications` 加 `company_id`；`0006`：`applications.job_id` 改成**唯一索引**——一个岗位只允许一条投递记录）。实测 `jh init` 打印「迁移版本：0006」 |
 | PRAGMA | ✅ `journal_mode=wal`、`foreign_keys=1`、`busy_timeout=5000`（每个连接都挂） |
 | 时区 | 库里一律 naive UTC，显示转北京时间（`utils/time.py`） |
 | 编码 | 启动即 `force_utf8_output()`；所有文件读写显式 `encoding`（ruff `PLW1514`） |

@@ -3,6 +3,52 @@
 > **维护规则**：每完成一个阶段，由开发角色更新本文件，然后停下等验证。
 > 内容只写**事实与本阶段范围**：做了什么 / 关键文件 / 已知问题 / 建议重点验证的地方。
 > **不写自评结论、不写对抗性测试** —— 那是验证会话的职责。
+>
+> ⚠️ **本文件是"按轮次追加"的历史记录**：下面每一节都是**当时**的事实，
+> 后面轮次可能已经改掉了它。**当前状态以最上面那一节为准**
+> （只读代码审查 §4 第 5 条点出的"读数矛盾"就是这个结构造成的）。
+> 想知道"现在到底怎样"，看最上面一节的表格 + `README.md` 的进度表。
+
+---
+
+## 只读代码审查修复轮（2026-09-21）：JH-01 … JH-13
+
+**背景**：用户给了一份**只读**代码审查报告（`notes/2026-09-21-JobHunter-只读代码审查.md`，
+外部探针 `try anything/test_jobhunter_review_20260921.py`，**10 条探针全红**作为证据），
+要求按它改代码。本轮把 13 条逐条处理完，探针从 10 红 → **1 红**
+（剩下的 JH-01 那一条需要验证会话把自己的文件提交进仓库，见下）。
+
+| # | 症状（改前） | 改法要点 | 关键文件 |
+|---|---|---|---|
+| JH-01 | CI 的隐私扫描指向**未被跟踪**的 `tests/verify/test_v_p9.py` → 干净 checkout 里 CI 直接失败 | CI 改指**受跟踪**的 `tests/unit/test_repo_pii_scan.py`（同口径：样本来自 `JH_PII_SAMPLES` / `state/pii-samples.txt`，没配样本时 **skip 而不是 pass**，只报位置不回显内容）；新增**结构性守卫**：解析 ci.yml 的 `run:`、把里面出现的 `tests/**.py` 拿去问 git 是否被跟踪 | `.github/workflows/ci.yml`、`tests/unit/test_repo_pii_scan.py` |
+| JH-02 | 从线索 B 标记同一个岗位时，**静默把投递归属从线索 A 改到 B**（A 的页面从"已投"变"未投"） | 归属只允许"认领无主的"（`company_id is None` → 认领）与"幂等"；属于别的线索时**不动**，并回传 `owned_by_other_lead=True` + 一句人话。页面新增第四种结果态 `conflict`（错误色，明说"这条线索没有记上"） | `services/leads_svc.py`、`web/app.py`、`web/src/apply.ts`、`web/src/types.ts`、`web/src/styles.css` |
+| JH-03 | 同站 `/job/AAA` 跳到 `/job/BBB` 不拦 → URL/ID 来自 A、内容来自 B 的混合记录入库 | 地址判据从"只比域名"扩成三级：跨站 / **同站但岗位标识集合不相交** / 被丢到"路径段全是通用词"的入口页。用**集合比较**而不是整串比较，避免把规范化跳转与"每次都变的 `securityId`"判成异常 | `adapters/manual.py` |
+| JH-04 | 4xx/5xx 的响应体**不脱敏**就进异常与日志（200+非 JSON 那条脱敏了，等于一半） | 三条路径统一走 `_body_preview()`；脱敏范围加上 `Bearer <token>` 与邮箱 | `llm/deepseek.py` |
+| JH-05 | `--config` 里显式的相对目录按**当前工作目录**解析（换个目录运行就打开另一个库） | 显式相对路径按 `config.yaml` 所在目录解析（绝对路径原样）；环境变量的相对路径语义写进 `docs/config.md` | `config/settings.py`、`docs/config.md` |
+| JH-06 | 没有投递时间也照样生成「我**前几天**投了…」 | 没有 `applied_at` 且没显式 `--days` → 抛 `FollowupError`（CLI 退出码 2，给出"先打标 / 显式给天数"两条路）；显式给天数时 `days_source="user"` 并在输出里提醒"天数是你给的" | `services/followup_svc.py`、`cli/commands/followup_cmd.py` |
+| JH-07 | `question add` 同时给 `--interview` 与 `--job` 时两个外键都写 → 两个入口两个事实 | XOR 校验（两个都给 → 中文报错，不"以某个为准"悄悄丢事实）；列表查询补 `interview → application → job` 那条路，`--job` 过滤口径与显示口径统一 | `services/question_svc.py` |
+| JH-08 | 迁移状态 `unknown` 被当成可用（**fail-open**：脚本目录读不到也照跑） | `database_ready()` 只认 `ok`；`unknown` 的 `message()` 说清"无法确认 + 两个常见原因 + 怎么办" | `storage/db.py`、`storage/migrate.py` |
+| JH-09 | greeting "只修字数"的提示词手拼 `<previous>`，上一版里的 `</previous>` 能把数据块提前闭合 | 改走 `wrap_delimited()`；`previous` 也登记进 `DELIMITED_TAGS`（同一形态的**第五次**现身） | `services/greeting_svc.py`、`llm/safety.py` |
+| JH-10 | 快照里的 `official_url` / `evidence_url` 没有协议校验（`file:` / `javascript:` 会被渲染成可点链接） | 导入层只接受 `http`/`https`（中文报错给出正确写法）；前端加第二道 `httpUrlOrNull()`，非 http(s) 按纯文本显示 | `services/leads_svc.py`、`web/src/format.ts`、`web/src/components/LeadCard.tsx` |
+| JH-11 | 投递"幂等"只靠"先查后插"，并发/重发可能各插一行（日额度与转化率跟着假） | 迁移 **0006**：`applications.job_id` 改**唯一**索引（升级前先查重复并**报错列 id**，不替用户挑一条）；服务层用 SAVEPOINT 捕获唯一冲突后**复用**已有记录 | `alembic/versions/0006_applications_one_per_job.py`、`models/application.py`、`services/apply_svc.py` |
+| JH-12 | 缓存命中计数只 `flush()`，而 CLI 生成路径不提交 → 计数被回滚，`jh cache stats` 永远低估 | 命中就在服务层提交（此刻还没写任何业务数据，是安全的）；用"第一次建缓存 → 第二次命中 → **重开 Session** 读 hits"的用例守住 | `services/followup_svc.py` |
+| JH-13 | CDP 专用 profile 可配到仓库里（登录 Cookie 可能被 `git add .` 提交） | 覆盖值落在**任何 git 工作树**里且不在 `state/` 下 → `CdpProfileError` 拒绝启动；相对路径按配置文件目录解析。判据用"在不在 git 工作树"而不是"在不在项目根"（后者会误伤 `D:\configs\` 这种安全路径） | `adapters/cdp.py` |
+
+**文档面（同一轮）**：`README.md` 不再链接未入库的样例 json（改指受跟踪的测试文件）；
+`COMPLIANCE.md` 迁移版本 → `0006`；`STATUS.md` 顶部加这条"以最新一节为准"的说明；
+`architecture.md` 的 P7 段按"采集端已搬去 `leadhunter`"更正。
+
+**已知未了（需要人或验证会话动作）**：
+
+1. **`tests/verify/test_v_p9.py` 仍未入库** —— 那是验证会话的文件，我不动。
+   CI 已经不再依赖它（JH-01 已修），但"仓库里没有这份隐私扫描"这件事还在；
+   验证会话把它提交进仓库后，可以在 CI 里补一条 step 一起跑。
+2. **用户真实库停在 `0005`**：本轮加了迁移 `0006`，所以在那台机器上跑任何 `jh`
+   命令都会看到"数据库结构是旧的（当前 0005，程序需要 0006）→ 跑 jh init"。
+   这是**守卫按设计工作**，不是故障；`jh init` 是幂等的，只建一个唯一索引。
+   （我没有替用户在真实库上跑迁移 —— 那是他的数据。）
+3. **报告 §4 里剩下的几条台账矛盾**（`ISSUES.md` 的"未关闭 N 条"三个数字互相打架等）
+   属于验证会话的文件，未动。
 
 ---
 
@@ -259,6 +305,9 @@ AST 守卫禁止手拼分隔标签。
 
 1. **P7 未实现**：`jh leads *` 仍是占位；`docs/install.md` §9 与 `COMPLIANCE.md` §8 都明确标注，
    README 也不声称"支持 App 线索采集"。
+   ⚠️ **这一条已被后面的轮次推翻**（保留原文只为记录当时的状态）：P7 在 2026-09-19 拆成
+   采集端（独立部署 `leadhunter`）与消费端（本仓库），消费端 `jh leads import` /
+   `jh leads serve` **已经落地**；当前能做什么见本文件最上面那一节与 README 的进度表。
 2. **`.ics` 覆盖同名文件**是唯一偏离"只写新文件"的地方（幂等快照，理由见 `COMPLIANCE.md` §5.4）。
 3. **覆盖率门槛 80% 是刻意的低门槛**：不追高（追覆盖率会催生"为覆盖率而写"的测试），
    当前 84%，掉下来会红。

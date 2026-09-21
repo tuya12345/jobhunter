@@ -52,6 +52,7 @@ logger = get_logger(__name__)
 
 __all__ = [
     "CdpEndpoint",
+    "CdpProfileError",
     "cdp_profile_dir",
     "ensure_cdp_browser",
     "find_browser_executable",
@@ -62,6 +63,10 @@ __all__ = [
 _CDP_PROBE_TIMEOUT_SECONDS = 20.0
 #: 探测间隔
 _CDP_PROBE_INTERVAL_SECONDS = 0.4
+
+
+class CdpProfileError(ValueError):
+    """专用 profile 的路径不安全（落在仓库里）——**拒绝启动浏览器**（JH-13）。"""
 
 
 @dataclass(frozen=True)
@@ -85,11 +90,99 @@ def cdp_profile_dir(settings: AppSettings | None = None) -> Path:
     ★ 为什么不放在 `data/` 或项目根：这里会有**真实登录态**（Cookie 等），
       而 `state/` 是三个数据目录里最"纯运行时"的那个（`.gitignore` 覆盖，
       且 `jh init` 不会往里写业务数据）。配置里可以覆盖，但默认值必须是安全的那一个。
+
+    ★★ 覆盖值会被**检查**（只读代码审查 JH-13）：不允许落在某个 git 工作树里（`state/` 除外）
+
+      为什么必须管：profile 里是 Cookie / localStorage / token ——
+      用户把它配到工作树里（例如相对路径 `cdp-profile` 恰好落在项目根）之后，
+      一次 `git add .` 就可能把登录态提交进版本库。那是一次**不可撤销**的泄露
+      （就算马上删，历史里还在）。而"配置项接受任意路径"本身没有任何提示。
+
+      允许的两类位置：
+        · `state/` 目录下（含它自己）—— 它被 `.gitignore` 覆盖，这是默认布局；
+        · **不在任何 git 仓库里**的目录（例如加密盘、临时目录）。
+
+    Raises:
+        CdpProfileError: 覆盖值解析后落在 git 工作树里、且不在 `state/` 下。
     """
     settings = settings or get_settings()
     if settings.browser.cdp_profile_dir is not None:
-        return Path(settings.browser.cdp_profile_dir)
+        candidate = _resolve_profile_dir(Path(settings.browser.cdp_profile_dir), settings)
+        _reject_repo_profile(candidate, settings)
+        return candidate
     return settings.paths.state_dir / "cdp-profile"
+
+
+def _resolve_profile_dir(value: Path, settings: AppSettings) -> Path:
+    """把配置里的 profile 目录解析成绝对路径。
+
+    ★ 相对路径按 `config.yaml` 所在目录解析 —— 与 `settings.paths` 同一口径
+      （只读代码审查 JH-05：相对路径挂在当前工作目录下，是"换目录运行就换个库"
+      的同一个坑）。这里**不能**靠 `settings.paths` 顺手解决：那个属性只处理
+      data/output/state 三个目录，profile 是 `browser.*` 里的独立配置项。
+    """
+    if value.is_absolute():
+        return value
+    from jobhunter.config.paths import default_paths
+
+    anchor = (
+        Path(settings.config_file).resolve().parent
+        if settings.config_file
+        else default_paths().root
+    )
+    return anchor / value
+
+
+def _reject_repo_profile(profile: Path, settings: AppSettings) -> None:
+    """profile 落在**某个 git 工作树里**（且不在 `state/` 下）→ 明确拒绝。
+
+    ★ 判据是"在不在 git 工作树里"，而**不是**"在不在项目根下"：
+
+      · 真正的危险是"一次 `git add .` 把登录态提交上去"——那要求这个目录位于
+        **某个 git 仓库的工作树**内（worktree / 子模块 / 项目放在子目录里都算）；
+      · 而"项目根"是个更宽的概念：config.yaml 放在 `D:\\configs\\` 时项目根就等于
+        `D:\\configs`，那里根本没有 git —— 按项目根判会**误伤**一个完全安全的路径
+        （本项目对"守卫收得太紧"同样敏感：误报的守卫最后会被绕过去）。
+
+    ★ 为什么是**拒绝**而不是"警告一下继续跑"：警告会被忽略，而后果是
+      "真实登录态进了版本库"——那件事一旦发生就无法收回。
+      与"自动投递"同一条纪律：可疑路径宁可不开工，也不替用户冒不可逆的险。
+    """
+    target = profile.absolute()
+    worktree = _git_worktree_of(target)
+    if worktree is None:
+        return
+
+    state = settings.paths.state_dir.absolute()
+    if target == state or state in target.parents:
+        return  # 默认布局 / 用户自己配到 state 里 —— 已被 .gitignore 覆盖
+
+    raise CdpProfileError(
+        "browser.cdp_profile_dir 指到了**git 工作树里**，这会出问题：\n"
+        f"    它指向：{target}\n"
+        f"    它所在的仓库：{worktree}\n"
+        "  为什么不行：这个目录里存的是浏览器的登录 Cookie / localStorage / token ——\n"
+        "    放进工作树里，一次 `git add .` 就可能把它们提交上去，而且**删不干净**\n"
+        "    （历史里还在）。这是本项目最不能碰的红线之一。\n"
+        "  怎么办（二选一）：\n"
+        f"    · 删掉这条配置，用默认值：{settings.paths.state_dir / 'cdp-profile'}"
+        "（state/ 已被 .gitignore 覆盖）；\n"
+        "    · 或者改成一个**不在任何 git 仓库里**的目录（加密盘 / 临时目录）的绝对路径。"
+    )
+
+
+def _git_worktree_of(path: Path) -> Path | None:
+    """`path` 落在哪个 git 工作树里？不在任何仓库里时返回 None。
+
+    ★ 只看 `.git` 是否存在（目录或**文件**都算：后者是 worktree / 子模块的写法），
+      **不调用 git 命令** —— 这个判断在"启动浏览器之前"的热路径上，
+      而且用户机器上不一定装了 git。
+    """
+    current = path if path.is_dir() else path.parent
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
 
 
 def find_browser_executable(settings: AppSettings | None = None) -> Path | None:

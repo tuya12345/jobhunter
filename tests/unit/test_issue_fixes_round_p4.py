@@ -30,10 +30,10 @@ runner = CliRunner()
 
 MIGRATION_0003 = "ck_application_events_event_type"
 
-#: 当前 head 的 revision。它随迁移推进而变（0004 → 0005 …），
+#: 当前 head 的 revision。它随迁移推进而变（0004 → 0005 → 0006 …），
 #: 所以断言用的是 conftest 的 `alembic_head` 夹具（从迁移脚本目录读），
 #: 这里只保留一份"当前是哪个版本"的文字记录，避免读代码的人要自己去数迁移。
-HEAD_REVISION = "0005"
+HEAD_REVISION = "0006"
 
 
 # ===========================================================================

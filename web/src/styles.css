@@ -32,6 +32,7 @@
   --notice-line: #f0d488;
   --error-bg: #fdecea;
   --error-line: #f3b7b1;
+  --error-fg: #8c2019;
 
   --radius: 8px;
 }
@@ -451,7 +452,7 @@ a {
   padding: 1px 8px;
 }
 
-/* 三种结果在页面上必须长得不一样（反 ISSUE #57：不能只显示一个"✓ 成功"） */
+/* 四种结果在页面上必须长得不一样（反 ISSUE #57：不能只显示一个"✓ 成功"） */
 .outcome-created {
   background: var(--ok-bg);
   border-color: var(--ok-line);
@@ -468,6 +469,14 @@ a {
   background: var(--unknown-bg);
   border-color: var(--unknown-line);
   color: var(--unknown-fg);
+}
+
+/* ★ 归属属于另一条线索 = **这次没记上**（JH-02）——
+   用"错误"色而不是"成功"色：页面必须一眼看出线索页不会有任何变化。 */
+.outcome-conflict {
+  background: var(--error-bg);
+  border-color: var(--error-line);
+  color: var(--error-fg);
 }
 
 .banner {

@@ -71,9 +71,14 @@
 > | **消费端** | 本仓库 | `jh leads import <快照.json>`、`jh leads serve` |
 >
 > 两边**不共用数据库**，唯一的接口是采集端导出的那份 JSON 快照
-> （契约见 [docs/leads-snapshot.md](docs/leads-snapshot.md)，样例见
-> [docs/leads-snapshot-sample.json](docs/leads-snapshot-sample.json)）：采集端导出 → 你把文件拷过来 →
+> （契约见 [docs/leads-snapshot.md](docs/leads-snapshot.md)，**字段形状的可跑范例**见
+> [tests/unit/test_leads_import.py](tests/unit/test_leads_import.py) 里的 `_snapshot()` /
+> `_lead()`）：采集端导出 → 你把文件拷过来 →
 > `jh leads import` 入库 → `jh leads serve` 在浏览器里看。
+>
+> ★ 这里**刻意不再链接**"样例 json 文件"：那份样例是验证会话在本机生成的产物、
+>   没有进仓库（只读代码审查 §4 第 6 条：README 链一个干净 checkout 里不存在的文件，
+>   等于给读者一个 404）。字段形状以上面那个**受跟踪**的测试文件为准。
 >
 > **为什么这么拆**：采集端要装安卓模拟器那一套依赖（`uiautomator2`）、要连设备、要在本机跑；
 > 消费端只要一个库和一张网页。混在一个仓库里，等于让"看线索"这件事也背上那份环境负担。

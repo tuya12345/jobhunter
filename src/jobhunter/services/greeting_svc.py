@@ -120,9 +120,7 @@ REPAIR_PROMPT = """你上一次的输出**字数不合格**，需要重写。
   （一句话自报方向 + 一个具体问题，别罗列技能；实测"技能+项目+问题"一定超）
 
 上一版内容（可以删减、改写，但不许引入新的技能/数字/学历）：
-<previous>
-{previous}
-</previous>
+{previous_block}
 """
 
 
@@ -293,11 +291,20 @@ def build_repair_payload(
       而这个功能的价值恰恰在"像人写的"。字数问题可数、可验证、改短不会引入新事实，
       是**最适合让模型自己修**的一类失败。
     ★ 只修字数：保真类失败绝不走这条路（见 `is_length_only_failure`）。
+
+    ★★ 上一版内容必须**经统一入口**包进 `<previous>`（只读代码审查 JH-09）：
+
+      这段文本是模型上一轮的输出，里面可能带着**用户可控的内容**
+      （岗位标题、JD 片段都会进上一轮的提示词，模型可能照抄）。原来这里是
+      手拼 `f"<previous>{text}</previous>"` —— 正文里写一个 `</previous>`
+      就能把数据块提前闭合，后面的字全部落到标签外面，于是"只修字数"的边界没了。
+      这正是 safety.py 里记着的那一类缺陷（#2 / #8 / #29 / #56 都是它），
+      修法也照那条纪律：**用 `wrap_delimited()`**，不手拼标签。
     """
     previous_message = LLMMessage(role="user", content=previous.content)
     repair_body = REPAIR_PROMPT.format(
         problems="\n".join(f"- {item}" for item in problems),
-        previous=previous_message.content[-1200:],
+        previous_block=wrap_delimited("previous", previous_message.content[-1200:]),
         **_length_hints(settings),
     )
     return PromptPayload(

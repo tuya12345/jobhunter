@@ -382,46 +382,217 @@ def _finish_detail(
         detail.raw["access_wall"] = True
         return
 
-    # ★★ 再看一眼"浏览器最后停在哪个地址"（ISSUES #65 实测踩到）
+    # ★★ 再看一眼"浏览器最后停在哪个地址"（ISSUES #65 实测踩到，JH-03 扩了判据）
     #
     #   在专用实例里跑真实 BOSS 链接时，浏览器把我们带到了**它自己的**
     #   「我们现在正在你的所有设备上同步你的浏览数据」首次运行页 ——
     #   那段文字被当成 JD（140 字）拿到 `partial`，**会被入库**。
     #   它既不是登录墙（没有登录字样），也没有岗位结构可判 —— 只看正文根本挡不住。
     #
-    #   地址是最便宜的硬判据：**跨站**（域名不同）就说明我们看到的不是那个岗位页。
-    #   同站内的跳转（登录页、验证页）不在这里拦，交给上面的登录墙判定。
+    #   地址是最便宜的硬判据：**跨站**（域名不同）说明我们看到的不是那个岗位页；
+    #   **同站换了岗位标识**（`/job/AAA` → `/job/BBB`）同样说明内容对不上号。
+    #   两种都不许入库：混合记录（URL 来自 A、内容来自 B）会静默污染匹配与复盘。
     note = _cross_site_note(url, final_url)
     if note:
         detail.fetch_status = "failed"
         detail.fetch_note = note
         detail.jd_text = ""
         detail.raw["final_url"] = final_url
-        detail.raw["cross_site"] = True
+        detail.raw["redirect_mismatch"] = True
+        if _hosts_differ(url, final_url):
+            # 保留 `cross_site` 这个更具体的事实（诊断与用例都按它区分两种情形）
+            detail.raw["cross_site"] = True
+
+
+def _host_of(url: str | None) -> str:
+    """取域名（小写、去掉 `www.`）。存疑时返回空串。**口径只有这一份。**"""
+    if not url:
+        return ""
+    return (urlsplit(url).hostname or "").lower().removeprefix("www.")
+
+
+def _hosts_differ(requested: str, final: str | None) -> bool:
+    """两边的域名是否不同（任一边取不到域名时返回 False —— 不猜）。"""
+    left, right = _host_of(requested), _host_of(final)
+    return bool(left and right and left != right)
 
 
 def _cross_site_note(requested: str, final: str | None) -> str | None:
-    """`goto` 之后是否**跨站**了？跨站时返回一句可操作的中文说明。
+    """`goto` 之后地址是不是**已经不是那个岗位**了？是就返回一句可操作的中文说明。
+
+    ★ 三级判据（从硬到软）—— 只读代码审查 JH-03 补上了后两级：
+
+      ① **跨站**：域名变了。浏览器把我们带到别的站（或它自己的首次运行页）——
+         实测踩过（ISSUES #65）：Edge 的「同步你的浏览数据」提示页差点被当成 JD 入库。
+      ② **同站、但岗位标识变了**：`/job/AAA` 跳到了 `/job/BBB`。
+         过期岗位跳"推荐岗位"是最常见的一种，旧的判据（只比域名）完全看不见它 ——
+         结果就是"URL 与 platform_job_id 来自 A，公司/职位/JD 来自 B"的混合记录，
+         匹配与复盘全部被静默污染。
+      ③ **同站、但被丢到了非详情页**：请求的是详情页，最后停在首页/列表/登录页
+         （最终的路径段**全是**通用词）。这种情况没有岗位内容可抓，早点判失败比
+         把首页文字当 JD 存进去好。
 
     ★ 为什么不比"完整 URL 相等"：同一个站点会有正常的规范化
-      （补斜杠、加/去 `www.`、加跟踪参数、http→https），比整串会天天误报。
-      比**域名**既能挡住"被带到别的站/浏览器自己的页面"，又不会误伤这些规范化。
+      （补斜杠、加/去 `www.`、加跟踪参数、http→https、把 id 从路径挪到查询串），
+      比整串会天天误报。所以这里比的是**从 URL 里抽出来的"岗位标识"集合**：
+      路径段 / 片段 / 少数几个 id 类查询参数里，像 ID 的那些（见 `_url_identity_tokens`）。
+
+    ★ 判据宁可漏一点，也不能误伤"正常的规范化跳转"：只有"两边都抽到了标识、
+      且完全没有交集"才判失败（②）；"最终地址一个标识都没有、且路径段全是通用词"
+      才判失败（③）。抽不出标识时不猜。
     """
     if not final:
         return None
-    requested_host = (urlsplit(requested).hostname or "").lower().removeprefix("www.")
-    final_host = (urlsplit(final).hostname or "").lower().removeprefix("www.")
-    if not requested_host or not final_host or requested_host == final_host:
+    requested_host = _host_of(requested)
+    final_host = _host_of(final)
+    if not requested_host or not final_host:
         return None
-    return (
-        f"浏览器把你带到了**另一个站点**，抓到的是那里的页面而不是你要的岗位：\n"
-        f"    你给的是：{requested_host}\n"
-        f"    实际停在：{final}（{final_host}）\n"
-        "  常见原因：① 浏览器**自己的提示页**（首次运行 / 同步数据 / 默认浏览器询问）\n"
-        "            —— 在那个窗口里点掉它，再重跑一次就好；\n"
-        "          ② 站点把你重定向到了登录/首页 —— 在那个窗口里登录后再重跑；\n"
-        "          ③ 顺手用 --html 另存网页那条路也可以（见 jh job add --help）。"
-    )
+
+    if requested_host != final_host:
+        return (
+            f"浏览器把你带到了**另一个站点**，抓到的是那里的页面而不是你要的岗位：\n"
+            f"    你给的是：{requested_host}\n"
+            f"    实际停在：{final}（{final_host}）\n"
+            "  常见原因：① 浏览器**自己的提示页**（首次运行 / 同步数据 / 默认浏览器询问）\n"
+            "            —— 在那个窗口里点掉它，再重跑一次就好；\n"
+            "          ② 站点把你重定向到了登录/首页 —— 在那个窗口里登录后再重跑；\n"
+            "          ③ 顺手用 --html 另存网页那条路也可以（见 jh job add --help）。"
+        )
+
+    wanted = _url_identity_tokens(requested)
+    landed = _url_identity_tokens(final)
+    if wanted and landed and wanted.isdisjoint(landed):
+        return (
+            "浏览器**换了另一个岗位**，抓到的是那个页面的内容：\n"
+            f"    你给的是：{requested}\n"
+            f"    实际停在：{final}\n"
+            "  常见原因：① 那个岗位已经下线/过期，站点把你转到了推荐岗位或相似岗位；\n"
+            "          ② 链接本身是短链/分享链，跳到的是当前有效的那一条。\n"
+            "  怎么办：回到那个站点，打开你要投的**那一个**岗位，"
+            "复制地址栏里的完整链接再跑一次（地址栏里就是岗位页才说明它还在）。"
+        )
+
+    if wanted and not landed and _path_is_all_generic(final):
+        return (
+            "浏览器停在了**非岗位页**（首页/列表/登录页这类），没有岗位内容可抓：\n"
+            f"    你给的是：{requested}\n"
+            f"    实际停在：{final}\n"
+            "  常见原因：链接过期后站点把访客丢回列表页；或该站点要求先登录再进详情页。\n"
+            "  怎么办：在那个窗口里登录/刷新一次，确认地址栏还是那个岗位页，再重跑本条命令。"
+        )
+    return None
+
+
+#: 路径里的"通用词"—— 一个地址的路径段**全是**这些词时，它就只是一个入口页
+#: （首页/列表/登录/详情壳），不是某个具体岗位。用于 `_cross_site_note` 的判据 ③。
+_GENERIC_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "index",
+        "home",
+        "main",
+        "default",
+        "welcome",
+        "job",
+        "jobs",
+        "joblist",
+        "job_list",
+        "list",
+        "lists",
+        "search",
+        "result",
+        "results",
+        "detail",
+        "details",
+        "position",
+        "positions",
+        "post",
+        "posts",
+        "view",
+        "show",
+        "apply",
+        "login",
+        "signin",
+        "sign-in",
+        "register",
+        "auth",
+        "sso",
+        "passport",
+        "web",
+        "www",
+        "m",
+        "mobile",
+        "app",
+        "portal",
+        "campus",
+        "social",
+        "en",
+        "zh",
+        "html",
+        "htm",
+        "php",
+        "aspx",
+        "jsp",
+        "page",
+        "pages",
+    }
+)
+
+#: 像"岗位标识"的一段文本：字母/数字/下划线/连字符/点，长度 2–64。
+#: 点号要允许（`8a1b2c.html` 这类），但**先用后缀表剥掉常见扩展名**再判断。
+_ID_LIKE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{1,63}$")
+#: 剥掉的扩展名（它们是"文件格式"，不是岗位标识的一部分）
+_STRIP_SUFFIXES = (".html", ".htm", ".php", ".aspx", ".jsp", ".shtml")
+#: 只有这几个查询参数名才可能承载"岗位标识"。
+#: ⚠️ 刻意是个**白名单**：BOSS 的 `securityId` / `lid` 每次导航都会变，
+#: 把它们算进标识集合会让正常的同页跳转被判成"换了岗位"（天天误报）。
+_ID_QUERY_KEYS: frozenset[str] = frozenset(
+    {"id", "jobid", "job_id", "jid", "positionid", "position_id", "postid", "post_id"}
+)
+
+
+def _url_identity_tokens(url: str) -> set[str]:
+    """从 URL 里抽出"这一段地址指的是哪个东西"的标识集合（小写，用于**集合比较**）。
+
+    ★ 什么算标识：含数字的段（`1234567`、`8a1b2c3d`、`web-123`），
+      或全大写的短字母段（`AAA` 这类站点自己的 id）。
+      "campus"、"detail" 这类纯小写单词**不算** —— 它们是栏目名，不是标识。
+    """
+    parts = urlsplit(url)
+    raw: list[str] = [seg for seg in parts.path.split("/") if seg]
+    if parts.query:
+        for item in parts.query.split("&"):
+            key, _, value = item.partition("=")
+            if key.strip().lower() in _ID_QUERY_KEYS:
+                raw.append(value)
+    if parts.fragment:
+        raw.extend(item for item in re.split(r"[/?&=]+", parts.fragment) if item)
+
+    tokens: set[str] = set()
+    for item in raw:
+        candidate = item.strip()
+        lowered = candidate.lower()
+        for suffix in _STRIP_SUFFIXES:
+            if lowered.endswith(suffix):
+                candidate = candidate[: -len(suffix)]
+                lowered = candidate.lower()
+                break
+        if lowered in _GENERIC_PATH_SEGMENTS or not _ID_LIKE_RE.match(candidate):
+            continue
+        if any(ch.isdigit() for ch in candidate) or (candidate.isalpha() and candidate.isupper()):
+            tokens.add(lowered)
+    return tokens
+
+
+def _path_is_all_generic(url: str) -> bool:
+    """这个地址的路径段是不是**全是通用词**（也就是"不是某个具体页面"）。
+
+    ★ 只对最终地址用，且要求**每一个**段都是通用词 —— 只要有一段看不懂，
+      就说明它可能是某个具体页面，这时**不判失败**（宁可漏，不要误伤）。
+    """
+    segments = [seg for seg in urlsplit(url).path.split("/") if seg]
+    if not segments:
+        return True  # 根路径：确实是"入口页"
+    return all(seg.strip().lower() in _GENERIC_PATH_SEGMENTS for seg in segments)
 
 
 def _prepare_page(page: Any) -> None:

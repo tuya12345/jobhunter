@@ -250,6 +250,7 @@ def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> Fa
             "status": result.status,
             "status_before": result.status_before,
             "status_changed": result.status_changed,
+            "owned_by_other_lead": result.owned_by_other_lead,
             "message": result.message,
         }
 

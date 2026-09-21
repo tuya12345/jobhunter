@@ -88,6 +88,9 @@ class Followup:
     source: str = "template"
     #: 投出去多少天（None = 库里没有投递时间）
     days: int | None = None
+    #: ★ `auto` = 从 `applications.applied_at` 算出来的；`user` = 用户用 `--days` 指定的
+    #:   （JH-06：人工给的天数必须与"库里算出来的"区分开，CLI 会据此打印一句提醒）
+    days_source: str = "auto"
     #: 走模板的原因（空 = 模型一次通过）
     issues: list[str] = field(default_factory=list)
     #: 这次用到的素材（排查"为什么提了这条经历"）
@@ -315,14 +318,42 @@ def generate_followup(
     """
     settings = settings or get_settings()
     vocabulary = resume_svc.load_skill_vocabulary(settings)
-    _application, candidate, material, _missing, auto_days = _context(
+    application, candidate, material, _missing, auto_days = _context(
         session, job, settings=settings
     )
-    real_days = days if days is not None else auto_days
+
+    # ★★ "投了几天"是**事实**，不知道就不许编（只读代码审查 JH-06）。
+    #
+    #   原来这里 `days or auto_days`（None 就往下走），模板里 `days is None`
+    #   会渲染成「我**前几天**投了…」—— 于是"没有投递记录 / 没有 applied_at"
+    #   这种**不知道**的情况会生成一句具体的时间声明，用户复制粘贴就发出去了。
+    #   而这个工具的全部价值建立在"只说真话"上（FidelityGuard 那一整套都是为此）。
+    #
+    #   现在的口径：
+    #     · 有 `applied_at` → 自动算（原来的行为）；
+    #     · 显式传 `days`   → 用它，但**标明这是用户给的**（`days_source="user"`），
+    #       CLI 会打印一句提醒 —— 人工补写的时间不该看起来像从库里算出来的；
+    #     · 两者都没有     → 报错，并给出两条可操作路径（去打标 / 显式给天数）。
+    if days is not None:
+        real_days = days
+        days_source = "user"
+    elif auto_days is not None:
+        real_days = auto_days
+        days_source = "auto"
+    else:
+        raise FollowupError(
+            f"岗位 #{job.id} 没有「已投递」时间，算不出投了几天 —— 追问话术里那句"
+            "「我 N 天前投了」不能凭空编。\n"
+            f"  · 确实投过了：先打标 `jh apply {job.id} --status applied`"
+            "（之后这条命令就能自动算天数）；\n"
+            f"  · 只是想自己指定天数：`jh followup {job.id} --days 7`"
+            "（那样文案里的天数是你给的，不是库里算出来的）。"
+        )
     chosen_style = style if style in FOLLOWUP_STYLES else FOLLOWUP_STYLES[0]
 
     if provider is None or not provider.is_configured():
         result = _template(job, days=real_days, material=material, style=chosen_style)
+        result.days_source = days_source
         result.issues.append("没有配置大模型密钥 → 用确定性模板")
         return result
 
@@ -354,14 +385,33 @@ def generate_followup(
         hit = llm_cache.get_cached(session, cache_key)
         if hit is not None:
             content = hit.content
+            # ★★ 命中计数在这里就落盘（只读代码审查 JH-12）。
+            #
+            #   `get_cached()` 刻意只 `flush()`（理由写在它自己的 docstring 里：
+            #   调用方握着事务边界）。但**这条生成路径**的调用方（CLI）拿到结果后
+            #   只打印、不提交 —— 于是 Session 关闭时那次 `UPDATE hits` 被回滚，
+            #   `jh cache stats` 长期低估命中次数与省下的钱（一条"记账不存在"的失真）。
+            #
+            #   为什么在**这里**提交是安全的：此刻本函数还没有写过任何业务数据
+            #   （只读了简历与缓存），所以这次提交只可能提交"命中计数"这一笔。
+            #   反过来说：缓存真被命中了，这次省钱就是事实 —— 即使后面模型/闸门
+            #   出问题降级成模板，那次命中也不该被抹掉。
+            session.commit()
+
+    # ★ 降级路径只有这一个出口：模板 + 原因 + **天数的来源**。
+    #   （`days_source` 必须跟着结果一起走，否则 CLI 会把人工指定的天数
+    #    当成本库算出来的 —— 那正是 JH-06 要消灭的那类失真。）
+    def _fallback(reasons: list[str] | None = None) -> Followup:
+        result = _template(job, days=real_days, material=material, style=chosen_style)
+        result.days_source = days_source
+        result.issues.extend(reasons or [])
+        return result
 
     if not content:
         try:
             response = provider.complete(payload)
         except DeepSeekError as exc:
-            fallback = _template(job, days=real_days, material=material, style=chosen_style)
-            fallback.issues.append(f"调用模型失败：{exc}")
-            return fallback
+            return _fallback([f"调用模型失败：{exc}"])
         content = response.content
         if cacheable and content.strip():
             llm_cache.put_cached(
@@ -379,9 +429,7 @@ def generate_followup(
     try:
         text = parse_followup(content)
     except ValueError as exc:
-        fallback = _template(job, days=real_days, material=material, style=chosen_style)
-        fallback.issues.append(f"模型输出解析失败：{exc}")
-        return fallback
+        return _fallback([f"模型输出解析失败：{exc}"])
 
     reasons = _violations(
         text,
@@ -391,15 +439,14 @@ def generate_followup(
         vocabulary=vocabulary,
     )
     if reasons:
-        fallback = _template(job, days=real_days, material=material, style=chosen_style)
-        fallback.issues.extend(reasons)
-        return fallback
+        return _fallback(reasons)
 
     return Followup(
         text=text,
         style=chosen_style,
         source="llm",
         days=real_days,
+        days_source=days_source,
         material=material,
         job_id=job.id,
     )

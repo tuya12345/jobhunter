@@ -113,6 +113,11 @@ export interface ApplyResponse {
   status_before: string | null;
   status_changed: boolean;
   /**
+   * ★ 这个岗位的投递记录**已经属于另一条线索**，所以这次没有改归属（后端 JH-02）。
+   *   为 true 时页面要把它当成"没记上"来说，不能显示成一次成功的标记投递。
+   */
+  owned_by_other_lead?: boolean;
+  /**
    * ★ 必须**原样**显示给用户：它区分了「新建 / 更新了已有记录（渠道 X → Y）/ 没有变化」。
    *   用一句"✓ 成功"盖掉它就是 ISSUE #57 的原症状。
    */

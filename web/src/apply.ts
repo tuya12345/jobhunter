@@ -10,7 +10,7 @@
 
 import type { ApplyResponse } from './types.ts';
 
-export type ApplyOutcomeKind = 'created' | 'updated' | 'unchanged';
+export type ApplyOutcomeKind = 'created' | 'updated' | 'unchanged' | 'conflict';
 
 export interface ApplyOutcomeView {
   kind: ApplyOutcomeKind;
@@ -24,10 +24,17 @@ export interface ApplyOutcomeView {
   facts: string[];
 }
 
-/** 三件事：新建了没有 / 改了什么 / 什么都没改。 */
-export function classifyApplyOutcome(res: Pick<ApplyResponse, 'created' | 'channel_changed' | 'status_changed'>): ApplyOutcomeKind {
+/** 四件事：新建了没有 / 改了什么 / 什么都没改 / **归属属于另一条线索**（没记上）。 */
+export function classifyApplyOutcome(
+  res: Pick<ApplyResponse, 'created' | 'channel_changed' | 'status_changed' | 'owned_by_other_lead'>,
+): ApplyOutcomeKind {
   if (res.created) {
     return 'created';
+  }
+  // ★ 归属冲突优先于"更新/没有变化"：这种情况下**线索页什么都不会变**，
+  //   把它说成"更新了已有记录"就是 JH-02 那一类失真（页面与实际不符）。
+  if (res.owned_by_other_lead) {
+    return 'conflict';
   }
   return res.channel_changed || res.status_changed ? 'updated' : 'unchanged';
 }
@@ -46,6 +53,10 @@ function describeStatus(status: string | null | undefined): string {
 /** 结构化事实（只在真的变了/真的有值时列出，不制造噪音）。 */
 function outcomeFacts(res: ApplyResponse): string[] {
   const facts: string[] = [`记录 #${res.application_id}`];
+  if (res.owned_by_other_lead) {
+    // 归属没改 → 渠道/状态就说"未变"，不要摆出一堆"更新"的样子
+    facts.push('线索归属：属于另一条线索（未改动）');
+  }
   if (res.channel_changed) {
     facts.push(`渠道 ${describeChannel(res.channel_before)} → ${describeChannel(res.channel)}`);
   } else {
@@ -63,12 +74,14 @@ const CHIP: Record<ApplyOutcomeKind, string> = {
   created: '新建了投递记录',
   updated: '更新了已有记录',
   unchanged: '没有变化',
+  conflict: '这条线索没有记上（归属属于另一条线索）',
 };
 
 const CHIP_CLASS: Record<ApplyOutcomeKind, string> = {
   created: 'outcome-created',
   updated: 'outcome-updated',
   unchanged: 'outcome-unchanged',
+  conflict: 'outcome-conflict',
 };
 
 export function describeApplyOutcome(res: ApplyResponse): ApplyOutcomeView {

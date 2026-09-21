@@ -226,8 +226,14 @@ class DeepSeekProvider(LLMProvider):
         """
         if response.status_code >= 400:
             # 让 httpx 抛，交由上层统一处理（4xx 不重试的判定在 _is_retryable）
+            #
+            # ★★ 响应体必须走 `_body_preview()`（只读代码审查 JH-04）：
+            #   这里原来直接 `response.text[:300]` —— 于是 200 + 非 JSON 那条路径
+            #   有脱敏、4xx/5xx 这条**没有**，同一个保护被绕过了一半。
+            #   真实场景：网关把请求原样回显进错误页（`sk-…`、简历片段、邮箱都在里面），
+            #   而这条异常会进终端和日志 —— 密钥泄露的代价远大于多留几个字符的排查价值。
             raise httpx.HTTPStatusError(
-                f"HTTP {response.status_code}: {response.text[:300]}",
+                f"HTTP {response.status_code}：{_body_preview(response)}",
                 request=response.request,
                 response=response,
             )
@@ -291,6 +297,12 @@ def _body_preview(response: httpx.Response, *, limit: int = _BODY_PREVIEW_LIMIT)
       · 压空白：HTML 错误页大量换行缩进，不压掉的话 200 字符里看不到几个字；
       · 脱敏：`sk-` 开头的密钥一旦被回显，不能让它进异常消息（进而进日志）；
       · 截断：留个标记，免得读者误以为"响应体就这么长"。
+
+    ★ 所有状态码的响应体都走这里（JH-04）：200 + 非 JSON、4xx、5xx 三条路径
+      用**同一个**函数 —— 之前 4xx/5xx 那条绕过了它，等于同一个保护只做了一半。
+
+    ★ 脱敏范围（宁可多打码，也不要漏一个）：`sk-…` 密钥、`Bearer <token>`、
+      邮箱。网关回显请求体时带出来的通常就是这几类，而它们都会进终端与日志。
     """
     try:
         text = response.text
@@ -299,6 +311,8 @@ def _body_preview(response: httpx.Response, *, limit: int = _BODY_PREVIEW_LIMIT)
     text = re.sub(r"\s+", " ", text or "").strip()
     # 脱敏：任何形如密钥的串一律打码（宁可多打码，也不要漏一个）
     text = re.sub(r"sk-[A-Za-z0-9_\-]{3,}", "sk-****", text)
+    text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{6,}", "Bearer ****", text)
+    text = re.sub(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "****@****", text)
     if not text:
         return "（空响应体）"
     if len(text) > limit:
