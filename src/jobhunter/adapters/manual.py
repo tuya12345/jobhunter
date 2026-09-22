@@ -50,12 +50,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from jobhunter.adapters import cdp as cdp_module
 from jobhunter.adapters.base import JobDetail, JobSource
 from jobhunter.adapters.parse_html import (
+    count_watermarks,
     detect_access_wall,
     detect_platform,
     extract_platform_job_id,
     parse_detail_from_html,
+    strip_watermarks,
 )
 from jobhunter.config.settings import AppSettings, get_settings
 
@@ -222,6 +225,20 @@ class ManualAdapter(JobSource):
                 html, rendered_jd, title_hint, final_url = self._render_page_via_cdp(url)
             else:
                 html, rendered_jd, title_hint, final_url = self._render_page(url)
+        except cdp_module.CdpOwnerError as exc:
+            # ★★ "连错浏览器"必须**说清楚**（#67 优先级 4）：它不是超时、也不是网络问题，
+            #   所以不能落进下面那句 `return None` —— 那会让 CLI 报成"打开失败/超时"，
+            #   而用户照那句话去查网络，永远查不到"9333 后面是别人的浏览器"。
+            #   做法：交回一个 `failed` 的 JobDetail，CLI 会把 `fetch_note` 原样打印。
+            logger.warning("CDP 端口后面不是本工具的专用浏览器：%s", exc)
+            return JobDetail(
+                platform=platform,
+                jd_text="",
+                url=url,
+                fetch_status="failed",
+                fetch_note=str(exc),
+                raw={"cdp_owner_mismatch": True},
+            )
         except Exception as exc:  # noqa: BLE001 - 网络/浏览器异常一律降级
             logger.warning("抓取失败（%s）：%s", url, exc)
             return None
@@ -293,8 +310,9 @@ class ManualAdapter(JobSource):
                     #   · 桌面 UA       → 让站点返回**桌面版**页面结构。移动版是另一套 DOM，
                     #     解析规则（最长文本块 / data-test 属性）在移动版上不成立。
                     #   它**不是**用来规避风控的：整个进程只发这一个 UA、**不随请求轮换**、
-                    #   不伪造 Referer/Cookie；抓取路径也仍然只是"用户手动给的单个链接"，
-                    #   没有自动翻页、没有批量遍历（见 docs/COMPLIANCE.md §5.2 / §5.5）。
+                    #   不伪造 Referer/Cookie；抓取路径只是"读页面"，不做任何写操作。
+                    #   ★ 自动搜索（`jh job crawl`）自 2026-09-21 起已获授权，
+                    #     但它同样**不换 UA、不伪造凭据、不点页面** —— 见 COMPLIANCE.md §5.8。
                     locale="zh-CN",
                     viewport={"width": 1440, "height": 900},
                     user_agent=(
@@ -350,18 +368,20 @@ class ManualAdapter(JobSource):
         """
         from playwright.sync_api import sync_playwright
 
-        from jobhunter.adapters import cdp as cdp_module
-
         endpoint = self._cdp_endpoint
         if endpoint is None:
             endpoint = cdp_module.ensure_cdp_browser(self.settings)
 
         with sync_playwright() as playwright:
             opened: tuple[Any, Any] | None = None
-            with contextlib.suppress(Exception):
+            try:
                 opened = cdp_module.open_target_page(playwright, endpoint, url)
-
-            if opened is None:
+            except cdp_module.CdpOwnerError:
+                # ★★ "连错浏览器"必须**当场传上去**（#67 优先级 4）：
+                #   不能落进下面的回退分支 —— 回退那条路（`cdp_page` + `goto`）
+                #   会连到**同一个**别人的实例，等于把错误继续做下去。
+                raise
+            except Exception:
                 logger.warning(
                     "以目标 URL 新建标签页没成功，回退到「复用已有页面 + goto」——"
                     "这条路在会 history.back() 的站点（如 BOSS）上抓不到正文"
@@ -442,16 +462,81 @@ def _finish_detail(
     #   地址是最便宜的硬判据：**跨站**（域名不同）说明我们看到的不是那个岗位页；
     #   **同站换了岗位标识**（`/job/AAA` → `/job/BBB`）同样说明内容对不上号。
     #   两种都不许入库：混合记录（URL 来自 A、内容来自 B）会静默污染匹配与复盘。
-    note = _cross_site_note(url, final_url)
+    #
+    # ★★ 两级判据，先精确后模糊（2026-09-21 适配 #67 优先级 1）：
+    #     ① `_job_id_mismatch_note`：**平台自己的岗位 ID** 对不上 ——
+    #        最精确，而且不受"ID 长得像不像 ID"影响（见它的说明）；
+    #     ② `_cross_site_note`：域名 / 标识集合 / 被丢到入口页 ——
+    #        平台 ID 抠不出来时的兜底。
+    #   为什么两级都要：①需要 URL 里有可识别的 ID 形态；②能覆盖"首页/404 页"这类
+    #   地址里干脆没有 ID 的情形。缺任何一级都有一类错页漏过去（实测 5/5 把 BOSS
+    #   首页当岗位存进去，就是只有"比域名"这一级时发生的）。
+    #
+    #   ★ 跨站时**优先用跨站那句话**（它更具体：告诉用户"你被带到别的站了"，
+    #     而 ID 判据在这种情形下只能说"地址里没有那个 ID"—— 一样的拦截，不同的可操作性）。
+    cross_note = _cross_site_note(url, final_url)
+    id_note = None if cross_note else _job_id_mismatch_note(url, final_url, platform)
+    note = cross_note or id_note
     if note:
         detail.fetch_status = "failed"
         detail.fetch_note = note
         detail.jd_text = ""
         detail.raw["final_url"] = final_url
         detail.raw["redirect_mismatch"] = True
+        if id_note:
+            # 最硬的那条证据单独留痕（排查"为什么这条没入库"时一眼看出来）
+            detail.raw["job_id_mismatch"] = True
         if _hosts_differ(url, final_url):
             # 保留 `cross_site` 这个更具体的事实（诊断与用例都按它区分两种情形）
             detail.raw["cross_site"] = True
+
+
+def _job_id_mismatch_note(requested: str, final: str | None, platform: str) -> str | None:
+    """请求 URL 与最终 URL 里的**平台岗位 ID** 不一致？不一致就返回一句说明。
+
+    ★ 为什么单独有这一条（#67 优先级 1，交接文档 §5 第 7 条）：
+      岗位 ID 是"这条记录到底对应哪个岗位"的**唯一权威标识**，而
+      `platform_job_id` 是从**请求 URL** 里抠的。如果浏览器最终停在**另一个岗位**
+      （过期岗位跳推荐位），那份内容会被挂到 A 的 ID/URL 下 —— 混合记录。
+
+    ★ 为什么它比"比域名"强：域名判据对**同站错页**完全无效（实测 5/5 把 BOSS 首页
+      当成岗位存了进去）；而岗位 ID 是站点自己给的语义标识，不依赖路径长得像不像 ID。
+
+    ★ 为什么 `manual` 平台要跳过：那是"本地另存/粘贴"那条路，URL 可能是用户手填的，
+      平台 ID 的抽取规则本来就不适用（硬套会误报）。
+
+    ★ 两边任一抠不出 ID 时**返回 None**（不猜）：抠不出来就交给
+      `_cross_site_note` 的标识集合判据。
+    """
+    if not final or platform in ("", "manual"):
+        return None
+    wanted = extract_platform_job_id(requested, platform)
+    landed = extract_platform_job_id(final, platform)
+    if not wanted:
+        return None  # 请求 URL 里就没有平台 ID → 交给 `_cross_site_note`
+    if landed == wanted:
+        return None
+    if not landed:
+        # ★ 请求里有 ID、最终地址里**没有** —— 说明最后那个页面根本不是详情页
+        #   （首页 / 列表页 / 登录页 / 站点自己的失效页）。实测就是这么丢的：
+        #   BOSS 把 5/5 个请求都丢回首页，而"比域名"当然看不出来。
+        return (
+            "浏览器停在的地址里**没有那个岗位 ID** —— 多半是被带到了首页/列表/登录页，"
+            "而不是那个岗位页：\n"
+            f"    你给的岗位 ID：{wanted}\n"
+            f"    实际停在：{final}\n"
+            "  常见原因：岗位已下线、链接被站点改写，或该站点要求先登录"
+            "（先在专用窗口里登录再重跑）。\n"
+            "  这条记录**没有**入库 —— 宁可没抓到，也不要存一条对不上岗位的记录。"
+        )
+    return (
+        "浏览器停在**另一个岗位**上，内容与你要的不是同一条：\n"
+        f"    你给的岗位 ID：{wanted}\n"
+        f"    实际落到的 ID：{landed}（{final}）\n"
+        "  常见原因：那个岗位已下线/过期，站点把你转到了推荐位或相似岗位。\n"
+        "  怎么办：回站点打开你要投的**那一个**岗位，确认地址栏里就是它，"
+        "再复制完整链接重跑（这条记录**没有**入库 —— 宁可没抓到，也不要存错岗位）。"
+    )
 
 
 def _host_of(url: str | None) -> str:
@@ -910,6 +995,17 @@ def _clean_rendered_text(raw: str) -> str:
         这个规则不依赖任何站点专有名词，因此改版免疫。
     """
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    # ★★ 先去掉站点注入的水印词（2026-09-21 实测：BOSS 把 `BOSS直聘` / `boss` /
+    #    `kanzhun` 塞进中文词中间，把「职位描述」切成「职 boss 位描述」）——
+    #    不去掉的话下面那句 `marker in line` 匹配不上，正文起点找不到，
+    #    "微信扫码分享 / 举报"这类导航噪音就会跟着 JD 一起入库。
+    #    见 `parse_html.strip_watermarks`（只删"两侧都是中文"的注入形态，
+    #    取舍与"动过文本要能看见"都在它的 docstring 里）。
+    injected = sum(count_watermarks(line) for line in lines)
+    if injected:
+        logger.info("渲染文本里有 %d 处站点注入的水印词，已去掉（正文裁剪依赖它们）", injected)
+    lines = [strip_watermarks(line) for line in lines]
+    lines = [line for line in lines if line.strip()]
     lines = [line for line in lines if not _is_filler_line(line)]
 
     # 找正文起点

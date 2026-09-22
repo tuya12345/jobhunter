@@ -13,7 +13,10 @@
 **三条不可逾越的红线**（写进 README，且用代码守住，不靠提示词祈祷）：
 
 1. **不做全自动投递** —— 脚本止于"录入 / 抓取 / 打分 / 写话术 / 出清单"，**投递按钮由人点**。
-2. **不做自动搜索翻页** —— BOSS 有 `__zp_stoken__` 签名 + 字体反爬。主路径 = **人给链接 → 工具抓详情**；自动搜索降级为"可选适配器 + 必须先过 spike"。
+2. **不做未经授权的自动搜索** —— 主路径 = **人给链接 → 工具抓详情**。
+   ★ 2026-09-21 变更：使用者本人授权放开自动搜索（`jh job crawl`，发现层 `adapters/discover.py`），
+   但**授权后仍在守的边界**是：不点页面（翻页靠 URL 的 `page=`）、不绕风控（命中验证页即停）、
+   不自动投递；页数与条数都有显式上限。见 `docs/COMPLIANCE.md` §5.8。
 3. **AI 改简历不得编造** —— 由代码级 `FidelityGuard`（实体白名单 + 数字守恒 + 时间守恒 + 技能词表 + 长度上限）在【生成】【审核】【导出】三处强制校验，违规拒绝写入。
 
 ---
@@ -396,7 +399,8 @@ job-002 的 JD / 薪资还会覆盖到 job-001 那条记录上（信息串味）
 | 防线 | 代码位置 | 测试位置 |
 |---|---|---|
 | 不做全自动投递 | `adapters/manual.py` 只读不写；CLI 无"提交"动作 | 代码评审 + COMPLIANCE.md 自检 |
-| 不做自动搜索 | `boss.py` 默认不注册；需 spike 通过 | `spikes/boss_search_spike.py` |
+| 自动搜索**已授权**（边界仍在） | 发现层 `adapters/discover.py` 只抠链接、**不点页面**；命中验证页即停；`--pages`/`--limit` 显式上限 | `tests/verify/test_v_checklist12.py` 的 AST 守卫（点一下就红）+ `docs/COMPLIANCE.md` §5.8 |
+| 不连错浏览器 | CDP 连上后校验 `--user-data-dir` 是不是本工具的专用实例 | `tests/unit/test_issue67_adaptation.py` |
 | 不编造 | `services/fidelity.py`，生成/审核/导出三处强制 | 恶意 fixture 断言全拦（P5） |
 | 不泄露隐私 | `.gitignore` / `utils/logging.py` / 只写新文件 | 脱敏测试 + 原文件 hash 不变测试 |
 

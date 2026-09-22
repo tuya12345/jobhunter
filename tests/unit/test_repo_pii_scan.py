@@ -107,11 +107,16 @@ def _git_tracked_files(root: Path) -> list[str]:
             ["git", "-C", str(root), "ls-files", "-z"],
             check=True,
             capture_output=True,
-            text=True,
+            # ★ 必须显式 utf-8：`git ls-files` 会输出**中文文件名**
+            #   （`vendor/shotocr/docs/调用手册.md` 这类），而 Windows 上默认按 GBK 解码 →
+            #   解码线程抛 UnicodeDecodeError → `stdout` 变成 None →
+            #   两个用例都报 `AttributeError: 'NoneType' has no attribute 'split'`（实测踩过）。
+            encoding="utf-8",
+            errors="replace",
         )
     except (OSError, subprocess.CalledProcessError):  # pragma: no cover - 环境没有 git
         pytest.skip("环境里没有可用的 git（或这里不是 git 仓库）→ 无法列出受跟踪文件")
-    return [name for name in completed.stdout.split("\0") if name]
+    return [name for name in (completed.stdout or "").split("\0") if name]
 
 
 def test_working_tree_has_no_real_identifiers() -> None:

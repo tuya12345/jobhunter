@@ -41,7 +41,7 @@ import logging
 import random
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -170,6 +170,9 @@ class SearchPageResult:
     final_url: str | None = None
     #: 一句话说明（失败原因 / 空页提示）
     note: str | None = None
+    #: ★ 这一页读到的链接**全都已经在前面几页出现过**（`--pages` 很可能没生效）。
+    #:   见 `search()` 的说明：站点不认 `page=` 参数时，第 2 页与第 1 页是同一批。
+    duplicate_of_previous: bool = False
 
     @property
     def usable(self) -> bool:
@@ -318,16 +321,53 @@ class JobDiscovery:
 
         ★ 为什么不"自动翻到最后一页"：那是无上限的对外请求。用户要几页就给几页，
           这个数字是他自己的决定（`--pages`），而不是程序替他决定的。
+
+        ★★ `--pages > 1` 静默无效时要说出来（#67 优先级 2）。
+
+          实测（交接文档 §8 第 5 条）：BOSS **不认** `page=` 参数 ——
+          第 2 页抓回来的还是第 1 页那一批，于是 `--pages 2` 除了多花 2~5 秒延时
+          与一次对外请求之外**什么也没做**，而用户看到的输出与 `--pages 1` 一模一样。
+
+          "静默无效"正是本项目最不接受的一类失真，所以这里两步都做：
+
+            ① **提前停**：某一页读到的链接**全部**在前面出现过 → 后面的页不用再跑
+               （每页都要一次对外请求 + 2~5 秒延时，白跑是实打实的浪费）；
+            ② **留痕**：把这一页标成 `duplicate_of_previous=True` 并写一句 `note`，
+               调用方（`jh job crawl`）会把"这个参数看起来没生效"直接打给用户看。
         """
         results: list[SearchPageResult] = []
-        for index in range(1, max(1, int(pages)) + 1):
+        seen_paths: set[str] = set()
+        total = max(1, int(pages))
+
+        for index in range(1, total + 1):
             url = build_search_url(keyword, city, page=index)
             logger.info("读取搜索结果第 %d 页：%s", index, url)
-            results.append(self.read_page(url))
-            if results[-1].blocked:
+            result = self.read_page(url)
+
+            page_paths = {urlsplit(job_url).path for job_url in result.job_urls}
+            if index > 1 and page_paths and page_paths <= seen_paths:
+                # 整页都是旧的 → 站点多半没认 `page=` 参数
+                result = replace(
+                    result,
+                    duplicate_of_previous=True,
+                    note=(
+                        f"第 {index} 页与第 1 页是**同一批岗位**"
+                        f"（{len(page_paths)} 条全部已经出现过）"
+                        "—— `--pages` 看起来没有生效：站点可能不认 `page=` 参数。"
+                        f"已提前停止，后面几页不再白跑（每页还要一次请求 + "
+                        f"{_PAGE_DELAY_RANGE[0]:.0f}~{_PAGE_DELAY_RANGE[1]:.0f} 秒延时）"
+                    ),
+                )
+            seen_paths |= page_paths
+            results.append(result)
+
+            if result.blocked:
                 logger.warning("第 %d 页命中风控特征，**停止翻页**（不尝试绕过）", index)
                 break
-            if index < pages:
+            if result.duplicate_of_previous:
+                logger.warning("第 %d 页与前面重复，停止翻页（`--pages` 无效）", index)
+                break
+            if index < total:
                 self._polite_delay()
         return results
 
@@ -427,6 +467,9 @@ class JobDiscovery:
                         html = _wait_for_job_cards(page, "")
                     finally:
                         cdp_module.close_page_if_not_last(context, page)
+            except cdp_module.CdpOwnerError:
+                # ★★ "连错浏览器"要当场停下（#67 优先级 4）：重试三次只会连错三次。
+                raise
             except Exception as exc:  # noqa: BLE001 - 抓不到就如实报，不无限重试
                 last_note = f"读取失败：{type(exc).__name__}: {exc}"
                 logger.warning(

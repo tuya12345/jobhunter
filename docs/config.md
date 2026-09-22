@@ -397,7 +397,7 @@ tailor:
 ## 6. 频率克制（rate_limit.*）
 
 ★ 先说结论：**这两个是合规参数，不是性能参数**（`settings.py:160-165`）。
-本项目的合规态度是"随机延时 + `--dry-run` + 出错即停 + 只抓用户给的单个链接"，
+本项目的合规态度是"随机延时 + `--dry-run` + 出错即停 + 页数与条数都有显式上限"，
 目的是不给目标站点造成压力、也不被风控标记。想"跑得更快"的正确做法是少录岗位、
 用 `jh match run --no-llm`、靠缓存，而不是调这里。
 
@@ -420,10 +420,13 @@ tailor:
 
 一个**没人读的配置项**本身危害有限，但它让 `docs/COMPLIANCE.md` 声称了
 一个不存在的控制（"抓取路径带……翻页上限"），而那是合规自评要拿给人看的部分。
-所以删掉配置项、删掉 `search()` 的 `max_pages` 参数，并把 COMPLIANCE 改成如实描述
-（当前**没有自动翻页路径**：默认只抓用户手动给的单个链接）。
+所以删掉配置项、删掉 `search()` 的 `max_pages` 参数，并把 COMPLIANCE 改成如实描述。
 
-将来真要做自动搜索：**参数、配置项、文档说明要一起加回来**，不要只加其中一样。
+★★ **2026-09-21 更新（授权变更）**：使用者本人授权放开了自动搜索，
+现在**有**自动翻页了（`jh job crawl --pages`，见 `docs/COMPLIANCE.md` §5.8）。
+但那句话里的**原则没变**：页数由**命令行**显式给定（不做"翻到没有为止"）、
+条数有硬上限（`--limit` 100），所以仍然**不需要**这个配置项 ——
+"上限"这种事不该藏在一个可能没人读的 YAML 字段里。
 
 ```yaml
 rate_limit:
@@ -475,6 +478,40 @@ browser:
   cdp_port: 9333            # 与日常浏览器互不影响
   cdp_executable: null      # 不填自动找 Edge/Chrome
   cdp_profile_dir: null     # 不填 → state/cdp-profile（里面有登录态，别放进仓库）
+```
+
+---
+
+## 6.6 截图 OCR（`ocr.*`，只有 `jh job add --image` 用）
+
+★ 这一组**不装也能用**：shotocr 是独立项目（`vendor/shotocr`），jobhunter 通过**子进程**调用它
+（`adapters/ocr.py`），所以它的依赖（RapidOCR + opencv ≈ 250 MB）永远不会进 `uv sync`。
+安装步骤见 [install.md §10](install.md)；这一节只说配置。
+
+### `ocr.root`
+
+- **是什么**：shotocr 的项目根目录（里面应当有 `src/shotocr` 与 `.venv`）。
+- **默认值**：`None` → 自动探测 `<项目根>/vendor/shotocr`（也就是本仓库自带的那份）。
+- **什么时候要配**：把 shotocr 放在别处（例如 `D:/tools/shotocr`）时。
+- ⚠️ **写错了会怎样**：`--image` 报「找不到 shotocr（截图 OCR 工具）」，
+  并把**期望位置**打在消息里（所以你一眼能看出路径配错还是没装）；
+  同时给出另外两条出路（自己装 / 改用 `--manual`）。**其余命令不受影响**。
+- 查找顺序（`find_shotocr`）：① 这个配置 / `vendor/shotocr` → ② `PATH` 上的 `shotocr` →
+  ③ 当前解释器里的 `shotocr` 包。三条都找不到才报错。
+
+### `ocr.timeout_seconds`
+
+- **是什么**：单张图片的识别超时（秒）。
+- **默认值**：`300`。**取值范围**：`10 ~ 3600`。
+- **为什么给这么大**：OCR 第一次跑要加载模型（实测 demo 图约 14 秒，其中 8 秒是识别本身），
+  而截图可能很大（4K 屏整屏）。超时不是"卡住"，是**真的还在算**。
+- ⚠️ **写错了会怎样**：超出范围 → `Input should be less than or equal to 3600`；
+  设太小 → `--image` 报「OCR 超时（超过 N 秒）」，并提示调大它或换小一点的截图。
+
+```yaml
+ocr:
+  root: null               # 不填 → <项目根>/vendor/shotocr
+  timeout_seconds: 300
 ```
 
 ---
@@ -757,11 +794,11 @@ show_reminders: true
   （它是一个 `Path` 字段，写一个不存在的路径只会让"项目根"算到别处）。
   要换配置文件，用 `jh --config <路径>` 或环境变量 `JH_CONFIG`。
 
-### 全部 27 个 `AppSettings` 字段索引
+### 全部 28 个 `AppSettings` 字段索引
 
 `python -c "…; print(sorted(AppSettings.model_fields))"` 打出来的字段全部在下面（一个不漏）。
-嵌套小节里的子字段（`match_weights` 3 个、`greeting` 4 个、`tailor` 5 个、`rate_limit` 3 个，共 15 个）
-在各节里逐条写了。
+嵌套小节里的子字段（`match_weights` 3 个、`greeting` 4 个、`tailor` 5 个、`rate_limit` 2 个、
+`browser` 3 个、`ocr` 2 个，共 19 个）在各节里逐条写了。
 
 | 字段 | 在哪一节 | 一句话作用 | 默认值 |
 |---|---|---|---|
@@ -779,7 +816,8 @@ show_reminders: true
 | `greeting` | §4 | 开场白字数约束 + GitHub | 80/150/60/`""` |
 | `tailor` | §5 | 定制简历的硬约束 | 1.5/30/12/3/2 |
 | `rate_limit` | §6 | 随机延时（合规红线；~~翻页上限~~ 已删，#18） | 2.0/5.0 |
-| `browser` | §6.5 | 浏览器抓取（只有 `--cdp` 用；含端口/路径/专用 profile） | 9333/None/None |
+| `browser` | §6.5 | 浏览器抓取（`--cdp` / `jh job crawl` 用；端口/路径/专用 profile） | 9333/None/None |
+| `ocr` | §6.6 | 截图 OCR（`--image` 用；shotocr 位置与超时） | None/300 |
 | `show_reminders` | §13 | 顶部待处理提醒开关 | `true` |
 | `deepseek_api_key` | §7 | 密钥（只从 `.env`/环境变量来） | `""` |
 | `deepseek_base_url` | §7 | API 地址 | `https://api.deepseek.com` |
@@ -788,8 +826,8 @@ show_reminders: true
 | `llm_concurrency` | §7 | 精评并发度 | `4`（1-16） |
 | `llm_max_retries` | §7 | 业务层重试次数 | `1`（0-3） |
 | `db_url` | §9 | 直接给库连接串（优先于目录） | `None` |
-| `data_dir` | §9 | 数据目录（库 + 抓屏产物） | `None`（→ `<项目根>/data`） |
+| `data_dir` | §9 | 数据目录（库；~~抓屏产物~~ 已随采集端搬走） | `None`（→ `<项目根>/data`） |
 | `output_dir` | §9 | 导出目录 | `None`（→ `<项目根>/output`） |
-| `state_dir` | §9 | 运行时状态目录 | `None`（→ `<项目根>/state`） |
+| `state_dir` | §9 | 运行时状态目录（含 CDP 专用 profile） | `None`（→ `<项目根>/state`） |
 | `default_resume_path` | §9 | 默认简历（只放 `.env`） | `None` |
 | `config_file` | §13 | config.yaml 自身位置（CLI 注入） | `None` |

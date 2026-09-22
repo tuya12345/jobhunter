@@ -11,17 +11,21 @@
     · 测试可以写一个假 adapter（直接返回构造好的 `JobDetail`），
       不用真的开浏览器 —— 这也是 CI 能保持秒级的原因。
 
-★ 主路径是 `manual.py`（人给 URL → 抓详情），不是自动搜索翻页。
-  BOSS 有 `__zp_stoken__` 签名 + 字体反爬，自动搜索大概率中期撞墙，
-  而它是 MVP 的唯一入口、没有 fallback —— 所以主路径必须换。
+★ 主路径仍然是 `manual.py`（人给 URL → 抓详情）。
+  BOSS 有 `__zp_stoken__` 签名 + 字体反爬，而主路径要求"一定能抓到"——
+  所以主路径必须是"人给链接"。
+  ★ 2026-09-21 更新：**自动搜索已获使用者授权**（`jh job crawl`，见 COMPLIANCE.md §5.8），
+  但它是**加在旁边的**一条路（发现层 `discover.py`），没有替换主路径：
+  抓详情、判据、入库仍然是同一套代码。
 
 ★ 合规硬约束（写在这里，因为这里是唯一能拿到"外部访问能力"的地方）：
     1. 适配器**只做读**：抓详情、解析页面。**绝不**点击投递按钮、
        绝不点赞/私信/关注 —— 不做任何写操作。
     2. 频率克制：请求之间必须有随机延时（config 的 rate_limit），
        出错即停；不绕过验证码/风控/签名。
-       ★ 这里原本还写着"遵守翻页上限"，随 ISSUES #18 一并删掉：那个上限从来没有读取点，
-         而默认路径只抓**用户手动给的单个链接**，根本没有翻页可限（见 COMPLIANCE.md §5.2）。
+       ★ 这里原本还写着"遵守翻页上限"，随 ISSUES #18 一并删掉：那个上限从来没有读取点。
+         现在真正的上限是 `jh job crawl --pages <页数>`（命令行显式给）与
+         `--limit`（硬上限 100）—— 都在读得到的地方（见 COMPLIANCE.md §5.8）。
     3. 失败必须能降级：抓不到就返回 `None` 并让上层提示"手动粘贴 JD"，
        绝不让整条链路断掉（网络不通也要能用 —— 这是 `--manual` 存在的理由）。
 """
@@ -102,9 +106,14 @@ class JobDetail:
 class SearchResult:
     """搜索结果条目（只有 `search()` 会返回）。
 
-    ★ 注意：`search()` 属于**可选能力**，且本项目的主路径不使用它。
-      保留这个类型是为了让"自动搜索 spike 通过"之后有地方放实现，
-      而不是说搜索能力已经是产品的一部分（见 docs/roadmap.md 的 P2）。
+    ★ 注意：`search()` 仍然**没有实现**（抛 `NotImplementedError`），
+      而"自动搜索"这个能力**已经存在** —— 它在独立模块 `adapters/discover.py`
+      （`JobDiscovery`，2026-09-21 获使用者授权后新增），由 `jh job crawl` 调用。
+
+      分成两个模块是刻意的：**发现岗位**（读搜索结果页的链接）与**抓取详情**
+      （`fetch_detail`）是两件事，让 `JobSource` 这个"抓单个链接"的接口保持不变，
+      边界才一眼可见（守卫见 `tests/verify/test_v_checklist12.py`）。
+      保留 `SearchResult` 这个类型，是为了将来真要把搜索并进适配器时有个落点。
     """
 
     url: str
@@ -141,22 +150,28 @@ class JobSource(ABC):
         raise NotImplementedError
 
     def search(self, keyword: str, city: str | None = None) -> list[SearchResult]:
-        """搜索岗位（**可选能力，默认不支持**）。
+        """搜索岗位（**仍然未实现 —— 但"发现岗位"这个能力已经存在**）。
 
-        默认抛 NotImplementedError —— 这是一个**故意的**设计：
-            · 主路径是"人给链接"，搜索本来就不是必需的；
-            · BOSS 的自动搜索必须先过 spike 验证，没通过就不该有实现；
-            · 一个明确报错的"未支持"，比一个偷偷返回空列表的假实现好得多
-              （后者会让人误以为"搜了但没结果"）。
+        ★★ 2026-09-21 澄清（授权变更之后容易读错，所以写在这里）：
+
+          · **能力**：自动搜索已获使用者授权并落地 —— `adapters/discover.py`
+            的 `JobDiscovery`（由 `jh job crawl` 调用）。它**故意不并进这个类**：
+            发现层只读搜索结果页的链接，抓详情仍走 `fetch_detail`，
+            两个职责分开，边界才看得见；
+          · **这个默认实现**：仍然抛 `NotImplementedError`，而且**必须**继续抛 ——
+            它是一个明确报错的"未支持"，比一个偷偷返回空列表的假实现好得多
+            （后者会让人误以为"搜了但没结果"）。守卫见
+            `tests/verify/test_v_checklist12.py::test_the_search_boundary_matches_the_authorization`。
 
         ★ 这里原本带一个 `max_pages` 参数（ISSUES #18 时删掉）：它和配置里的
           `rate_limit.max_pages` 一起构成了"我们有翻页上限"的错觉 ——
           而**这个方法没有任何实现、也没有任何调用方**，那个"上限"从来没生效过。
-          将来真要做自动搜索，**参数、配置项、COMPLIANCE 的说明要一起加回来**，
-          不要只加其中一样（那正是 #18 的成因）。
+          现在真正的页数上限在 `jh job crawl --pages`（命令行显式给），
+          条数上限在 `--limit`（硬上限 100）—— 都在**真实读得到**的地方。
         """
         raise NotImplementedError(
             f"{type(self).__name__} 不支持搜索。"
-            "本项目主路径是 `jh job add <url>`（人给链接）；"
-            "自动搜索需要先通过 spikes/boss_search_spike.py 验证。"
+            "抓单个链接用 `jh job add <url>`；"
+            "自动搜索用 `jh job crawl -q <关键词> --city <城市>`"
+            "（发现层在 adapters/discover.py，见 docs/COMPLIANCE.md §5.8）。"
         )

@@ -1,7 +1,7 @@
 """`jh job` —— 岗位录入（P2：**主路径是"人给链接"**；2026-09-21 加了自动搜索）。
 
 ═══════════════════════════════════════════════════════════════════════════
-五种录入口子，覆盖"网络好/网络差/批量/离线/不想手动找"五种真实情况
+六种录入口子，覆盖"网络好/网络差/批量/离线/只有截图/不想手动找"六种真实情况
 ═══════════════════════════════════════════════════════════════════════════
 
     jh job add <url>              主路径：粘贴岗位链接 → 抓详情 → 入库
@@ -10,6 +10,7 @@
     jh job add --manual           手动粘贴：从标准输入读 JD 文本（网络不通也能用）
     jh job add --html page.html   从本地保存的网页解析（不想联网 / 抓取被拦）
     jh job add --text "…"         直接给一段文本（脚本化调用）
+    jh job add --image 截图.png   ★ 从**截图**识别文字（本地离线 OCR，2026-09-21 接入 shotocr）
     jh job crawl -q Python --city 东莞 --pages 2
                                   ★ 自动搜索 + 批量抓取（2026-09-21 用户授权放开）
 
@@ -45,7 +46,7 @@ import ipaddress
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 import typer
@@ -108,6 +109,16 @@ def job_add(
         Path | None,
         typer.Option("--html", help="从本地保存的网页解析（离线/抓取被拦时的兜底）"),
     ] = None,
+    image: Annotated[
+        Path | None,
+        typer.Option(
+            "--image",
+            help=(
+                "从**截图**识别 JD（本地离线 OCR，调 vendor/shotocr，不上传图片）。"
+                "建议同时给 --url 记下原链接"
+            ),
+        ),
+    ] = None,
     url: Annotated[
         str | None,
         typer.Option(
@@ -146,9 +157,9 @@ def job_add(
         typer.Option("--dry-run", help="只解析并打印结果，**不写库**"),
     ] = False,
 ) -> None:
-    """录入岗位：给链接 / 批量文件 / 手动粘贴 / 本地 HTML。"""
+    """录入岗位：给链接 / 批量文件 / 手动粘贴 / 本地 HTML / 截图 OCR。"""
     settings = get_settings()
-    _check_url_option(url, urls=urls, html_file=html_file, manual=manual, text=text)
+    _check_url_option(url, urls=urls, html_file=html_file, manual=manual, text=text, image=image)
 
     details, failures = _collect_details(
         urls=urls,
@@ -156,6 +167,7 @@ def job_add(
         manual=manual,
         text=text,
         html_file=html_file,
+        image=image,
         url=url,
         platform=platform,
         cdp=cdp,
@@ -181,6 +193,11 @@ def job_add(
     if dry_run:
         console.print()
         warn("--dry-run：以上结果没有写入数据库")
+        # ★ 一条都没解析出来 → **非 0 退出**，即便这是 dry-run（2026-09-21 补）。
+        #   `--dry-run` 的语义是"先看看会发生什么"，而"什么都没解析出来"就是它的结论；
+        #   退出码 0 会让脚本以为这一步没问题（#62 那条"不许假报成功"的同一个道理）。
+        if not details:
+            raise typer.Exit(code=1)
         return
 
     _print_upsert_summary(_upsert_everything(details, keyword=keyword), failures)
@@ -316,13 +333,29 @@ def job_crawl(
     # 跨页去重：用 `job_svc.url_dedup_key`（与 `--file` 那条路同一个判据，
     # 不另写一套 —— 否则"什么算同一个链接"会有两种答案）。
     seen: dict[str, str] = {}
-    for result in page_results:
+    ineffective_pages: list[int] = []
+    for index, result in enumerate(page_results, start=1):
+        if result.duplicate_of_previous:
+            ineffective_pages.append(index)
         if result.note:
             warn(f"{result.page_url}\n    {result.note}")
         for url in result.job_urls:
             key = job_svc.url_dedup_key(url)
             if key and key not in seen:
                 seen[key] = url
+
+    # ★★ `--pages` 静默无效必须**明说**（#67 优先级 2）：
+    #   BOSS 不认 `page=` 参数时，第 2 页抓回来的还是第 1 页那一批 ——
+    #   用户以为"多读了几页"，实际上除了多花延时什么都没发生。
+    #   发现层已经提前停了，这里负责把"为什么只有这么几条"讲清楚。
+    if ineffective_pages:
+        warn(
+            f"--pages {pages} 看起来**没有生效**：第 {ineffective_pages[0]} 页与第 1 页是同一批岗位"
+            "（站点多半不认 `page=` 参数）。已提前停止，没有继续白跑。\n"
+            "  想拿到更多岗位：换关键词 / 换城市，或用 `jh job add --file` 喂你自己整理的链接。"
+        )
+    elif pages > 1 and len(page_results) < pages:
+        warn(f"--pages {pages}：只读到 {len(page_results)} 页就停了（原因见上面的提示）")
 
     targets = list(seen.values())
     if not targets:
@@ -603,18 +636,20 @@ def _upsert_everything(details: list[JobDetail], *, keyword: str | None) -> _Ups
 
 
 def _print_missing_input_help() -> None:
-    """什么都没给时，把四种用法摆出来（而不是甩一句「参数错误」）。"""
+    """什么都没给时，把五种用法摆出来（而不是甩一句「参数错误」）。"""
     err_console.print(
         Panel(
-            "没有可录入的内容。四种用法：\n\n"
+            "没有可录入的内容。五种用法：\n\n"
             "  [bold]jh job add <url>[/bold]              粘贴岗位链接（主路径）\n"
             "  [bold]jh job add --file jobs.txt[/bold]    批量（一行一个 URL）\n"
             "  [bold]jh job add --manual[/bold]           手动粘贴 JD 文本\n"
+            "  [bold]jh job add --image 截图.png[/bold]   从截图识别（本地离线 OCR）\n"
             "  [bold]jh job add --html page.html[/bold]   从保存的网页解析\n"
-            '  [dim]（后两种可以配 --url "<原链接>" --platform boss，'
+            '  [dim]（后三种可以配 --url "<原链接>" --platform boss，'
             "把原始链接与平台一起记下来）[/dim]\n\n"
             "[dim]为什么主路径是「人给链接」：BOSS 有签名与字体反爬，"
-            "自动搜索容易撞墙；而「刷到岗位 → 存下来」本来就是真实工作流。[/dim]",
+            "搜索页还会自己关掉；而「刷到岗位 → 存下来」本来就是真实工作流。\n"
+            "要自动搜索 + 批量抓取用 [bold]jh job crawl -q <关键词> --city <城市>[/bold][/dim]",
             title="缺少录入目标",
             border_style="yellow",
         )
@@ -628,11 +663,12 @@ def _check_url_option(
     html_file: Path | None,
     manual: bool,
     text: str | None,
+    image: Path | None = None,
 ) -> None:
     """校验 `--url`（ISSUES #61）——**不许静默忽略一个显式给出的选项**。
 
     `--url` 的语义是"给这条记录补上原始岗位链接"，只在 `--html` / `--manual` /
-    `--text` 下有意义。两种矛盾输入都当场报错，而不是挑一个听：
+    `--text` / `--image` 下有意义。两种矛盾输入都当场报错，而不是挑一个听：
 
       · 与位置参数（岗位链接）同时给 → 链接已经由位置参数提供了，两个都听
         等于静默挑一个；
@@ -641,21 +677,32 @@ def _check_url_option(
     ★ 为什么走"报错"而不是"警告后忽略"：这正是 #34 / #50 / #61 反复出现的那一类
       ——**静默忽略比报错危险得多，因为用户不会知道自己少了什么**。
     """
+    # ★ `--image` 与"另外三种文本来源"互斥（#67 优先级 6）：它们都要产出**一份** JD 文本，
+    #   同时给就等于让程序替用户挑一份 —— 而"挑一份"正是上面那条纪律要禁止的。
+    if image is not None and (html_file is not None or manual or text is not None):
+        err_console.print(
+            "[red]--image 不能与 --html / --manual / --text 同时用[/red]："
+            "它们各自都要给出一份 JD 文本，同时给无法确定用哪一份。\n"
+            '  · 截图识别：[bold]jh job add --image 截图.png --url "<原链接>"[/bold]\n'
+            '  · 手动粘贴：[bold]jh job add --manual --url "<原链接>"[/bold]'
+        )
+        raise typer.Exit(code=1)
     if not url:
         return
     if urls:
         err_console.print(
             "[red]--url 与位置参数（岗位链接）不能同时用[/red]：\n"
             "  · 抓链接：直接给位置参数 —— [bold]jh job add <url>[/bold]\n"
-            "  · 补链接：配合 --html / --manual / --text —— "
+            "  · 补链接：配合 --html / --manual / --text / --image —— "
             '[bold]jh job add --html 页面.html --url "<原链接>"[/bold]'
         )
         raise typer.Exit(code=1)
-    if not (html_file or manual or text):
+    if not (html_file or manual or text or image):
         err_console.print(
             "[red]--url 需要配合一种输入方式[/red]：\n"
             '  · jh job add --html 页面.html --url "<原链接>" --platform boss\n'
-            '  · jh job add --manual --url "<原链接>" --platform boss'
+            '  · jh job add --manual --url "<原链接>" --platform boss\n'
+            '  · jh job add --image 截图.png --url "<原链接>" --platform boss'
         )
         raise typer.Exit(code=1)
 
@@ -669,22 +716,24 @@ def _collect_details(
     html_file: Path | None,
     url: str | None,
     platform: str | None,
+    image: Path | None = None,
     cdp: bool = False,
     release_page: bool = False,
     settings: object,
 ) -> tuple[list[JobDetail], list[str]]:
     """把各种输入统一收集成 `(成功解析的详情列表, 失败说明列表)`。
 
-    ★ 分批处理的顺序即"优先级"：显式给的链接 → 批量文件 → 本地 HTML → 手动文本。
-      用户的真实用法通常只走其中一条，但允许混用（比如"给两个链接 + 粘一段文本"）。
+    ★ 分批处理的顺序即"优先级"：显式给的链接 → 批量文件 → 本地 HTML → 手动文本
+      → 截图 OCR。用户的真实用法通常只走其中一条，但允许混用
+      （比如"给两个链接 + 粘一段文本"）。
 
-    ★★ `platform` 现在对**三条路都生效**（ISSUES #61）：
+    ★★ `platform` 现在对**四条路都生效**（ISSUES #61）：
       改前它只在手动文本那条路上被传下去，链接抓取与本地 HTML 都静默忽略它 ——
       而 `--help` 写的是"强制指定平台"。本地 HTML 恰恰是最需要它的场景：
       保存下来的网页**没有域名上下文**，工具无从判断是 BOSS 还是别的站，
       用户显式说了却被丢掉。现在：**要么真的用它，要么明确报错**，不许两者都不做。
     """
-    from jobhunter.adapters.manual import ManualAdapter, read_html_file
+    from jobhunter.adapters.manual import ManualAdapter
 
     details: list[JobDetail] = []
     failures: list[str] = []
@@ -719,24 +768,26 @@ def _collect_details(
             details.append(detail)
 
     if html_file is not None:
-        if not html_file.is_file():
-            failures.append(f"{html_file}（文件不存在）")
-        else:
-            try:
-                # ★ 把 url 与 platform 一起传下去（#61 的两个缺口就在这里）
-                parsed = read_html_file(html_file, url=url, platform=platform)
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"{html_file}（解析失败：{exc}）")
-            else:
-                if parsed.fetch_status == "failed":
-                    reason = parsed.fetch_note or "这个网页里没解析出 JD 正文"
-                    failures.append(f"{html_file}\n    {reason}")
-                else:
-                    details.append(parsed)
+        parsed, html_failure = _detail_from_html_file(html_file, url=url, platform=platform)
+        if parsed is not None:
+            details.append(parsed)
+        if html_failure:
+            failures.append(html_failure)
 
     content = text
     if manual and content is None:
         content = _read_stdin()
+
+    # ---- 截图 OCR（`--image`，2026-09-21 接入 shotocr）-------------------------
+    ocr_source: str | None = None
+    ocr_failed: str | None = None
+    if image is not None:
+        recognized, note = _read_image_text(image, settings=settings)
+        if recognized is None:
+            ocr_failed = note
+        else:
+            content = recognized.text
+            ocr_source = recognized.source
 
     if content is not None:
         if not content.strip():
@@ -747,10 +798,71 @@ def _collect_details(
                     content,
                     url=url,
                     platform=platform or "manual",
+                    # ★ 来源如实标注：`ocr` 的文本可能认错字，`manual` 的不会 ——
+                    #   排查"这条 JD 为什么怪"时这是第一条线索。
+                    source="ocr" if ocr_source else "manual",
                 )
             )
+            if ocr_source:
+                details[-1].raw["ocr"] = {"source": ocr_source}
+
+    if ocr_failed:
+        # OCR 没成功（没装 shotocr / 识别失败）→ 说清原因，而不是静默少一条
+        failures.append(f"{image}\n    {ocr_failed}")
 
     return details, failures
+
+
+def _detail_from_html_file(
+    html_file: Path, *, url: str | None, platform: str | None
+) -> tuple[JobDetail | None, str | None]:
+    """从本地保存的网页解析一条（`--html`），返回 `(结果或 None, 失败说明)`。
+
+    ★ 失败也要分两种：**文件不存在**（用户给的路径错了）与**解析不出正文**
+      （网页是登录页/改版了）—— 它们该做的事完全不同，所以说明里必须能看出来。
+    """
+    from jobhunter.adapters.manual import read_html_file
+
+    if not html_file.is_file():
+        return None, f"{html_file}（文件不存在）"
+    try:
+        # ★ 把 url 与 platform 一起传下去（#61 的两个缺口就在这里）
+        parsed = read_html_file(html_file, url=url, platform=platform)
+    except Exception as exc:  # noqa: BLE001 - 任何解析异常都要变成一句人话
+        return None, f"{html_file}（解析失败：{exc}）"
+    if parsed.fetch_status == "failed":
+        return None, f"{html_file}\n    {parsed.fetch_note or '这个网页里没解析出 JD 正文'}"
+    return parsed, None
+
+
+def _read_image_text(image: Path, *, settings: object) -> tuple[Any, str | None]:
+    """跑一次截图 OCR，返回 `(识别结果或 None, 说明或失败原因)`。
+
+    ★ 抽成函数不只是为了"函数别太长"：这段的**每一步都要如实说出来**
+      （识别了多少字、用的哪个引擎、置信度多少、低到什么程度要提醒）——
+      混在 `_collect_details` 的一堆分支里时，最容易在改动中丢掉其中一句。
+    """
+    from jobhunter.adapters import ocr as ocr_module
+
+    console.print(f"  [dim]识别截图中… {image}[/dim]")
+    try:
+        recognized = ocr_module.read_image(image, settings=settings)  # type: ignore[arg-type]
+    except ocr_module.OcrUnavailableError as exc:
+        # ★ 没装 shotocr ≠ 失败得不明不白：消息里带三条出路（装 / 配 / 换路子）
+        return None, f"{exc}"
+    except ocr_module.OcrError as exc:
+        return None, f"{exc}"
+    engine = recognized.engine or "?"
+    score = f"{recognized.mean_score:.2f}" if recognized.mean_score is not None else "（未报）"
+    console.print(
+        f"  识别到 [bold]{len(recognized.text)}[/bold] 字（引擎 {engine}　平均置信度 {score}）"
+    )
+    if recognized.low_confidence:
+        warn(
+            "这次 OCR 的**平均置信度偏低** —— 识别出来的字可能有错。"
+            "入库前请用 `--dry-run` 看一眼解析结果，或改用 --manual 粘贴原文。"
+        )
+    return recognized, recognized.source
 
 
 def _read_url_file(path: Path) -> list[str]:

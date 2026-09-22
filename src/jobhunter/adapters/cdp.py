@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -60,11 +61,13 @@ logger = get_logger(__name__)
 
 __all__ = [
     "CdpEndpoint",
+    "CdpOwnerError",
     "CdpProfileError",
     "cdp_profile_dir",
     "close_page_if_not_last",
     "create_target",
     "ensure_cdp_browser",
+    "ensure_our_browser",
     "find_browser_executable",
     "is_cdp_listening",
     "open_target_page",
@@ -78,6 +81,15 @@ _CDP_PROBE_INTERVAL_SECONDS = 0.4
 
 class CdpProfileError(ValueError):
     """专用 profile 的路径不安全（落在仓库里）——**拒绝启动浏览器**（JH-13）。"""
+
+
+class CdpOwnerError(RuntimeError):
+    """CDP 端口后面**不是**本工具的专用浏览器 —— 拒绝继续（#67 优先级 4）。
+
+    ★ 为什么必须当场停下而不是"照常用"：连错浏览器 = 用**别人的登录态**去读页面，
+      而那个实例的 profile 不是我们的（可能装着别人的账号、扩展、代理设置）。
+      结果既不可复现，也说不清"这份数据到底是从哪个会话里读出来的"。
+    """
 
 
 @dataclass(frozen=True)
@@ -310,6 +322,91 @@ def ensure_cdp_browser(
     )
 
 
+def _browser_profile_of(browser: Any) -> str | None:
+    """问浏览器自己："你的 `--user-data-dir` 是哪个？"（问不出来返回 None）。
+
+    ★ 用 CDP 的 `Browser.getBrowserCommandLine`（browser 级会话），它返回**启动命令行**，
+      里面有 `--user-data-dir=<profile>` —— 这是"端口后面是谁"唯一可靠的答案。
+      `/json/version` 只有版本号与 UA，认不出实例。
+
+    ★ 问不出来时**返回 None 而不是抛**：不同浏览器/版本对这个命令的支持不一，
+      而"问不出来"不该变成新的失败点（调用方会按"不阻断"处理，并记一条日志）。
+    """
+    try:
+        session = browser.new_browser_cdp_session()
+        result = session.send("Browser.getBrowserCommandLine")
+    except Exception:  # noqa: BLE001 - 老版本/受限环境问不出来
+        return None
+    arguments = (result or {}).get("arguments") or []
+    if not isinstance(arguments, list):
+        return None
+    for argument in arguments:
+        if isinstance(argument, str) and argument.startswith("--user-data-dir="):
+            return argument.split("=", 1)[1]
+    return ""
+
+
+def _same_dir(left: str | Path, right: str | Path) -> bool:
+    """两个路径是不是同一个目录（Windows 上大小写/斜杠都要容忍）。"""
+    try:
+        a = os.path.normcase(os.path.abspath(str(left)))
+        b = os.path.normcase(os.path.abspath(str(right)))
+    except (OSError, ValueError):  # pragma: no cover - 路径异常就当不同
+        return False
+    return a == b
+
+
+def ensure_our_browser(browser: Any, endpoint: CdpEndpoint) -> None:
+    """连上之后校验"**端口后面确实是我们那个专用实例**"（#67 优先级 4）。
+
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║ 为什么端口通不等于"能连"                                                 ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    `ensure_cdp_browser()` 只问了一句"端口上有没有人在听"。如果**另一个会话/另一个人**
+    的浏览器占着 9333（同一个 9333 是完全可能的：同事、另一份 checkout、用户自己
+    手动起的实例），我们会**静默连到别人的浏览器**上去读页面：
+    用的不是我们的 profile、不是我们的登录态，而抓到的数据看起来一模一样。
+
+    ★ 判据用的是**启动命令行里的 `--user-data-dir`**（见 `_browser_profile_of`）：
+      它和 `cdp_profile_dir()` 给出的目录必须一致 —— 那是我们自己起的实例的标识。
+
+    ★ 三种结果分开处理（不混成一句"连不上"）：
+
+      · 命令行**拿不到** → 记一条 WARNING 放行（浏览器版本不支持这个命令，
+        把"问不出来"当成"不是我们的"会让这条路在旧版浏览器上彻底不可用）；
+      · 命令行里**没有** `--user-data-dir`（返回空串）→ **判定为别人的实例**：
+        我们自己起实例时**一定**带这个参数（见 `ensure_cdp_browser`），
+        所以"没有"就说明不是我们起的；
+      · 有但不是我们的目录 → 判定为别人的实例。
+
+    Raises:
+        CdpOwnerError: 端口后面不是我们那个专用实例。
+    """
+    found = _browser_profile_of(browser)
+    if found is None:
+        logger.warning(
+            "连上了 CDP 端口 %s，但问不出它的启动命令行（这个浏览器版本不支持 "
+            "Browser.getBrowserCommandLine）—— 无法确认它是不是本工具的专用实例，先按可用处理",
+            endpoint.port,
+        )
+        return
+    if found and _same_dir(found, endpoint.profile_dir):
+        return
+
+    shown = found or "（没有 --user-data-dir，是一个用默认配置的浏览器）"
+    raise CdpOwnerError(
+        f"CDP 端口 {endpoint.port} 后面**不是本工具的专用浏览器**，已停下：\n"
+        f"    它用的配置目录：{shown}\n"
+        f"    本工具期望的是：{endpoint.profile_dir}\n"
+        "  为什么不停下不行：那样会**用别人的登录态**去读页面 —— 抓到的内容既不可复现，\n"
+        "    也说不清是从哪个会话里读出来的（而且那个实例可能装着别的账号/扩展/代理）。\n"
+        "  怎么办（二选一）：\n"
+        f"    · 换一个端口：config.yaml 里 `browser.cdp_port: 9334`，再重跑；\n"
+        "    · 或者把占着这个端口的那个实例关掉（先确认它不是本工具的窗口），再重跑。"
+    )
+
+
 def cdp_page(playwright: Any, endpoint: CdpEndpoint) -> Any:
     """连上 CDP，拿一个**可用的页面**（优先复用已有页面）。
 
@@ -321,6 +418,9 @@ def cdp_page(playwright: Any, endpoint: CdpEndpoint) -> Any:
     ★ 这里**只**做"连接 + 取页面"，不做任何点击/填表 —— 红线 2。
     """
     browser = playwright.chromium.connect_over_cdp(endpoint.url)
+    # ★ 先确认"连上的是我们那个实例"（#67 优先级 4）——连错浏览器要用别人的登录态，
+    #   那比"抓不到"糟得多，所以这一步在拿页面之前。
+    ensure_our_browser(browser, endpoint)
     contexts = list(getattr(browser, "contexts", []) or [])
     context = contexts[0] if contexts else browser.new_context()
     pages = list(getattr(context, "pages", []) or [])
@@ -439,6 +539,8 @@ def open_target_page(playwright: Any, endpoint: CdpEndpoint, url: str) -> tuple[
     target_id = create_target(endpoint.port, url)
 
     browser = playwright.chromium.connect_over_cdp(endpoint.url)
+    # ★ 同 `cdp_page`：连上的第一件事是确认"这是我们那个实例"（#67 优先级 4）。
+    ensure_our_browser(browser, endpoint)
     contexts = list(getattr(browser, "contexts", []) or [])
     context = contexts[0] if contexts else browser.new_context()
     pages = list(getattr(context, "pages", []) or [])

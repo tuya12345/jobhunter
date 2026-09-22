@@ -187,17 +187,37 @@ class BrowserSettings(BaseModel):
     cdp_profile_dir: Path | None = None
 
 
+class OcrSettings(BaseModel):
+    """截图 OCR（`jh job add --image`，2026-09-21 接入 shotocr）。
+
+    ★ 为什么是一个**可选**能力：shotocr 是独立项目（`vendor/shotocr`），它的依赖
+      很重（RapidOCR + opencv ≈ 250 MB，其中 opencv 独占 113 MB）。
+      所以 jobhunter **不**把它变成硬依赖：`jh job add --image` 是**子进程调用**，
+      `uv sync` 不装它时其余功能照常可用（见 `adapters/ocr.py`）。
+
+    ★ `root` 默认自动探测 `<项目根>/vendor/shotocr`；把它挪到别处时在这里指路径。
+    """
+
+    #: shotocr 项目根目录（含 `src/shotocr` 与 `.venv`）；不填 → 自动探测 vendor/shotocr
+    root: Path | None = None
+    #: 单张图片的识别超时（秒）。OCR 要加载模型，第一次跑偏慢（实测 demo 图约 14 秒）
+    timeout_seconds: int = Field(default=300, ge=10, le=3600)
+
+
 class RateLimitSettings(BaseModel):
     """频率克制（合规红线之一）。
 
-    随机延时 + 出错即停 —— 不做自动搜索，但即使抓详情也要有节奏，
-    避免给目标站点造成压力，也避免被风控标记。
+    随机延时 + 出错即停 —— 即使只抓详情也要有节奏，避免给目标站点造成压力，
+    也避免被风控标记。
+
+    ★ 2026-09-21 起**有自动搜索**了（`jh job crawl`，用户授权，见
+      `docs/COMPLIANCE.md` §5.8），这条配置对"翻页之间"与"详情之间"**都**生效。
 
     ★ 这里**刻意没有** `max_pages`（ISSUES #18）：它曾经存在，但全仓没有任何读取点，
       而 `docs/COMPLIANCE.md` 却据此声称"抓取路径带翻页上限"——
       **合规文档声称一个不存在的控制，比一个没人读的配置项严重得多**。
-      现在默认路径只抓用户手动给的单个链接，没有自动翻页，所以也不需要这个上限。
-      将来真要做翻页，配置项和文档要一起加（并且要有真实读取点）。
+      现在的页数由命令行 `--pages` 显式给定（`jh job crawl`），
+      条数护栏是 `--limit`（硬上限 100），都不需要这个字段。
     """
 
     min_delay_seconds: float = Field(default=2.0, ge=0.0)
@@ -269,6 +289,9 @@ class AppSettings(BaseSettings):
 
     # ---- 浏览器抓取（可选，`jh job add --cdp` 用）---------------------------
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
+
+    # ---- 截图 OCR（可选，`jh job add --image` 用）---------------------------
+    ocr: OcrSettings = Field(default_factory=OcrSettings)
 
     # ---- CLI 行为 -----------------------------------------------------------
     show_reminders: bool = True

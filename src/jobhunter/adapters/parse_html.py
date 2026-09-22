@@ -38,13 +38,18 @@ from jobhunter.adapters.parse_text import (
     normalize_text,
     strip_html,
 )
+from jobhunter.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 __all__ = [
     "PLATFORM_SELECTORS",
+    "count_watermarks",
     "detect_platform",
     "extract_platform_job_id",
     "parse_detail_from_html",
     "parse_detail_from_text",
+    "strip_watermarks",
 ]
 
 # ---------------------------------------------------------------------------
@@ -154,6 +159,76 @@ def extract_platform_job_id(url: str, platform: str | None = None) -> str | None
         if match:
             return match.group("id")
     return None
+
+
+# ---------------------------------------------------------------------------
+# 站点水印词：BOSS 把 `BOSS直聘` / `boss` / `kanzhun` **塞进正文的词中间**
+# ---------------------------------------------------------------------------
+#: 已知的水印词（大小写不敏感）。
+#:
+#: ★★ 为什么需要处理它（2026-09-21 实测，交接文档 §5 第 8 条）：
+#:
+#:   BOSS 会在渲染文本里**随机往词语中间插**这些词，例如把「职位描述」写成
+#:   「职 boss 位描述」/「职位描BOSS直聘述」。后果**不是"多几个字"这么轻**：
+#:
+#:     · `_JD_START_MARKERS`（"职位描述"）匹配不上 → **正文裁剪失效** →
+#:       JD 前面混进"微信扫码分享 / 举报"这类导航噪音，被整段存进库；
+#:     · 那些噪音随后会被 `match` 打分、被 `tailor` 拿去定制简历 ——
+#:       污染一路往下游传。
+#:
+#: ★ 判据刻意**只在"两侧都是中日韩字符"时才删**（见 `strip_watermarks`）：
+#:   正文里正常出现的英文 `boss`（两侧是空格/ASCII，例如"汇报给 boss"）**不许动** ——
+#:   宁可漏掉一次注入，也不改写用户看到的原文。这是一条真实的取舍，不是保守。
+_WATERMARK_TOKENS: tuple[str, ...] = ("BOSS直聘", "kanzhun", "zhipin", "boss")
+
+#: 水印词的注入形态：**夹在中文词中间**（`(?<=[CJK])` + `(?=[CJK])`，允许中间有空白）。
+_WATERMARK_IN_CJK_RE = re.compile(
+    r"(?<=[\u3400-\u4dbf\u4e00-\u9fff])"
+    r"\s*(?:" + "|".join(re.escape(token) for token in _WATERMARK_TOKENS) + r")\s*"
+    r"(?=[\u3400-\u4dbf\u4e00-\u9fff])",
+    re.IGNORECASE,
+)
+
+
+def strip_watermarks(text: str | None) -> str:
+    """去掉**夹在中文词中间**的站点水印词（`职 boss 位描述` → `职位描述`）。
+
+    ★ 只删"注入形态"（两侧都是中日韩字符），不动正常的英文 `boss`：
+      见 `_WATERMARK_TOKENS` 的说明（那是本函数唯一需要判断的事）。
+
+    ★ 幂等：删完不会再生出新的"两侧都是中文"的水印词。
+
+    ★★ 已知取舍（写在代码里，不在文档里藏）：这个判据**分不清**
+      「注入进 `职位描述` 的 boss」与「中文句子里正常写的英文 boss」
+      （`汇报给 boss 的时候` 两侧同样是中文）—— 也就是说，极少数正常的英文词会被删掉。
+
+      为什么接受这个代价：另一边是**整段正文裁错** —— marker 匹配不上时，
+      JD 前面会挂上"微信扫码分享 / 举报"这类导航噪音，而那段噪音会被 `match` 打分、
+      被 `tailor` 抄进定制简历（污染一路往下游走）。两害相权，删一个可能是正常的英文词更轻。
+
+      ⚠️ 但"动过文本"这件事**必须能看见**：调用方用 `count_watermarks()` 报数
+      （`raw["watermarks_removed"]` + 一条日志），用户才有机会发现。
+    """
+    if not text:
+        return text or ""
+    return _WATERMARK_IN_CJK_RE.sub("", text)
+
+
+def count_watermarks(text: str | None) -> int:
+    """这段文本里有几处"夹在中文中间的水印词"（给调用方报数用，不修改文本）。"""
+    if not text:
+        return 0
+    return len(_WATERMARK_IN_CJK_RE.findall(text))
+
+
+def _strip_optional(value: str | None) -> str | None:
+    """`strip_watermarks` 的空值版：`None` 仍然是 `None`（别把"认不出"变成空串）。
+
+    ★ 为什么要单独一个函数：`company` / `title` 的语义是"认不出就是 None"，
+      而 `""` 会让下游多一种状态（本项目为此吃过好几次亏 —— 空串与 None 在
+      判空、展示、去重三处行为都不同）。
+    """
+    return strip_watermarks(value) if value else value
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +674,9 @@ def parse_detail_from_html(
     #   BOSS 真实页面上城市与经验就在 `class="info-primary"` 里的
     #   `<a class="text-desc text-city">深圳</a>` / `<span class="text-desc text-experiece">`。
     region = _main_job_region(normalizer)
-    region_text = strip_html(region)
+    # ★ 水印词在这里就去掉（`职 boss 位描述` → `职位描述`）：
+    #   城市/经验/学历也是从这段文本里抽的，注入同样会把它们切开（见 strip_watermarks）。
+    region_text = strip_watermarks(strip_html(region))
 
     if not salary_source:
         salary_source = _salary_from_dom(region)
@@ -622,11 +699,13 @@ def parse_detail_from_html(
 
     return JobDetail(
         platform=platform,
-        jd_text=jd_text or "",
+        # ★ 水印词去掉后再入库（`职 boss 位描述` 这类注入 —— 见 `strip_watermarks`）。
+        #   结构化字段也要过一遍：注入不挑位置，标题/公司名里同样可能出现。
+        jd_text=strip_watermarks(jd_text or ""),
         platform_job_id=job_id,
-        company=company,
-        title=title_text,
-        city=city_text or extract_city(region_text) or extract_city(title or ""),
+        company=_strip_optional(company),
+        title=_strip_optional(title_text),
+        city=_strip_optional(city_text) or extract_city(region_text) or extract_city(title or ""),
         experience=extract_experience(region_text),
         education=extract_education(region_text),
         is_intern=looks_intern_from(region, structured, title_text, jd_text),
@@ -638,14 +717,35 @@ def parse_detail_from_html(
         # ★ 命中登录墙时把说明带上：CLI 直接打印它（用户看到的必须是
         #   "为什么没抓到 + 接下来怎么办"，而不是一句笼统的失败）
         fetch_note=wall_note,
-        raw={
-            "title_tag": title or "",
-            "jd_length": len(jd_text or ""),
-            "jsonld": structured is not None,
-            # 留痕：事后排查"这条为什么没入库"时，一眼能看出是登录墙
-            "access_wall": bool(wall_note),
-        },
+        raw=_html_raw(title=title, jd_text=jd_text, structured=structured, wall_note=wall_note),
     )
+
+
+def _html_raw(
+    *,
+    title: str | None,
+    jd_text: str | None,
+    structured: dict[str, Any] | None,
+    wall_note: str | None,
+) -> dict[str, Any]:
+    """`parse_detail_from_html` 的 `raw`：把"这次动过什么"一并留下来。
+
+    ★ 水印计数放在这里（而不是丢掉）：`strip_watermarks` 会改文本，
+      而"改了多少"必须能查（见它 docstring 里写明的取舍）。
+    """
+    removed = count_watermarks(jd_text)
+    if removed:
+        logger.info("JD 正文里有 %d 处站点注入的水印词，已去掉", removed)
+    raw: dict[str, Any] = {
+        "title_tag": title or "",
+        "jd_length": len(jd_text or ""),
+        "jsonld": structured is not None,
+        # 留痕：事后排查"这条为什么没入库"时，一眼能看出是登录墙
+        "access_wall": bool(wall_note),
+    }
+    if removed:
+        raw["watermarks_removed"] = removed
+    return raw
 
 
 def _resolve_basic_fields(
@@ -737,26 +837,38 @@ def parse_detail_from_text(
     platform: str = "manual",
     title: str | None = None,
     company: str | None = None,
+    source: str = "manual",
 ) -> JobDetail:
-    """从**纯文本**构造 `JobDetail`（`--manual` 手动粘贴走这条路）。
+    """从**纯文本**构造 `JobDetail`（`--manual` 手动粘贴 / `--image` 截图识别走这条路）。
 
     与 `parse_detail_from_html` 的区别：不再做标签抽取，
     直接把整段文本当 JD 正文，然后抽取结构化字段。
     用户可以自己写好 `公司：xxx` / `职位：xxx` 这样的行，这里会识别。
+
+    Args:
+        source: 这段文本**从哪来**（`manual` 人粘的 / `ocr` 截图识别的）。
+            只进 `raw`，供 CLI 与排障用 —— 两者的可信度不同（OCR 会认错字）。
     """
-    normalized = normalize_text(text)
     labeled_company, labeled_title = _parse_labeled_fields(text)
 
     salary_text, salary_min, salary_max = extract_salary(text)
     resolved_title = title or labeled_title or _first_meaningful_line(text)
     resolved_company = company or labeled_company
+    # ★ 水印词去掉之后再入库（否则「职 boss 位描述」这种注入会被当成正文的一部分，
+    #   一路污染 match / tailor；见 `strip_watermarks` 的说明）。
+    cleaned = strip_watermarks(text).strip()
+    removed = count_watermarks(text)
+    if removed:
+        logger.info(
+            "这段文本里有 %d 处站点注入的水印词，已去掉（见 parse_html.strip_watermarks）", removed
+        )
 
     return JobDetail(
         platform=platform,
-        jd_text=text.strip(),
+        jd_text=cleaned,
         platform_job_id=extract_platform_job_id(url or "", platform) if url else None,
-        company=resolved_company,
-        title=resolved_title,
+        company=_strip_optional(resolved_company),
+        title=_strip_optional(resolved_title),
         city=extract_city(text[:2000]),
         experience=extract_experience(text[:2000]),
         education=extract_education(text[:2000]),
@@ -765,8 +877,12 @@ def parse_detail_from_text(
         salary_min=salary_min,
         salary_max=salary_max,
         url=url,
-        fetch_status="ok" if normalized else "failed",
-        raw={"source": "manual"},
+        fetch_status="ok" if cleaned else "failed",
+        # ★ 来源要如实标注：`manual` = 人粘的；`ocr` = 截图识别的（见 adapters/ocr.py）。
+        #   两者都会进来，而"这段文本是怎么来的"决定了排查时该怀疑谁
+        #   （OCR 可能把字符认错，粘贴不会）。
+        # ★ `watermarks_removed`：这次动过几处文本（0 时不写这个键 —— 没动过就是没动过）
+        raw=({"source": source, "watermarks_removed": removed} if removed else {"source": source}),
     )
 
 

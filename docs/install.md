@@ -209,6 +209,8 @@ pip install -e ".[web]"          # 只想用 jh leads serve 的线索页时
 `[web]` 除了两个 Python 包，还要**构建一次前端产物**（否则页面打不开，接口照常）——
 两步都在 [§9](#9-p7-消费端导入线索快照--打开本机线索页) 里。
 `[emulator]` 在本仓库用不到：模拟器那套在采集端 `leadhunter`，同一个 §9 里有说明。
+**截图 OCR 不是 extra**：它是子进程调用 `vendor/shotocr`（可选、按需装，见
+[§10](#10-可选截图-ocrshotocr)），所以 `uv sync` 永远不会因为它变重。
 
 ---
 
@@ -664,8 +666,15 @@ chcp 65001        # 把控制台代码页切成 UTF-8
 - 日志里"没装 Playwright，无法抓取" → `uv sync --extra browser` 并装两个 Chromium（见 §1）。
 - 抓到的字段不全（`partial`）→ 正常现象，工具**不猜**字段：缺的留空并列出来，
   你可以 `jh job show <id> --jd` 看正文，必要时补录一条。
+- 提示「浏览器停在了**非岗位页**」/「地址里**没有那个岗位 ID**」→ 那个岗位可能已下线，
+  或站点把访客丢回了首页/列表页（日志里会写明你给的是哪个、实际停在哪个）。
+  换一条有效链接重跑；登录态过期就先在专用窗口里重新登录。
+- 实在抓不到 → **截图兜底**：`jh job add --image 截图.png --url "<原链接>"`
+  （本地离线 OCR，见 [§10](#10-可选截图-ocrshotocr)）。
 
-注意：工具**只读页面**，不点投递、不绕验证码、不做自动搜索翻页。
+注意：工具**只读页面**，不点投递、不绕验证码。自动搜索（`jh job crawl`）已获使用者授权，
+但边界仍在：翻页靠 URL 参数、命中验证页即停、**不自动投递**（见
+[docs/COMPLIANCE.md §5.8](COMPLIANCE.md)）。
 
 ### 8）导出 docx 报缺 python-docx
 
@@ -814,17 +823,24 @@ jh leads serve        # 重新起一次；已经开着的话，构建完直接�
 而你从输出里看不出任何异常（ISSUES #62 就是这么发现的）。
 现在它会识别出"这不是岗位页"（页面里有登录/验证特征词、且没有任何岗位结构），
 压成失败并**清掉正文**，绝不入库。
-**解决**：三条路（详见上面 §5 的 ③ 那一节）：
+**解决**：四条路（详见上面 §5 的 ③ 那一节）：
 
 ```powershell
 jh job add --cdp "<岗位链接>"                          # ① 复用你自己浏览器的登录态
 jh job add --html page.html --url "<链接>" --platform boss   # ② 另存为网页
 jh job add --manual --url "<链接>" --platform boss           # ③ 复制正文
+jh job add --image "截图.png" --url "<链接>" --platform boss  # ④ 截图 → 本地离线 OCR
 ```
 
 **① `--cdp` 第一次用会弹出一个浏览器窗口**，那是**给工具用的专用实例**（配置目录
 `state/cdp-profile`）——在里面登录一次目标站点，之后就不用再登了；它与你日常那个浏览器互不影响。
-**注意**：不要把它当成"批量抓取"的入口 —— 它一次只抓你给的那**一个**链接（这是红线，代码里有用例守着）。
+★ 如果 `browser.cdp_port`（默认 9333）被**别的**实例占着，工具连上后会**当场停下**并告诉你
+"端口后面不是本工具的专用浏览器"（改 `cdp_port` 或关掉那个实例）——
+它不会用别人的登录态去读页面（#67 优先级 4）。
+
+**一次可以给多个链接**：`jh job add <url1> <url2> …` 会逐个抓、失败跳过并记录
+（这是实况 —— 旧文档曾写"只抓你给的那一个"，与实现不符，2026-09-21 更正）。
+要**自动搜索**一批岗位用 `jh job crawl`（已授权，见 `COMPLIANCE.md` §5.8）。
 
 **为什么一定要带 `--url`**（走 ②③ 时）：不带的话库里只能记成 `file:///…/page.html` ——
 列表里点不回去，`platform_job_id` 也抽不出来（第一层去重失效）。
@@ -1017,5 +1033,53 @@ jh leads serve --port 8899            # 换端口（8765 被别的工具占着�
 - 采集端侧的准备（安卓模拟器、ADB、`uiautomator2`）照 leadhunter 自己的文档做 ——
   本仓库的 `[emulator]` extra 目前**没有任何代码用到**（`src/` 里没有 `import uiautomator2`）。
 - **采集类命令不会再搬回本仓库**：它们要模拟器依赖，这是 P7 架构变更时定下的红线；
-  同理，"不做批量抓取 / 不绕风控 / 不做任何写操作"这三条合规约束对采集端同样成立，
+  同理，"不绕风控 / 不做任何写操作"这两条合规约束对采集端同样成立，
   由那个仓库的文档负责自检。
+  ★ 注意：**"不批量抓取"这一条已经不再适用于本仓库**（2026-09-21 使用者授权放开了自动搜索，
+  见 [COMPLIANCE §5.8](COMPLIANCE.md)）；采集端是否放开，由它自己的文档说明。
+
+---
+
+## 10. 可选：截图 OCR（shotocr）
+
+**什么时候用**：页面抓不到（要登录 / 页面被站点自己关掉 / 结构不认识），
+但你**手上有一张能看清 JD 的截图**。这时用 `--image` 走本地离线 OCR：
+
+```powershell
+jh job add --image "截图.png" --url "<原链接>" --platform boss
+jh job add --image "截图.png" --dry-run          # 先看看识别+解析成什么样，不写库
+```
+
+它**不上传图片、不联网**（shotocr 全程本地），识别完的文本走**和 `--manual` 完全相同**的
+解析入库路径。命令会打印识别了多少字、用的哪个引擎、平均置信度多少；
+**置信度偏低时会提醒你**"识别出来的字可能有错，先用 `--dry-run` 看一眼"。
+
+### 10.1 装 shotocr（不装也能用 jobhunter 的其它功能）
+
+shotocr 是**独立项目**（`vendor/shotocr`，本地离线截图 OCR），**不是** jobhunter 的依赖 ——
+它的运行时依赖约 250 MB（RapidOCR + opencv，其中 opencv 独占 113 MB），
+所以 `uv sync` 永远不会装它。要启用 `--image`，自己装一次：
+
+```powershell
+cd vendor\shotocr
+uv venv .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+```
+
+装完直接回去跑 `jh job add --image …` 即可（工具会自己找到 `vendor/shotocr/.venv`）。
+想验证它本身能用：
+
+```powershell
+vendor\shotocr\shotocr.cmd --file vendor\shotocr\samples\demo.png    # 应当打印识别出的文字
+```
+
+**把 shotocr 放在别处**时，在 `config.yaml` 里指路径（见 [config.md](config.md) §6.6）：
+
+```yaml
+ocr:
+  root: D:/tools/shotocr     # 含 src/shotocr 与 .venv 的那个目录
+```
+
+**没装时会怎样**：`--image` 报「找不到 shotocr（截图 OCR 工具）」并给出三条出路
+（怎么装 / 怎么配路径 / 改用 `--manual` 粘贴），**其余所有命令照常可用**。
+这一条有测试守着（`tests/unit/test_ocr_image.py::test_shotocr_is_not_a_hard_dependency`）。
