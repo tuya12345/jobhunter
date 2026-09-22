@@ -320,57 +320,9 @@ def job_crawl(
         err_console.print(f"[red]--limit 要在 1~{CRAWL_MAX_ITEMS} 之间[/red]")
         raise typer.Exit(code=1)
 
-    from jobhunter.adapters.discover import JobDiscovery, build_search_url
-
-    console.print(f"[bold]自动搜索[/bold]　关键词={query}　城市={city}　页数={pages}")
-    for index in range(1, pages + 1):
-        console.print(f"  [dim]{build_search_url(query, city, page=index)}[/dim]")
-
-    console.print("\n[bold]① 读搜索结果[/bold]")
-    discovery = JobDiscovery(settings, use_cdp=True, cdp_endpoint=_prepare_cdp(settings))
-    page_results = discovery.search(query, city, pages=pages)
-
-    # 跨页去重：用 `job_svc.url_dedup_key`（与 `--file` 那条路同一个判据，
-    # 不另写一套 —— 否则"什么算同一个链接"会有两种答案）。
-    seen: dict[str, str] = {}
-    ineffective_pages: list[int] = []
-    for index, result in enumerate(page_results, start=1):
-        if result.duplicate_of_previous:
-            ineffective_pages.append(index)
-        if result.note:
-            warn(f"{result.page_url}\n    {result.note}")
-        for url in result.job_urls:
-            key = job_svc.url_dedup_key(url)
-            if key and key not in seen:
-                seen[key] = url
-
-    # ★★ `--pages` 静默无效必须**明说**（#67 优先级 2）：
-    #   BOSS 不认 `page=` 参数时，第 2 页抓回来的还是第 1 页那一批 ——
-    #   用户以为"多读了几页"，实际上除了多花延时什么都没发生。
-    #   发现层已经提前停了，这里负责把"为什么只有这么几条"讲清楚。
-    if ineffective_pages:
-        warn(
-            f"--pages {pages} 看起来**没有生效**：第 {ineffective_pages[0]} 页与第 1 页是同一批岗位"
-            "（站点多半不认 `page=` 参数）。已提前停止，没有继续白跑。\n"
-            "  想拿到更多岗位：换关键词 / 换城市，或用 `jh job add --file` 喂你自己整理的链接。"
-        )
-    elif pages > 1 and len(page_results) < pages:
-        warn(f"--pages {pages}：只读到 {len(page_results)} 页就停了（原因见上面的提示）")
-
-    targets = list(seen.values())
-    if not targets:
-        err_console.print(
-            "[red]一个岗位链接都没读到。[/red]\n"
-            "  · 先确认那个专用窗口里**已经登录** BOSS（见 `jh job add --cdp --help`）\n"
-            "  · 也可能是这一页确实没有结果，或站点给了验证页"
-            "（本工具**不绕风控**，遇到就停）"
-        )
-        raise typer.Exit(code=1)
-
-    console.print(f"  读到 [bold]{len(targets)}[/bold] 个不重复的岗位链接")
-    if len(targets) > limit:
-        console.print(f"  [dim]按 --limit {limit} 截断（剩下的换一次跑）[/dim]")
-        targets = targets[:limit]
+    targets = _search_and_collect_targets(
+        query=query, city=city, pages=pages, limit=limit, settings=settings
+    )
 
     if dry_run:
         console.print("\n[bold]--dry-run：以下链接没有被抓取[/bold]")
@@ -404,6 +356,109 @@ def job_crawl(
         _upsert_everything(details, keyword=keyword or query),
         failures,
     )
+
+
+def _search_and_collect_targets(
+    *,
+    query: str,
+    city: str,
+    pages: int,
+    limit: int,
+    settings: object,
+) -> list[str]:
+    """阶段①：读搜索结果 → 跨页去重 → 把护栏与告警讲清楚，返回要抓的链接。
+
+    ★ 为什么单独抽出来（2026-09-22）：`job_crawl` 本身的决策点已经够多
+      （页数/条数护栏、CDP 归属、dry-run、入库汇总…），
+      "读搜索结果"这一段塞回去会撞上 ruff 的语句数上限（PLR0915）——
+      与 `match_cmd._resolve_scope` 同一条理由：抽出来之后两边都读得清。
+
+    ★ 一条链接都没读到 → **非 0 退出**（不静默返回空清单让上层去猜）。
+    """
+    from jobhunter.adapters import cdp as cdp_module
+    from jobhunter.adapters.discover import JobDiscovery, build_search_url, format_page_list
+
+    console.print(f"[bold]自动搜索[/bold]　关键词={query}　城市={city}　页数={pages}")
+    for index in range(1, pages + 1):
+        console.print(f"  [dim]{build_search_url(query, city, page=index)}[/dim]")
+
+    console.print("\n[bold]① 读搜索结果[/bold]")
+    discovery = JobDiscovery(settings, use_cdp=True, cdp_endpoint=_prepare_cdp(settings))
+    try:
+        page_results = discovery.search(query, city, pages=pages)
+    except cdp_module.CdpOwnerError as exc:
+        # ★★ 「连错浏览器」必须**说人话**，不能让它冒成 traceback
+        #   （2026-09-22 复核发现的真实缺陷）：
+        #   发现层**故意**不吞这个异常（`discover._render` re-raise，理由
+        #   「重试三次只会连错三次」是对的），但 CLI 这一层原本没人接 ——
+        #   于是用户看到的是一整屏 typer/click 调用栈，
+        #   精心写的中文处置说明（含「怎么办（二选一）」）被埋在最后一行。
+        #   `jh job add --cdp` 那条路早就把它翻成人话了（`manual.fetch_detail`
+        #   捕获后交给 CLI 打印 `fetch_note`）—— 这里补上同一条待遇。
+        #   ★ `markup=False`：异常文本里有 `**` 与反引号，不能让 rich 当标记解析。
+        err_console.print("[red]连错浏览器，已停止：[/red]")
+        err_console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(code=1) from exc
+
+    # 跨页去重：用 `job_svc.url_dedup_key`（与 `--file` 那条路同一个判据，
+    # 不另写一套 —— 否则"什么算同一个链接"会有两种答案）。
+    seen: dict[str, str] = {}
+    ineffective_pages: list[int] = []
+    # ★ 重复来源页号：发现层记的（`duplicate_of_previous_pages`）。
+    #   为什么不让这里猜"就是第 1 页"（2026-09-22 修）：判据比的是前面所有页的并集，
+    #   重复来源未必是第 1 页；猜错会把归因指向反方向（见 `discover._duplicate_note`）。
+    duplicate_source_pages: tuple[int, ...] = ()
+    for index, result in enumerate(page_results, start=1):
+        if result.duplicate_of_previous:
+            ineffective_pages.append(index)
+            if not duplicate_source_pages:
+                duplicate_source_pages = result.duplicate_of_previous_pages
+        if result.note:
+            warn(f"{result.page_url}\n    {result.note}")
+        for url in result.job_urls:
+            key = job_svc.url_dedup_key(url)
+            if key and key not in seen:
+                seen[key] = url
+
+    # ★★ `--pages` 静默无效必须**明说**（#67 优先级 2）：
+    #   BOSS 不认 `page=` 参数时，第 2 页抓回来的还是第 1 页那一批 ——
+    #   用户以为"多读了几页"，实际上除了多花延时什么都没发生。
+    #   发现层已经提前停了，这里负责把"为什么只有这么几条"讲清楚。
+    if ineffective_pages:
+        where = format_page_list(duplicate_source_pages)
+        # ★ 归因跟着**来源页**走；来源未知时**不替它选一边**。
+        #   为什么：猜错归因比不说更糟（本项目反复吃过这个亏 —— 一句错的诊断
+        #   会让人去查一个不存在的问题）。发现层两者总是一起写，
+        #   所以"未知"理论上不会发生；万一发生，如实说"两种都可能"。
+        if duplicate_source_pages == (1,):
+            hint = "站点多半不认 `page=` 参数"
+        elif duplicate_source_pages:
+            hint = "站点可能只返回了这么多页"
+        else:
+            hint = "站点可能不认 `page=` 参数，也可能只返回了这么多页"
+        warn(
+            f"--pages {pages} 看起来**没有生效**：第 {ineffective_pages[0]} 页与{where}是同一批岗位"
+            f"（{hint}）。已提前停止，没有继续白跑。\n"
+            "  想拿到更多岗位：换关键词 / 换城市，或用 `jh job add --file` 喂你自己整理的链接。"
+        )
+    elif pages > 1 and len(page_results) < pages:
+        warn(f"--pages {pages}：只读到 {len(page_results)} 页就停了（原因见上面的提示）")
+
+    targets = list(seen.values())
+    if not targets:
+        err_console.print(
+            "[red]一个岗位链接都没读到。[/red]\n"
+            "  · 先确认那个专用窗口里**已经登录** BOSS（见 `jh job add --cdp --help`）\n"
+            "  · 也可能是这一页确实没有结果，或站点给了验证页"
+            "（本工具**不绕风控**，遇到就停）"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(f"  读到 [bold]{len(targets)}[/bold] 个不重复的岗位链接")
+    if len(targets) > limit:
+        console.print(f"  [dim]按 --limit {limit} 截断（剩下的换一次跑）[/dim]")
+        targets = targets[:limit]
+    return targets
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +647,15 @@ def _prepare_cdp(settings: object) -> object:
         err_console.print(f"[red]无法启用 --cdp[/red]：{exc}")
         raise typer.Exit(code=1) from exc
     if not endpoint.started:
-        console.print(f"  [dim]复用已在运行的浏览器实例（CDP 端口 {endpoint.port}）[/dim]")
+        # ★ 措辞刻意**不说"已复用"**（2026-09-22）：这一步只问过"端口上有没有人在听"，
+        #   **归属校验还没发生**（它在 `cdp.ensure_our_browser` 里，连上之后才跑）。
+        #   原文案「复用已在运行的浏览器实例」读起来像"已经确认是我们的"，
+        #   而紧接着就可能抛 `CdpOwnerError` —— 两句连起来读像"复用了、然后崩了"，
+        #   而不是"端口后面不是我们的实例"。如实说"将复用 + 待校验"。
+        console.print(
+            f"  [dim]端口 {endpoint.port} 上已有实例，将复用它；"
+            "连上后会校验它是不是本工具的专用实例[/dim]"
+        )
     return endpoint
 
 

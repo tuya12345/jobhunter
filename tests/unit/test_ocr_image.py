@@ -41,6 +41,14 @@ args = parser.parse_args()
 if args.file == "trigger-failure":
     sys.exit(3)
 
+# ★★ 真实 shotocr **会先检查图片存不存在**再识别（`[错误] 图片不存在`，退出码 2）。
+#   这里必须照样模拟 —— 否则"相对路径被换过的 cwd 带偏"这类缺陷
+#   在假实现上永远看不出来（假实现不读图，传什么都能"成功"）。
+#   见 `test_relative_image_path_survives_a_changed_workdir`。
+if not pathlib.Path(args.file).is_file():
+    print(f"[错误] 图片不存在：{args.file}", file=sys.stderr)
+    sys.exit(2)
+
 text = "职位描述\\n公司：星澜科技\\n职位：Python 后端开发\\n深圳 15-25K\\n负责后端接口开发。"
 pathlib.Path(args.txt).write_text(text, encoding="utf-8")
 pathlib.Path(args.json).write_text(
@@ -124,6 +132,68 @@ def test_read_image_returns_text_and_score(image: Path, settings, fake_shotocr) 
     assert result.engine == "rapid"
     assert result.low_confidence is False
     assert result.source  # 用了哪个 shotocr（诊断用）
+
+
+def test_relative_image_path_survives_a_changed_workdir(
+    tmp_path: Path, settings, fake_shotocr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★★ 相对图片路径 + shotocr **有工作目录** → 仍然必须找得到图片。
+
+    ★ 这条守的是一个**真实缺陷**（2026-09-22 复核发现，用户明确授权修复）：
+
+      `read_image` 会把子进程的 `cwd` 换成 shotocr 的根目录（vendored 布局下
+      `find_shotocr` 返回的 `workdir` 非 None），但传给 `--file` 的却是**原样的
+      字符串** —— 相对路径于是被 shotocr 按**新的 cwd** 解析，指向不存在的地方。
+
+      症状：`jh job add --image 截图.png` 报「图片不存在：截图.png」，
+      而那个文件就在用户眼前。**文档教的正是这种写法**（`job_cmd.py` 的 help 与
+      `docs/install.md` §10 都是 `--image 截图.png`）。
+
+    ★ 为什么原来那些用例抓不到：它们要么传 `command=`（→ `workdir=None`，不换 cwd），
+      要么 monkeypatch `find_shotocr` 返回 `(cmd, None)`；而 `image` fixture 是
+      `tmp_path`（**绝对**路径）。**"非 None 的 workdir" 与 "绝对路径" 两条
+      恰好一起把触发条件抹掉了。** 所以这条用例必须同时钉住这两点：
+      显式给一个非 None 的 `workdir`，并显式 `chdir` 之后用**相对**路径。
+    """
+    root = tmp_path / "shotocr-root"
+    root.mkdir()
+    # ★ 只替换 `find_shotocr`（让它返回非 None 的 workdir），
+    #   但照旧用**真的子进程**跑假 shotocr —— 这样 cwd 是真的被换过。
+    monkeypatch.setattr(ocr_module, "find_shotocr", lambda _settings=None: (fake_shotocr, root))
+
+    user_cwd = tmp_path / "user-cwd"
+    user_cwd.mkdir()
+    monkeypatch.chdir(user_cwd)
+    # 中文文件名一起验掉（Windows 上的编码坑本项目踩过多次）
+    relative = "截图.png"
+    (user_cwd / relative).write_bytes(b"\x89PNG\r\n\x1a\n(fake image)")
+
+    result = ocr_module.read_image(relative, settings=settings)
+
+    assert "星澜科技" in result.text, "相对路径在 cwd 被换过之后没被正确解析"
+
+
+def test_cli_accepts_a_relative_image_path(
+    tmp_path: Path, settings, fake_shotocr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ 用户视角的那一条：`jh job add --image 截图.png`（**相对**路径）必须能用。
+
+    `read_image` 的纯函数用例守机制，这条守"CLI 真的把用户的相对路径走通了" ——
+    因为文档教给用户的就是这个写法，而它曾经必然失败。
+    """
+    root = tmp_path / "shotocr-root"
+    root.mkdir()
+    monkeypatch.setattr(ocr_module, "find_shotocr", lambda _settings=None: (fake_shotocr, root))
+
+    user_cwd = tmp_path / "user-cwd"
+    user_cwd.mkdir()
+    monkeypatch.chdir(user_cwd)
+    (user_cwd / "截图.png").write_bytes(b"\x89PNG\r\n\x1a\n(fake image)")
+
+    result = runner.invoke(app, ["--no-remind", "job", "add", "--image", "截图.png", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "星澜科技" in result.output, "相对路径的截图没有被识别/解析出来"
 
 
 def test_low_confidence_is_flagged(tmp_path: Path, settings) -> None:
@@ -246,6 +316,59 @@ def test_cli_reports_missing_shotocr(
 # ===========================================================================
 # 结构性守卫：不做硬依赖
 # ===========================================================================
+def test_cli_marks_the_source_as_ocr(
+    tmp_path: Path, settings, fake_shotocr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★★ OCR 出来的 JD 必须在 `raw` 里标成 `ocr`，人粘贴的标成 `manual`。
+
+    ★ 为什么值得一条（2026-09-22 复核发现的**守卫缺口**）：
+      `raw["source"]` 是排查"这条 JD 为什么怪"的**第一条线索** ——
+      OCR 可能把字符认错，人粘贴的不会。`ocr.py` 与 `job_cmd.py` 的注释
+      都写明"来源要如实标注"，但**此前没有任何用例断言它**：
+      将来重构 `_collect_details` 时静默退回 `manual`，不会有任何测试变红。
+
+    ★ 为什么**两边都断言**（ocr / manual）：只断言 OCR 那一侧的话，
+      "永远写 ocr"这种改法照样绿；两个方向都钉住才是活的守卫。
+    """
+    from jobhunter.cli.commands import job_cmd
+
+    monkeypatch.setattr(ocr_module, "find_shotocr", lambda _settings=None: (fake_shotocr, None))
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n(fake image)")
+
+    details, failures = job_cmd._collect_details(
+        urls=None,
+        file=None,
+        manual=False,
+        text=None,
+        html_file=None,
+        url=None,
+        platform=None,
+        image=image,
+        settings=settings,
+    )
+
+    assert failures == []
+    assert len(details) == 1
+    assert details[0].raw["source"] == "ocr", f"OCR 的来源没标成 ocr：{details[0].raw}"
+    assert details[0].raw["ocr"]["source"], "没有留下「用了哪个 shotocr」的诊断信息"
+
+    pasted, pasted_failures = job_cmd._collect_details(
+        urls=None,
+        file=None,
+        manual=False,
+        text="职位描述\n负责 Python 后端开发。",
+        html_file=None,
+        url=None,
+        platform=None,
+        settings=settings,
+    )
+
+    assert pasted_failures == []
+    assert pasted[0].raw["source"] == "manual", f"粘贴文本被标成了 {pasted[0].raw['source']}"
+    assert "ocr" not in pasted[0].raw, "粘贴路径不该带上 ocr 的诊断键"
+
+
 def test_shotocr_is_not_a_hard_dependency() -> None:
     """★★ `uv sync` 不装 shotocr 也必须能跑 jobhunter（#67 §四的验收项）。
 

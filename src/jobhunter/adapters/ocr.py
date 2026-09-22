@@ -197,10 +197,28 @@ def read_image(
     with tempfile.TemporaryDirectory(prefix="jh-ocr-") as tmp:
         txt_path = Path(tmp) / "text.txt"
         json_path = Path(tmp) / "result.json"
+        # ★★ 传给子进程的图片路径**必须绝对化**（2026-09-22 修的真实缺陷）
+        #
+        #   下面 `subprocess.run(..., cwd=workdir)` 会把子进程的工作目录换成 shotocr
+        #   的根目录（vendored 布局下 `find_shotocr` 返回的 `workdir` 非 None）。
+        #   而原来的写法把**用户原样给的字符串**交给 `--file` —— 相对路径于是被
+        #   shotocr 按**新的 cwd** 解析，指向不存在的地方：
+        #
+        #       $ jh job add --image 截图.png          # 文件就在当前目录
+        #       OCR 失败（退出码 2）：截图.png
+        #       shotocr 说：[错误] 图片不存在：截图.png   ← 用户会以为工具坏了
+        #
+        #   问题的本体是**两个基准**：存在性检查用的是父进程的 cwd（所以"文件在"），
+        #   子进程用的是 `workdir`（所以"图片不存在"）。绝对化之后只剩一个基准。
+        #   ★ 文档教的写法正是相对路径（`job_cmd.py` 的 help、`docs/install.md` §10），
+        #     所以这曾经是"照文档抄一遍就失败"。
+        #   ★ 不改 `cwd` 而只加绝对路径：`cwd` 是给 `python -m shotocr` 用的
+        #     （shotocr 自己可能有依赖 cwd 的相对路径），动它风险更大。
+        image_arg = str(target.resolve())
         argv = [
             *prefix,
             "--file",
-            str(target),
+            image_arg,
             "--txt",
             str(txt_path),
             "--json",

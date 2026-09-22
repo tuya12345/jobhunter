@@ -41,6 +41,7 @@ import logging
 import random
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -56,9 +57,23 @@ __all__ = [
     "build_search_url",
     "detect_blocked",
     "extract_job_links",
+    "format_page_list",
     "is_blocked_url",
     "resolve_city_code",
 ]
+
+
+def format_page_list(pages: Iterable[int]) -> str:
+    """把页号写成「第 1 页」/「第 2、3 页」这种人话（**文案口径只有这一份**）。
+
+    ★ 为什么抽出来：发现层与 CLI 都要说"重复来源是哪一页"，
+      各写一份的话迟早有一处又退回写死「第 1 页」（2026-09-22 就是这么错的）。
+    """
+    ordered = sorted({int(page) for page in pages})
+    if not ordered:
+        return "前面某一页"
+    return "第 " + "、".join(str(page) for page in ordered) + " 页"
+
 
 #: BOSS 搜索结果页的 URL 模板。
 #:
@@ -173,6 +188,13 @@ class SearchPageResult:
     #: ★ 这一页读到的链接**全都已经在前面几页出现过**（`--pages` 很可能没生效）。
     #:   见 `search()` 的说明：站点不认 `page=` 参数时，第 2 页与第 1 页是同一批。
     duplicate_of_previous: bool = False
+    #: ★ 那些链接**首次出现在哪几页**（升序、去重）。空元组 = 没判重复。
+    #:
+    #:   为什么必须记下来（2026-09-22 复核发现的缺陷）：判据比的是
+    #:   「前面所有页的并集」，所以重复来源**未必是第 1 页** ——
+    #:   文案若写死「与第 1 页」，在"第 3 页重复第 2 页"时既与事实不符，
+    #:   也会把归因指向反方向（第 1、2 页内容不同 ⇒ 站点其实**是**认 `page=` 的）。
+    duplicate_of_previous_pages: tuple[int, ...] = ()
 
     @property
     def usable(self) -> bool:
@@ -293,6 +315,32 @@ def _absolute(href: str) -> str | None:
     return None
 
 
+def _duplicate_note(index: int, count: int, source_pages: list[int]) -> str:
+    """「这一页是重复的」那句话。**说清重复来源是哪一页**，并按来源给对归因。
+
+    ★★ 为什么归因要分两种（2026-09-22 复核发现的缺陷）：
+
+      原来的文案写死「与**第 1 页**是同一批……站点可能不认 `page=` 参数」。
+      但判据 `page_paths <= first_seen.keys()` 比的是**前面所有页的并集** ——
+      当重复来源**不是**第 1 页时，恰恰说明前面几页**内容不同**，
+      站点其实**是认** `page=` 的（更常见的解释是"结果只有这么多页，
+      最后一页被夹回上一页"）。把归因指向"不认 page="，
+      会让用户去查一个不存在的参数问题。
+    """
+    where = format_page_list(source_pages)
+    if source_pages == [1]:
+        diagnosis = "站点可能不认 `page=` 参数。"
+    else:
+        diagnosis = "站点可能只返回了这么多页（后面几页被夹回上一页）。"
+    return (
+        f"第 {index} 页与{where}是**同一批岗位**"
+        f"（{count} 条全部已经出现过）"
+        f"—— `--pages` 看起来没有生效：{diagnosis}"
+        f"已提前停止，后面几页不再白跑（每页还要一次请求 + "
+        f"{_PAGE_DELAY_RANGE[0]:.0f}~{_PAGE_DELAY_RANGE[1]:.0f} 秒延时）"
+    )
+
+
 class JobDiscovery:
     """按关键词 + 城市把岗位链接找出来（**只找链接，不抓 JD、不写库**）。
 
@@ -336,7 +384,10 @@ class JobDiscovery:
                调用方（`jh job crawl`）会把"这个参数看起来没生效"直接打给用户看。
         """
         results: list[SearchPageResult] = []
-        seen_paths: set[str] = set()
+        # ★ 记的是「每个岗位路径**首次**出现在第几页」，不是"见过没有"（2026-09-22）：
+        #   判据比的是**前面所有页的并集**，所以重复来源未必是第 1 页 ——
+        #   文案必须说它真正重复的那一页（见 `duplicate_of_previous_pages`）。
+        first_seen: dict[str, int] = {}
         total = max(1, int(pages))
 
         for index in range(1, total + 1):
@@ -345,20 +396,17 @@ class JobDiscovery:
             result = self.read_page(url)
 
             page_paths = {urlsplit(job_url).path for job_url in result.job_urls}
-            if index > 1 and page_paths and page_paths <= seen_paths:
+            if index > 1 and page_paths and page_paths <= first_seen.keys():
                 # 整页都是旧的 → 站点多半没认 `page=` 参数
+                source_pages = sorted({first_seen[path] for path in page_paths})
                 result = replace(
                     result,
                     duplicate_of_previous=True,
-                    note=(
-                        f"第 {index} 页与第 1 页是**同一批岗位**"
-                        f"（{len(page_paths)} 条全部已经出现过）"
-                        "—— `--pages` 看起来没有生效：站点可能不认 `page=` 参数。"
-                        f"已提前停止，后面几页不再白跑（每页还要一次请求 + "
-                        f"{_PAGE_DELAY_RANGE[0]:.0f}~{_PAGE_DELAY_RANGE[1]:.0f} 秒延时）"
-                    ),
+                    duplicate_of_previous_pages=tuple(source_pages),
+                    note=_duplicate_note(index, len(page_paths), source_pages),
                 )
-            seen_paths |= page_paths
+            for path in page_paths:
+                first_seen.setdefault(path, index)
             results.append(result)
 
             if result.blocked:
@@ -418,7 +466,21 @@ class JobDiscovery:
         return SearchPageResult(
             page_url=url,
             final_url=final_url,
-            note="这一页没读到岗位链接（可能是空结果 / 需要登录 / 页面结构变了）",
+            # ★★ 候选原因**必须按常见程度排**，而且第一条得是代码自己认定的主因
+            #   （2026-09-22 复核发现的缺陷）：`_wait_for_job_cards` 的实测早就写明
+            #   "同一套代码有时抢到 15 个链接、有时一个都没抢到 —— 不是站点不稳定，
+            #   是**我们出发得太晚**"。而原来的文案只列了「空结果 / 需要登录 /
+            #   页面结构变了」，用户会去查登录、查改版，**真正该做的（重跑一次）
+            #   一个字都没提**。真机实测：同一命令相隔约 1 分钟，一次 15 条、一次 0 条。
+            note=(
+                "这一页没读到岗位链接。可能的原因（按常见程度排）：\n"
+                "    ① **抢读窗口错过了** —— 站点的搜索结果页渲染出来约 1 秒就会把标签页"
+                "自己关掉，我们出发晚一点就只拿到空壳。**重跑一次往往就好了**；\n"
+                "    ② 这一页确实没有结果（换关键词 / 换城市试试）；\n"
+                "    ③ 需要先登录（在那个专用窗口里登录一次，再重跑）；\n"
+                "    ④ 站点改版，链接形态不再是 `/job_detail/<id>.html`"
+                "（那要改 `discover._JOB_LINK_RE` 与 `BOSS_SEARCH_URL`）。"
+            ),
         )
 
     # -- 内部 ------------------------------------------------------------

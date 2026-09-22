@@ -146,6 +146,110 @@ def test_growing_pages_keep_going(settings, monkeypatch) -> None:
     assert all(not result.duplicate_of_previous for result in results)
 
 
+def test_duplicate_page_names_the_page_it_repeats(settings, monkeypatch) -> None:
+    """★★ 重复页的说明必须指向**它真正重复的那一页**，不能写死「第 1 页」。
+
+    ★ 为什么这条判据重要（2026-09-22 复核发现）：判据 `page_paths <= seen_paths`
+      比的是**前面所有页的并集**，所以「第 3 页重复第 2 页」是完全可能的 ——
+      而这时第 1 页与第 2 页内容**不同**，说明站点**是认** `page=` 的。
+      原来的文案却硬写「第 3 页与第 1 页是同一批岗位（站点多半不认 `page=` 参数）」：
+      既与事实不符，也把归因指向了**反方向**，用户会去查一个不存在的参数问题。
+
+    ★ 断言"不能出现「与第 1 页」"而不是只断言"出现「第 2 页」"：
+      前者才是否定式判据 —— 只断言后者的话，文案里同时出现两句也照样绿。
+    """
+    pages = {
+        1: ["https://www.zhipin.com/job_detail/aaaaaaaaaaaa.html"],
+        2: ["https://www.zhipin.com/job_detail/bbbbbbbbbbbb.html"],
+        3: ["https://www.zhipin.com/job_detail/bbbbbbbbbbbb.html"],  # 重复的是第 2 页
+    }
+
+    def _fake_read_page(self, url: str) -> SearchPageResult:  # noqa: ANN001
+        index = int(url.rsplit("page=", 1)[-1])
+        return _page(url, list(pages[index]))
+
+    monkeypatch.setattr(JobDiscovery, "read_page", _fake_read_page)
+    monkeypatch.setattr(JobDiscovery, "_polite_delay", lambda self: None)
+
+    results = JobDiscovery(settings, use_cdp=True).search("Python", "东莞", pages=3)
+
+    duplicate = results[2]
+    assert duplicate.duplicate_of_previous is True
+    assert "第 2 页" in duplicate.note, f"没说清重复的是哪一页：{duplicate.note}"
+    assert "与第 1 页" not in duplicate.note, f"把重复来源写死成第 1 页了：{duplicate.note}"
+    assert "不认" not in duplicate.note, (
+        f"第 1、2 页内容不同说明站点**是**认 page= 的，不该往那个方向归因：{duplicate.note}"
+    )
+    assert duplicate.duplicate_of_previous_pages == (2,)
+
+
+def test_empty_page_note_mentions_the_grabbing_window(settings, monkeypatch) -> None:
+    """★★ 0 链接时的归因必须包含「抢读窗口错过」—— 那是代码自己认定的主因。
+
+    ★ 为什么（2026-09-22 真机实测）：同一命令相隔约 1 分钟，一次读到 **15 条**、
+      一次读到 **0 条**。`discover._wait_for_job_cards` 的 docstring 早就写明
+      「不是站点不稳定，是**我们出发得太晚**」——
+      而原来的兜底文案只列了「空结果 / 需要登录 / 页面结构变了」，
+      用户会去查登录、查改版，而真正该做的（**重跑一次**）一个字都没提。
+
+    ★ 只断言关键词会漏掉"句子读起来对不对"，所以这里同时钉住
+      「重跑」这个**动作**必须在文案里（那才是用户该做的事）。
+    """
+    monkeypatch.setattr(
+        JobDiscovery, "_render", lambda self, url: ("<html>空壳页面</html>", url, None)
+    )
+
+    result = JobDiscovery(settings, use_cdp=True).read_page(
+        "https://www.zhipin.com/web/geek/job?query=Python&city=101281600&page=2"
+    )
+
+    assert result.job_urls == []
+    assert "抢读" in result.note, f"没有把「抢读窗口」列进候选原因：{result.note}"
+    assert "重跑" in result.note, f"没有告诉用户「重跑一次」这个动作：{result.note}"
+
+
+def test_crawl_alert_names_the_right_duplicate_page(settings, monkeypatch) -> None:
+    """★★ **用户可见的那一层**：CLI 的 `--pages` 告警必须说对重复来源是哪一页。
+
+    ★ 为什么发现层已有用例、这里还要再来一条：这句文案在**两处**各写了一份
+      （`discover._duplicate_note` 与 `job_cmd` 的告警），
+      `job_cmd` 原来自己写死「与第 1 页」—— 发现层改对了它也不会跟着对。
+      这条走**真的** `JobDiscovery.search`（只替换 `read_page`），
+      所以 `duplicate_of_previous_pages` 是被真的写进去的，不是造出来的。
+
+    ★ 断言前先把换行抹掉：rich 会按终端宽度折行，折在关键词中间会让
+      `in result.output` 假红/假绿。
+    """
+    from typer.testing import CliRunner
+
+    from jobhunter.cli.commands import job_cmd
+
+    pages = {
+        1: ["https://www.zhipin.com/job_detail/aaaaaaaaaaaa.html"],
+        2: ["https://www.zhipin.com/job_detail/bbbbbbbbbbbb.html"],
+        3: ["https://www.zhipin.com/job_detail/bbbbbbbbbbbb.html"],  # 重复第 2 页
+    }
+
+    def _fake_read_page(self, url: str) -> SearchPageResult:  # noqa: ANN001
+        index = int(url.rsplit("page=", 1)[-1])
+        return _page(url, list(pages[index]))
+
+    monkeypatch.setattr(JobDiscovery, "read_page", _fake_read_page)
+    monkeypatch.setattr(JobDiscovery, "_polite_delay", lambda self: None)
+    monkeypatch.setattr(job_cmd, "_prepare_cdp", lambda _settings: object())
+
+    result = CliRunner().invoke(
+        job_cmd.app,
+        ["crawl", "-q", "Python", "--city", "东莞", "--pages", "3", "--dry-run"],
+    )
+
+    flat = result.output.replace("\n", "")
+    assert "看起来**没有生效**" in flat, "`--pages` 无效的告警没有打出来"
+    assert "与第 2 页是同一批岗位" in flat, f"没说对重复来源是哪一页：{flat}"
+    assert "与第 1 页是同一批岗位" not in flat, "CLI 把重复来源写死成第 1 页了"
+    assert "不认 `page=`" not in flat, "第 1、2 页内容不同，不该往那个方向归因"
+
+
 # ===========================================================================
 # P4：端口后面必须是我们那个专用实例
 # ===========================================================================
@@ -248,6 +352,50 @@ def test_owner_error_is_not_swallowed_by_the_fallback(settings, monkeypatch) -> 
     assert detail is not None
     assert detail.fetch_status == "failed"
     assert detail.fetch_note and "专用浏览器" in detail.fetch_note
+
+
+def test_crawl_reports_a_wrong_browser_instead_of_a_traceback(settings, monkeypatch) -> None:
+    """★★ `jh job crawl` 遇到「连错浏览器」也必须**说人话**，不能抛 traceback。
+
+    ★ 为什么单独一条（2026-09-22 复核发现的真实缺陷）：
+      `jh job add --cdp` 那条路会把 `CdpOwnerError` 翻成 `fetch_note` 打印出来
+      （`manual.fetch_detail` 捕获，见上一条用例），而 `jh job crawl` 这条路
+      **上游没人接** —— 异常一路穿到 typer，用户看到的是一整屏调用栈，
+      精心写的中文处置说明（含「怎么办（二选一）」）被埋在最后一行。
+      同一个错误、两条路两种待遇，而 crawl 恰恰是 #67 的主角。
+
+    ★ 判据为什么是"异常类型"而不是 `result.exception is None`：
+      `typer.Exit(code=1)` 在 CliRunner 里会被记成 `SystemExit`，
+      所以"没有异常"永远不成立。真正要守的是
+      **`CdpOwnerError` 不许直接冒到用户面前**（那才是 traceback 的来源）。
+    """
+    from typer.testing import CliRunner
+
+    from jobhunter.cli.commands import job_cmd
+
+    def _boom(self, keyword, city, *, pages=1):  # noqa: ANN001, ANN202
+        raise cdp_module.CdpOwnerError(
+            "CDP 端口 9333 后面**不是本工具的专用浏览器**，已停下：\n"
+            "  怎么办（二选一）：\n"
+            "    · 换一个端口：config.yaml 里 `browser.cdp_port: 9334`，再重跑；\n"
+            "    · 或者把占着这个端口的那个实例关掉，再重跑。"
+        )
+
+    monkeypatch.setattr(JobDiscovery, "search", _boom)
+    # 不真的去起浏览器（这一步与归属校验无关）
+    monkeypatch.setattr(job_cmd, "_prepare_cdp", lambda _settings: object())
+
+    result = CliRunner().invoke(
+        job_cmd.app,
+        ["crawl", "-q", "Python", "--city", "东莞", "--pages", "2", "--dry-run"],
+    )
+
+    assert not isinstance(result.exception, cdp_module.CdpOwnerError), (
+        f"crawl 路径把 CdpOwnerError 直接抛给用户了（会显示 traceback）：{result.exception!r}"
+    )
+    assert result.exit_code == 1, "连错浏览器必须以非 0 退出（不许假报成功）"
+    assert "专用浏览器" in result.output, "原因没有打印给用户"
+    assert "cdp_port" in result.output, "可操作的出路没有打印给用户"
 
 
 # ===========================================================================
@@ -355,6 +503,18 @@ def test_watermark_is_removed_from_pasted_text() -> None:
 #: 这些文件是"**讲当前行为**"的（用户与下一个人靠它们判断工具会做什么、不会做什么）。
 #: 历史记录类文件（`docs/REVIEW-*.md`、`docs/STATUS.md` 的旧轮次、`docs/ISSUES.md`）
 #: **不在**名单里 —— 它们本来就该保留当时的原话（改掉反而是篡改历史）。
+#:
+#: ★★ 为什么 `docs/COMPLIANCE.md` **也**不在名单里（2026-09-22 复核时补的说明）：
+#:   它确实是"讲当前行为"的，但它**故意引用旧话**，加进来会**误报**（实测确认）：
+#:     · `COMPLIANCE.md:182` 明写「原标题是『翻页：**当前没有自动翻页路径**』」——
+#:       改写处显式说明改了什么，这是**对**的做法，不该判红；
+#:     · `COMPLIANCE.md:445` 的「不做批量抓取」说的是 `projects/leadhunter`
+#:       **采集端**（另一个仓库），不是本仓库的当前行为。
+#:   → 它改由**正向**那条用例守着：`test_authorization_is_written_down_where_it_matters`
+#:     要求 COMPLIANCE 有 §5.8 / `2026-09-21` / 「授权」/「不自动投递」。
+#:   ⚠️ 残余风险（如实记下）：往 COMPLIANCE.md 的**当前行为段落**里塞一句真正的过期红线，
+#:     不会有任何用例变红。真要收紧应改成"按小节判定"（跳过标了历史引用的段落），
+#:     而不是简单把它加进这个名单 —— 那样只会拿到一个假红灯。
 _CURRENT_BEHAVIOUR_DOCS = (
     "README.md",
     "config.yaml",
