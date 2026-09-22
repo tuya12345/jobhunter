@@ -38,10 +38,21 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from jobhunter import __version__
+from jobhunter.config.settings import get_settings
 from jobhunter.models import Application, Company, Job
-from jobhunter.services import apply_svc, leads_svc
+from jobhunter.services import (
+    apply_svc,
+    interview_svc,
+    leads_svc,
+    question_svc,
+    stats_svc,
+    today_svc,
+    track_svc,
+    weak_svc,
+)
 from jobhunter.storage.db import create_db_engine, database_problem, make_session_factory
 from jobhunter.utils.logging import get_logger
+from jobhunter.web import serialize
 
 logger = get_logger(__name__)
 
@@ -211,6 +222,10 @@ def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> Fa
             ]
         }
 
+    # P8 的四个只读页面接口：抽到 `_register_page_routes`（create_app 已经够长，
+    # 而且那四条与线索页的读写接口是**两组不同的关注点**）。
+    _register_page_routes(app, get_session=get_session, require_schema=_require_schema)
+
     # ------------------------------------------------------------------
     # 唯一的写接口
     # ------------------------------------------------------------------
@@ -352,3 +367,141 @@ def _lead_application_count(session: Session, row: Company) -> int:
         )
         or 0
     )
+
+
+def _register_page_routes(app: FastAPI, *, get_session: Any, require_schema: Any) -> None:
+    """注册 P8 的四个**只读**页面接口（今日清单 / 看板 / 时间轴 / 问题与统计）。
+
+    ★★ 只读是刻意的（理由见每条接口的 docstring）：CLI 的 `jh today` 会生成开场白并写
+      pending 记录，而"打开网页 = 调模型 + 写库"会让刷新变成花钱、还留下幽灵记录。
+      页面这条路只读库里已有的东西，没有就如实说"去命令行生成"。
+    """
+
+    # ------------------------------------------------------------------
+    # P8 页面接口（今日清单 / 看板 / 面试与薄弱点 / 统计）
+    # ------------------------------------------------------------------
+    #
+    # ★★ 四条都是**只读**（GET 不写库、不调模型）——这是刻意的：
+    #
+    #   CLI 的 `jh today` 会**生成开场白**并写 pending 投递记录（那是"一条命令干完一轮"的
+    #   产品设计）。网页如果照抄那条路径，就会出现"打开页面 = 调模型 = 写库"，
+    #   刷新三次花三次钱、还留下三条 pending。所以页面这条路：
+    #     · 开场白**只读库里已有的**（`applications.greeting_text`）；
+    #     · 库里没有就如实说"还没生成，去命令行跑 jh today"，并给出命令。
+    #   要生成就在 CLI 里生成 —— 页面的职责是"看和复制"，不是"替我花钱"。
+    @app.get("/api/today")
+    def today(session: Session = Depends(get_session)) -> dict[str, Any]:
+        """今日待投清单（只读版本：不生成开场白、不写库）。"""
+        require_schema()
+        settings = get_settings()
+        jobs, candidates, dropped = today_svc.select_candidates(session, settings=settings)
+        items: list[dict[str, Any]] = []
+        missing_greeting = 0
+        for job in jobs:
+            application = apply_svc.get_latest_application(session, job.id)
+            greeting = (application.greeting_text if application else None) or None
+            if greeting is None:
+                missing_greeting += 1
+            items.append(
+                {
+                    "job_id": job.id,
+                    "company": job.company or "",
+                    "title": job.title or "",
+                    "city": job.city,
+                    "salary_text": job.salary_text,
+                    "match_score": job.match_score,
+                    "url": job.url,
+                    "greeting_text": greeting,
+                    "greeting_variant": (application.greeting_variant if application else None),
+                    "application_id": application.id if application else None,
+                }
+            )
+        return {
+            "candidates": candidates,
+            "shown": len(items),
+            "dropped": dropped,
+            "missing_greeting": missing_greeting,
+            "generate_hint": (
+                f"有 {missing_greeting} 条还没生成开场白 —— 在命令行跑 `jh today` 生成"
+                "（网页只读，不替你调模型/写库）"
+                if missing_greeting
+                else None
+            ),
+            "items": items,
+        }
+
+    @app.get("/api/dashboard")
+    def dashboard(session: Session = Depends(get_session)) -> dict[str, Any]:
+        """求职看板：岗位状态分布 + 该我动手的投递 + 接下来的面试。"""
+        require_schema()
+        status_rows = session.execute(
+            select(Job.status, func.count()).group_by(Job.status).order_by(Job.status)
+        ).all()
+        actionable = apply_svc.list_actionable(session)
+        upcoming = interview_svc.list_interviews(session, upcoming=True)
+        return {
+            "jobs_by_status": [
+                {"status": status, "count": int(count)} for status, count in status_rows
+            ],
+            "jobs_total": int(session.scalar(select(func.count()).select_from(Job)) or 0),
+            "actionable": [
+                {
+                    "job_id": row.job_id,
+                    "application_id": row.application_id,
+                    "company": row.company,
+                    "title": row.title,
+                    "status": row.status,
+                    "days": row.days,
+                    "reason": row.reason,
+                }
+                for row in actionable
+            ],
+            "upcoming_interviews": serialize.as_payload(upcoming),
+        }
+
+    @app.get("/api/jobs/{job_id}/timeline")
+    def job_timeline(job_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
+        """一个岗位的投递时间轴（读 append-only 事件流）。"""
+        require_schema()
+        try:
+            timeline = track_svc.build_timeline(session, job_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return serialize.as_payload(timeline)
+
+    @app.get("/api/questions")
+    def questions(
+        session: Session = Depends(get_session),
+        top: int = 10,
+        recorded_only: bool = False,
+    ) -> dict[str, Any]:
+        """面试问题清单 + 薄弱点聚合（`top` 控制薄弱点返回几个知识点）。"""
+        require_schema()
+        rows = question_svc.list_questions(session)
+        weak = weak_svc.build_weak_report(session, top=top, recorded_only=recorded_only)
+        return {
+            "questions": [
+                {
+                    "id": row.question.id,
+                    "question": row.question.question,
+                    "answer": row.question.my_answer,
+                    "rating": row.question.rating,
+                    "category": row.question.category,
+                    "is_weak": row.question.is_weak,
+                    "source": row.question.source,
+                    "company": row.company,
+                    "title": row.title,
+                    "round": row.round_,
+                    "interview_id": row.interview_id,
+                    "job_id": row.job_id,
+                }
+                for row in rows
+            ],
+            "weak": serialize.as_payload(weak),
+        }
+
+    @app.get("/api/stats")
+    def stats(session: Session = Depends(get_session), days: int | None = None) -> dict[str, Any]:
+        """转化率统计（页面画柱状图用）。`days` 只看最近 N 天投出去的。"""
+        require_schema()
+        return serialize.as_payload(stats_svc.build_stats(session, days=days))
