@@ -305,10 +305,48 @@ def test_owner_check_rejects_a_default_profile(tmp_path: Path) -> None:
         cdp_module.ensure_our_browser(_FakeBrowser(profile=None), endpoint)
 
 
-def test_owner_check_gives_up_quietly_when_unanswerable(tmp_path: Path) -> None:
-    """问不出来（老浏览器不支持这个命令）→ **不阻断**（否则这条路在旧版上全废）。"""
+def test_owner_check_stops_when_unanswerable_and_unknown(tmp_path: Path) -> None:
+    """问不出来（老浏览器不支持这条命令）**且没有归属标记** → 停下（2026-09-22 改）。
+
+    ★ 原行为是"警告后放行"，那等于在旧版浏览器上**没有任何**归属校验。
+      现在的口径：**证明不了 + 不像我们起的 → 停下**（宁可让用户换个端口，
+      也不要用别人的登录态读页面）。
+    """
     endpoint = cdp_module.CdpEndpoint(port=9333, started=False, profile_dir=tmp_path / "ours")
-    cdp_module.ensure_our_browser(_FakeBrowser(profile=None, raises=True), endpoint)
+    with pytest.raises(cdp_module.CdpOwnerError) as excinfo:
+        cdp_module.ensure_our_browser(_FakeBrowser(profile=None, raises=True), endpoint)
+
+    message = str(excinfo.value)
+    assert "无法确认" in message
+    assert "cdp_port" in message  # 给出可操作的出路
+
+
+def test_owner_check_allows_our_own_instance_when_unanswerable(tmp_path: Path) -> None:
+    """问不出来，但专用 profile 里有**本工具的归属标记** → 放行（只记一条日志）。
+
+    ★ 为什么必须放行：Edge 在 Windows 上不支持那条查询命令，而第二次跑 `jh job crawl`
+      时端口上正是**我们自己上次起的**实例 —— 拦下它等于功能不可用。
+      标记由 `ensure_cdp_browser` 起实例时写入（`_write_owner_marker`）。
+    """
+    profile = tmp_path / "cdp-profile"
+    profile.mkdir()
+    cdp_module._write_owner_marker(profile, port=9333, executable=None)
+    endpoint = cdp_module.CdpEndpoint(port=9333, started=False, profile_dir=profile)
+
+    cdp_module.ensure_our_browser(_FakeBrowser(profile=None, raises=True), endpoint)  # 不抛 = 放行
+
+
+def test_owner_marker_is_not_trusted_from_a_foreign_profile(tmp_path: Path) -> None:
+    """反向守卫：标记在**别的**目录里不算数（只认专用 profile 自己那个目录）。"""
+    ours = tmp_path / "ours"
+    ours.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    cdp_module._write_owner_marker(other, port=9333, executable=None)
+    endpoint = cdp_module.CdpEndpoint(port=9333, started=False, profile_dir=ours)
+
+    with pytest.raises(cdp_module.CdpOwnerError):
+        cdp_module.ensure_our_browser(_FakeBrowser(profile=None, raises=True), endpoint)
 
 
 def test_owner_error_is_not_swallowed_by_the_fallback(settings, monkeypatch) -> None:

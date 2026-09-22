@@ -209,14 +209,33 @@ class _FakeContext:
         self.closed = True
 
 
+class _FakeCdpSession:
+    """假的 browser 级 CDP 会话：回答"你的 --user-data-dir 是哪个"。
+
+    ★ 2026-09-22 起 `cdp.ensure_our_browser` 会问这一句（#67 优先级 4）——
+      假浏览器也得答得出来，否则测试会走进"证明不了归属 → 停下"那条路。
+    """
+
+    def __init__(self, profile: str) -> None:
+        self._profile = profile
+
+    def send(self, method: str) -> dict[str, object]:
+        assert method == "Browser.getBrowserCommandLine"
+        return {"arguments": ["msedge.exe", f"--user-data-dir={self._profile}"]}
+
+
 class _FakeChromium:
     def __init__(self, context: _FakeContext) -> None:
         self._context = context
         self.endpoint: str | None = None
+        #: 假浏览器自称的 profile 目录（默认就是测试里那个 `Path("x")`）
+        self.profile = "x"
 
     def connect_over_cdp(self, endpoint: str) -> object:
         self.endpoint = endpoint
-        return type("B", (), {"contexts": [self._context]})()
+        browser = type("B", (), {"contexts": [self._context]})()
+        browser.new_browser_cdp_session = lambda: _FakeCdpSession(self.profile)  # type: ignore[attr-defined]
+        return browser
 
 
 class _FakePlaywright:

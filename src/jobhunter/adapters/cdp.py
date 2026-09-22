@@ -291,7 +291,8 @@ def ensure_cdp_browser(
         on_message(
             f"正在打开一个**给工具用的**浏览器窗口（专用配置目录：{profile}）。\n"
             "  第一次用请在那个窗口里登录一次 BOSS/目标站点；之后就不用再登了。\n"
-            "  它与你日常那个浏览器互不影响。"
+            "  ★ 那个窗口里现在可能是**空白页**（批量抓取跑完会把工具开的标签页收掉，\n"
+            "    剩下这个空白页）—— 在地址栏里敲站点域名、登录即可；它与你日常那个浏览器互不影响。"
         )
 
     # ★ 只起一个空白页 —— 具体岗位链接由调用方随后导航过去（见 `_render_page_via_cdp`）。
@@ -312,6 +313,11 @@ def ensure_cdp_browser(
     deadline = time.monotonic() + _CDP_PROBE_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if is_cdp_listening(port):
+            # ★ 记一个**归属标记**（2026-09-22）：这台机器上的 Edge 不支持
+            #   `Browser.getBrowserCommandLine`，于是"端口后面是谁"证明不了。
+            #   标记的作用是区分两种"证明不了"：**我们自己起过的**（放行，见
+            #   `ensure_our_browser`）与**来源不明的**（停下）。
+            _write_owner_marker(profile, port=port, executable=executable)
             return CdpEndpoint(port=port, started=True, profile_dir=profile, executable=executable)
         time.sleep(_CDP_PROBE_INTERVAL_SECONDS)
 
@@ -371,26 +377,47 @@ def ensure_our_browser(browser: Any, endpoint: CdpEndpoint) -> None:
     ★ 判据用的是**启动命令行里的 `--user-data-dir`**（见 `_browser_profile_of`）：
       它和 `cdp_profile_dir()` 给出的目录必须一致 —— 那是我们自己起的实例的标识。
 
-    ★ 三种结果分开处理（不混成一句"连不上"）：
+    ★ 四种结果分开处理（不混成一句"连不上"）：
 
-      · 命令行**拿不到** → 记一条 WARNING 放行（浏览器版本不支持这个命令，
-        把"问不出来"当成"不是我们的"会让这条路在旧版浏览器上彻底不可用）；
-      · 命令行里**没有** `--user-data-dir`（返回空串）→ **判定为别人的实例**：
+      · 命令行里的目录**就是**我们的 profile → `confirmed`，放行；
+      · 命令行里**没有** `--user-data-dir`（返回空串）→ 判定为**别人的**实例：
         我们自己起实例时**一定**带这个参数（见 `ensure_cdp_browser`），
-        所以"没有"就说明不是我们起的；
-      · 有但不是我们的目录 → 判定为别人的实例。
+        所以"没有"就说明不是我们起的 → 抛错；
+      · 有但不是我们的目录 → 判定为别人的实例 → 抛错；
+      · 命令行**拿不到**（浏览器版本不支持这条命令，本机实测的 Edge 就是）→
+        `unverifiable`。这时才看**归属标记**（`_write_owner_marker` 在起实例时写的）：
+          - 标记在、且是我们这个 profile → 说明"本工具先前用这个 profile 起过实例"，
+            **警告后放行**（不然第二次跑 `jh job crawl` 就会被自己拦下，功能等于不可用）；
+          - 没有标记 → **来源不明 → 抛错**（宁可让用户换个端口，也不用别人的登录态读页面）。
 
     Raises:
-        CdpOwnerError: 端口后面不是我们那个专用实例。
+        CdpOwnerError: 端口后面不是我们那个专用实例（或证明不了且不像我们起的）。
     """
     found = _browser_profile_of(browser)
     if found is None:
-        logger.warning(
-            "连上了 CDP 端口 %s，但问不出它的启动命令行（这个浏览器版本不支持 "
-            "Browser.getBrowserCommandLine）—— 无法确认它是不是本工具的专用实例，先按可用处理",
-            endpoint.port,
+        marker = _read_owner_marker(endpoint.profile_dir)
+        if marker is not None:
+            logger.warning(
+                "连上了 CDP 端口 %s：问不出启动命令行（这个浏览器版本不支持 "
+                "Browser.getBrowserCommandLine），但专用 profile 里有本工具的归属标记"
+                "（%s 起过）—— 按'是我们自己那个实例'放行。若你怀疑连错了浏览器："
+                "换 browser.cdp_port 或关掉那个实例。",
+                endpoint.port,
+                marker.get("started_at", "?"),
+            )
+            return
+        raise CdpOwnerError(
+            f"CDP 端口 {endpoint.port} 上**已经有一个浏览器**，但无法确认它是不是本工具的专用实例："
+            + "\n"
+            f"    这个浏览器不支持那条查询命令（Browser.getBrowserCommandLine）\n"
+            f"    而专用 profile（{endpoint.profile_dir}）里**没有**本工具的归属标记\n"
+            "  为什么不停下不行：无法确认时连上去，可能是在**用别人的登录态**读页面 ——\n"
+            "    抓到的内容既不可复现，也说不清是从哪个会话里读出来的。\n"
+            "  怎么办（二选一）：\n"
+            f"    · 换一个端口：config.yaml 里 `browser.cdp_port: 9334`，再重跑；\n"
+            "    · 或者把占着这个端口、又不是本工具窗口的那个实例关掉，再重跑\n"
+            "      （本工具自己的实例会在专用 profile 里留标记，不会被这条拦下）。"
         )
-        return
     if found and _same_dir(found, endpoint.profile_dir):
         return
 
@@ -405,6 +432,41 @@ def ensure_our_browser(browser: Any, endpoint: CdpEndpoint) -> None:
         f"    · 换一个端口：config.yaml 里 `browser.cdp_port: 9334`，再重跑；\n"
         "    · 或者把占着这个端口的那个实例关掉（先确认它不是本工具的窗口），再重跑。"
     )
+
+
+#: 归属标记的文件名（写在**专用 profile 目录**里，那里已经 gitignore）
+_OWNER_MARKER_NAME = "jobhunter-owner.json"
+
+
+def _owner_marker_path(profile: Path) -> Path:
+    return Path(profile) / _OWNER_MARKER_NAME
+
+
+def _write_owner_marker(profile: Path, *, port: int, executable: Path | None) -> None:
+    """记下"本工具用这个 profile 在哪个端口起过实例"（写不进去只记日志，不影响抓取）。"""
+    payload = {
+        "tool": "jobhunter",
+        "port": port,
+        "profile": str(profile),
+        "executable": str(executable) if executable else None,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    try:
+        _owner_marker_path(profile).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:  # pragma: no cover - 磁盘/权限问题不该让抓取失败
+        logger.warning("写归属标记失败（不影响抓取）：%s", exc)
+
+
+def _read_owner_marker(profile: Path) -> dict[str, Any] | None:
+    """读归属标记；没有/坏了都返回 None（**不猜**：读不出来就当"来源不明"）。"""
+    try:
+        raw = _owner_marker_path(profile).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) and payload.get("tool") == "jobhunter" else None
 
 
 def cdp_page(playwright: Any, endpoint: CdpEndpoint) -> Any:
