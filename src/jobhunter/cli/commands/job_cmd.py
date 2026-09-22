@@ -358,6 +358,29 @@ def job_crawl(
     )
 
 
+def _report_page_yield(per_page_new: list[tuple[int, int]], *, pages: int) -> None:
+    """把"每页各带来多少条新岗位"如实打出来，收益很低时明确告警。
+
+    ★★ 为什么需要它（2026-09-22 真机实测发现）：同一个关键词，BOSS 第 1/2/3 页
+      分别是 **15 / 16 / 17** 条 —— 后面每页**只多 1 条**。而工单里那条
+      "整页重复才告警"的判据永远不会触发（三页互有新增），
+      于是用户会以为 `--pages 3` 多抓了两页的量。这种"参数看起来有用、其实几乎没用"
+      的落差必须说出来，否则用户会把"多翻页"当成常规手段。
+    """
+    if pages <= 1 or len(per_page_new) <= 1:
+        return
+    breakdown = "　".join(f"第 {index} 页 +{added}" for index, added in per_page_new)
+    console.print(f"  [dim]{breakdown}[/dim]")
+    extra = sum(added for index, added in per_page_new if index > 1)
+    first_page = per_page_new[0][1]
+    if extra <= max(2, first_page // 5):
+        warn(
+            f"--pages {pages} 的**收益很低**：第 2 页起一共只多带来 {extra} 条新岗位"
+            f"（第 1 页就有 {first_page} 条）—— 站点对同一关键词的排序几乎一样。\n"
+            "  想拿到更多岗位：换关键词 / 换城市，或用 `jh job add --file` 喂你自己整理的链接。"
+        )
+
+
 def _search_and_collect_targets(
     *,
     query: str,
@@ -404,6 +427,8 @@ def _search_and_collect_targets(
     # 不另写一套 —— 否则"什么算同一个链接"会有两种答案）。
     seen: dict[str, str] = {}
     ineffective_pages: list[int] = []
+    # 每页**新**贡献了多少条（真机实测：BOSS 三页 15/16/17 —— 后面每页只多 1 条）
+    per_page_new: list[tuple[int, int]] = []
     # ★ 重复来源页号：发现层记的（`duplicate_of_previous_pages`）。
     #   为什么不让这里猜"就是第 1 页"（2026-09-22 修）：判据比的是前面所有页的并集，
     #   重复来源未必是第 1 页；猜错会把归因指向反方向（见 `discover._duplicate_note`）。
@@ -415,10 +440,13 @@ def _search_and_collect_targets(
                 duplicate_source_pages = result.duplicate_of_previous_pages
         if result.note:
             warn(f"{result.page_url}\n    {result.note}")
+        added = 0
         for url in result.job_urls:
             key = job_svc.url_dedup_key(url)
             if key and key not in seen:
                 seen[key] = url
+                added += 1
+        per_page_new.append((index, added))
 
     # ★★ `--pages` 静默无效必须**明说**（#67 优先级 2）：
     #   BOSS 不认 `page=` 参数时，第 2 页抓回来的还是第 1 页那一批 ——
@@ -455,6 +483,8 @@ def _search_and_collect_targets(
         raise typer.Exit(code=1)
 
     console.print(f"  读到 [bold]{len(targets)}[/bold] 个不重复的岗位链接")
+    _report_page_yield(per_page_new, pages=pages)
+
     if len(targets) > limit:
         console.print(f"  [dim]按 --limit {limit} 截断（剩下的换一次跑）[/dim]")
         targets = targets[:limit]

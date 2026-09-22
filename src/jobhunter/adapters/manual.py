@@ -57,9 +57,11 @@ from jobhunter.adapters.parse_html import (
     detect_access_wall,
     detect_platform,
     extract_platform_job_id,
+    is_chrome_line,
     parse_detail_from_html,
     strip_watermarks,
 )
+from jobhunter.adapters.parse_text import extract_city
 from jobhunter.config.settings import AppSettings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -877,6 +879,9 @@ _JD_END_MARKERS: tuple[str, ...] = (
 )
 
 
+# ★ 站点操作条（`微信扫码分享` / `举报` …）的名单与判据住在 `parse_html` 里：
+#   两条路径（渲染文本 / HTML）都要用，而 `manual` 依赖 `parse_html`——
+#   放这边会成环，放那边两边都能 import。这里只保留"逐行丢掉"的那一步调用。
 def _longest_rendered_text(page: Any, *, min_length: int = 80) -> str | None:
     """在**渲染后的页面**里找"最长的文本块"，清理后当作 JD 正文。
 
@@ -1007,6 +1012,14 @@ def _clean_rendered_text(raw: str) -> str:
     lines = [strip_watermarks(line) for line in lines]
     lines = [line for line in lines if line.strip()]
     lines = [line for line in lines if not _is_filler_line(line)]
+    # ★★ 去掉"站点自己的操作条"（2026-09-22 真机实测 5/5 条命中）：
+    #    `微信扫码分享` / `举报` 会落在正文起点之前，而"挑最长的一行当标题"
+    #    恰好会把它选中并留在 JD 开头（见 `_CHROME_LINES` 的说明）。
+    #    必须在**找正文起点之前**去掉：否则它们还会参与 `_pick_header_title_line`。
+    chrome_removed = [line for line in lines if is_chrome_line(line)]
+    if chrome_removed:
+        logger.info("丢掉 %d 行站点操作条（例如 %r）", len(chrome_removed), chrome_removed[0][:30])
+    lines = [line for line in lines if not is_chrome_line(line)]
 
     # 找正文起点
     start_index = len(lines)
@@ -1042,11 +1055,42 @@ def _pick_header_title_line(header: list[str]) -> str | None:
 
     判据：**最长的那一行**。导航项都是"首页""登录"这种极短词，
     而岗位名通常带方向与级别（实测 `算法工程师｜LLM / AI Agent 方向`）。
+
+    ★★ 但"最长"会被**推荐位的卡片标题**骗到（2026-09-22 真机实测）：
+      原始渲染文本的前 25 行全是"相似职位"卡片（岗位名 / 薪资 / 公司 / 城市 × N），
+      其中最长的 `python开发工程师（六险一金 导师带教）` 就被当成了岗位名。
+      所以这里要**排除站点操作条**（`is_chrome_line`），并且**只在"头部本身很短"时
+      才相信它**：头部有十几行同形状的卡片时，说明这个"标题"其实来自推荐位，
+      此时**返回 None**（宁可留空，也不要把推荐位的岗位名当成这一条的标题）。
     """
-    candidates = [line for line in header if len(line) >= 4]
+    candidates = [line for line in header if len(line) >= 4 and not is_chrome_line(line)]
     if not candidates:
         return None
+    # ★ 头部出现大量"同形状"的短行（卡片列表）→ 不可信：真实头部只有字段行与标题行
+    if len(header) > 6 and len(candidates) > 4:
+        return None
+    # ★★ "卡片列表"的第二个特征：**薪资行 + 城市行**（真机推荐位的固定四件套是
+    #    「岗位名 / 薪资 / 公司 / 城市」）。头部里出现两条以上这种"卡片字段"时，
+    #    这不是信息头，而是推荐位 —— 里面的岗位名**不是这一条**的岗位名。
+    card_fields = sum(1 for line in header if _looks_like_card_field(line))
+    if card_fields >= 2:
+        return None
     return max(candidates, key=len)
+
+
+#: 薪资行（`15-30K·14薪` / `100-150元/天`）—— 推荐位卡片的固定字段之一
+_SALARY_LINE_RE = re.compile(r"\d+\s*[-–—]\s*\d+\s*(?:[Kk千Ww万]|元)")
+
+
+def _looks_like_card_field(line: str) -> bool:
+    """这一行像不像"推荐位卡片上的字段"（薪资 / 城市这种孤零零的短行）。
+
+    ★ 只用来判断"头部是不是卡片列表"，不用来删内容 —— 判错的代价只是"不从渲染文本里取标题"。
+    """
+    text = line.strip()
+    if _SALARY_LINE_RE.search(text):
+        return True
+    return len(text) <= 4 and extract_city(text) == text
 
 
 def _is_filler_line(line: str) -> bool:

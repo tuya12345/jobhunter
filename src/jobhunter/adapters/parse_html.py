@@ -46,7 +46,9 @@ __all__ = [
     "PLATFORM_SELECTORS",
     "count_watermarks",
     "detect_platform",
+    "drop_chrome_lines",
     "extract_platform_job_id",
+    "is_chrome_line",
     "parse_detail_from_html",
     "parse_detail_from_text",
     "strip_watermarks",
@@ -219,6 +221,85 @@ def count_watermarks(text: str | None) -> int:
     if not text:
         return 0
     return len(_WATERMARK_IN_CJK_RE.findall(text))
+
+
+# ---------------------------------------------------------------------------
+# 站点自己的操作条（`微信扫码分享` / `举报` …）—— 不是 JD 内容
+# ---------------------------------------------------------------------------
+#: **站点自己的操作条**（出现在正文之前，长得却像"一行短文本"）。
+#:
+#: ★★ 为什么需要这个名单（2026-09-22 真机实测）：
+#:
+#:   "按特征词裁正文"的规则本来能挡住导航，但这两行**恰好落在正文起点之前、
+#:   又短得像标题**，于是两种路径都会把它们留在 JD 开头：
+#:     · 渲染路径：`_pick_header_title_line` 挑"最长的一行"时选中了 `微 信 扫码分享`；
+#:     · HTML 路径：整页/区块文本直接带上了它们（真机 5/5 条命中，`jd_text` 前两行）。
+#:   下游影响：这段噪音会被 `match` 打分、被 `tailor` 抄进定制简历。
+#:
+#: ★ 放在 `parse_html`（而不是 `manual`）：两条路径都要用，而 `manual` 依赖
+#:   `parse_html`（反过来 import 会成环）。
+_CHROME_LINES: tuple[str, ...] = (
+    "微信扫码分享",
+    "扫码分享",
+    "分享",
+    "举报",
+    "收藏",
+    "投诉",
+    "投递",
+    "立即沟通",
+    "继续沟通",
+    "查看全部",
+    "查看更多",
+    "展开",
+    "收起",
+)
+
+#: 站点名/水印词的**碎片**（只在判断"这一整行是不是操作条"时剔掉，不改写正文）。
+#: `直聘` 不做全局水印词是刻意的：`企业直聘`、`厂区直聘` 是正常说法。
+_BRAND_RESIDUE: tuple[str, ...] = ("直聘", "来自", "看准")
+
+
+def is_chrome_line(line: str) -> bool:
+    """这一行是不是"站点自己的操作条"（去掉空白后逐字比对 `_CHROME_LINES`）。
+
+    ★ 判据是"**整行就是**这些词（可拼接）"，不是"包含" ——
+      包含式判据会把正文里正常的"分享""收藏"整行误删（本项目在 #56 吃过同类亏）。
+      实测的注入形态是把两个词粘成一行（`微信扫 直聘 码分享举报`），
+      所以这里允许"**多个已知词拼接成一行**"：拆不动才算正文。
+
+    ★★ 三种真实变体都要能认出来（2026-09-22 真机 dump 里抄下来的形态）：
+
+      · `微信扫码分享` / `举报` —— 直白形态；
+      · `微 信 扫码分享` —— 站点把词**按字切开**（空白先去掉再比）；
+      · `微信扫 直聘 码分享举报` / `微 来自信扫码分享` —— 站点往词中间**插水印词**
+        （见 `_BRAND_RESIDUE`），以及"只剩碎片"的情况（`微 来自信` → 去掉 `来自`
+        后是 `微信`，它只是操作条的一部分 → 仍然算操作条）。
+    """
+    squashed = strip_watermarks(re.sub(r"\s+", "", line))
+    if not squashed or len(squashed) > 24:
+        return False
+    residue = squashed
+    for token in sorted(_CHROME_LINES, key=len, reverse=True):
+        residue = residue.replace(token, "")
+    for fragment in _BRAND_RESIDUE:
+        residue = residue.replace(fragment, "")
+    if not residue:
+        return True
+    # "只剩碎片"：残渣是某个操作条词的一部分（`微信` ⊂ `微信扫码分享`）也算操作条。
+    # ★ 只在**短残渣**上做这个判断：长残渣（≥ 6 字）是正文的概率高得多。
+    return len(residue) <= 5 and any(residue in token for token in _CHROME_LINES)
+
+
+def drop_chrome_lines(text: str | None) -> str:
+    """逐行丢掉站点操作条（返回新文本；**不改写**其它行）。
+
+    ★ 两条路径共用它：渲染路径（`manual._clean_rendered_text`）与 HTML 路径
+      （`parse_detail_from_html` 的 jd_text / 区域文本）。
+    """
+    if not text:
+        return text or ""
+    kept = [line for line in text.splitlines() if not is_chrome_line(line)]
+    return "\n".join(kept).strip()
 
 
 def _strip_optional(value: str | None) -> str | None:
@@ -701,7 +782,10 @@ def parse_detail_from_html(
         platform=platform,
         # ★ 水印词去掉后再入库（`职 boss 位描述` 这类注入 —— 见 `strip_watermarks`）。
         #   结构化字段也要过一遍：注入不挑位置，标题/公司名里同样可能出现。
-        jd_text=strip_watermarks(jd_text or ""),
+        # ★★ 再逐行丢掉**站点操作条**（2026-09-22 真机实测 5/5 条命中）：
+        #    `微信扫码分享` / `举报` 会出现在正文起点之前，HTML 路径同样会把它们带上
+        #    （渲染路径在 `manual._clean_rendered_text` 里也丢一次，两处共用 `is_chrome_line`）。
+        jd_text=drop_chrome_lines(strip_watermarks(jd_text or "")),
         platform_job_id=job_id,
         company=_strip_optional(company),
         title=_strip_optional(title_text),
@@ -1078,8 +1162,18 @@ def _guess_company(html: str, title: str | None) -> str | None:
         ④ 页面 `<title>` 的公司段（`岗位_公司_招聘-BOSS直聘` 这种）
 
       `_main_job_region()` 会把推荐位切掉，所以 ③ 再也不会读到"别家公司"。
+
+    ★★ 2026-09-22 再补一道：③ 与 ④ 都要排除"候选 == 岗位名"（真机 1/5 条命中）
+      见下面 ③ 那段说明与 `_looks_like_the_job_title`。
     """
     region = _main_job_region(html or "")
+
+    # ★ 页面 title 的分段只算一次（③ 的"假候选"判据与 ④ 都要用）。
+    #   注意 ③ 比的是**岗位名那一段**（parts[0]），不是整串 page title ——
+    #   公司名天然会出现在整串 title 里（`「岗位」_公司招聘-BOSS直聘`），
+    #   拿整串去比会把**正确的公司名**也当成"岗位名"挡掉（我第一版就是这么错的，用例抓到了）。
+    title_parts = _split_page_title(title)
+    role_name = title_parts[0] if title_parts else title
 
     # ① BOSS 真实页面：公司名在 sider 里的 a[title] 属性上
     #   （`_text_of_elements_with_class` 返回的是**内层 HTML**，所以能读属性）
@@ -1099,17 +1193,51 @@ def _guess_company(html: str, title: str | None) -> str | None:
                 return candidate
 
     # ③ 主区域内的候选 token（顺序即优先级）
+    #
+    # ★★ 但**必须排除"这个候选其实就是岗位名"**（2026-09-22 真机实测，1/5 条）：
+    #
+    #   真实页面：`class="company-info"` 命中的那个容器，内层文本的**第一行是岗位名**
+    #   （`python开发工程师（大厂，需求多，福利好）`），于是公司名被存成了职位名
+    #   （`company == title`，看起来还挺像对的）。这与 #64 是同一类症状，
+    #   只是那次命中在"相似职位"推荐位、这次在**主区域**里。
+    #
+    #   而这条岗位的**真实公司名就在页面 title 里**
+    #   （`「岗位名招聘」_深圳某大型ICT基础设施和智能终端公司招聘-BOSS直聘`）——
+    #   也就是说：跳过这个假候选，④ 就能给出正确答案。
+    #   → 所以这里**跳过与岗位名相同的候选**，让它继续往下走，而不是就此返回。
     for token in ("company-info", "company-name", "company_name", "cname", "company"):
         for text in _text_of_elements_with_class(region, token):
             candidate = _clean_company(strip_html(text).split("\n")[0])
-            if candidate:
+            if candidate and not _looks_like_the_job_title(candidate, role_name):
                 return candidate
 
     # ④ 页面 title 的公司段
-    parts = _split_page_title(title)
-    if len(parts) >= 2 and parts[-1]:
-        return _clean_company(parts[-1])
+    if len(title_parts) >= 2 and title_parts[-1]:
+        candidate = _clean_company(title_parts[-1])
+        if candidate and not _looks_like_the_job_title(candidate, role_name):
+            return candidate
     return None
+
+
+def _looks_like_the_job_title(candidate: str, title: str | None) -> bool:
+    """这个"公司名"候选其实是不是**岗位名本身**？
+
+    ★ 为什么值得单独一道判据（真机实测，ISSUES #64 的同类）：公司字段一旦装进岗位名，
+      下游的 `name_norm` 去重键、`jh stats` 的渠道/公司聚合、开场白里的"贵司"全部会跟着错，
+      而它**看起来完全正常**（所以没人会发现）。宁可留空（`None`），也不要存一个假的。
+
+    ★ 判据只在"两边都够长"时做包含比较：短串（`Python`）包含关系太容易误伤
+      （`Python` 会命中 `Python开发`）。
+    """
+    if not title:
+        return False
+    left = re.sub(r"\s+", "", candidate)
+    right = re.sub(r"\s+", "", title)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return len(left) >= 6 and (left in right or right in left)
 
 
 #: 公司名里不该出现的"标签行"（真实页面里它们是同一个容器里的标题）
