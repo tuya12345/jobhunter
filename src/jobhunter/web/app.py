@@ -45,6 +45,7 @@ from jobhunter.services import (
     interview_svc,
     leads_svc,
     question_svc,
+    resume_svc,
     stats_svc,
     today_svc,
     track_svc,
@@ -109,6 +110,19 @@ class ApplyRequest(BaseModel):
     job_id: int = Field(description="投到的岗位 id（applications.job_id 是 NOT NULL）")
     status: str = "applied"
     channel: str | None = None
+
+
+class ResumeEditRequest(BaseModel):
+    """`POST /api/resumes/{id}/copies` 的请求体：把**改过的简历内容**存成新的一份。
+
+    ★ `content` 用 `dict`（而不是把 `ResumeContent` 直接当类型）是刻意的：
+      结构不对时要返回**一句中文说明**（422 + detail），而不是 FastAPI 默认那串
+      pydantic 英文报错 —— 后者对本项目的用户等于没提示。
+    """
+
+    content: dict[str, Any] = Field(description="整份简历的结构化内容（ResumeContent 的形状）")
+    name: str | None = Field(default=None, description="新那份的名字；默认自动带时间")
+    make_default: bool = Field(default=True, description="把新那份设为默认简历")
 
 
 def create_app(*, db_url: str | None = None, dist_dir: Path | None = None) -> FastAPI:
@@ -505,3 +519,90 @@ def _register_page_routes(app: FastAPI, *, get_session: Any, require_schema: Any
         """转化率统计（页面画柱状图用）。`days` 只看最近 N 天投出去的。"""
         require_schema()
         return serialize.as_payload(stats_svc.build_stats(session, days=days))
+
+    _register_resume_routes(app, get_session=get_session, require_schema=require_schema)
+
+
+def _register_resume_routes(app: FastAPI, *, get_session: Any, require_schema: Any) -> None:
+    """简历的读与**在线编辑**（P8 工作台左栏）。
+
+    ★★ 编辑 = **存成新的一份**，绝不原地改导入的那份（见 `resume_svc.save_edited_copy`）。
+    """
+
+    # ------------------------------------------------------------------
+    # 简历：读 + **在线编辑**（P8 工作台的左栏）
+    # ------------------------------------------------------------------
+    #
+    # ★★ 编辑的语义是"**存成新的一份**"，绝不原地改导入的那份 ——
+    #   原始简历是用户的资产，网页上手滑改错的代价是重新导入 + 重新解析
+    #   （解析结果还会随解析器版本变）。这与"导出只写新文件"是同一条红线。
+    #   见 `resume_svc.save_edited_copy` 的说明。
+    @app.get("/api/resumes")
+    def list_resumes(session: Session = Depends(get_session)) -> dict[str, Any]:
+        """简历列表（工作台的"切换简历"下拉用）。"""
+        require_schema()
+        return {"resumes": serialize.as_payload(resume_svc.list_resumes(session))}
+
+    @app.get("/api/resumes/{resume_id}")
+    def get_resume(resume_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
+        """一份简历的**结构化内容**（左栏渲染它，也用它做编辑表单的初值）。"""
+        require_schema()
+        row = resume_svc.get_resume(session, resume_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"找不到简历 id={resume_id}")
+        content = resume_svc.content_from_json(row.content_json)
+        return {
+            "id": row.id,
+            "name": row.name,
+            "direction": row.direction,
+            "content_hash": row.content_hash,
+            "is_default": bool(row.is_default),
+            "file_path": str(row.file_path) if row.file_path else None,
+            "created_at": serialize.iso(row.created_at),
+            "content": serialize.as_payload(content),
+        }
+
+    @app.post("/api/resumes/{resume_id}/copies")
+    def save_resume_copy(
+        resume_id: int,
+        request: ResumeEditRequest,
+        session: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        """把改过的简历**存成新的一份**（原始那份不动），默认把新版设为默认。
+
+        ★ 返回里带 `note`：改了简历意味着 **LLM 缓存 key 变了**（`content_hash` 是 key 的
+          组成部分），旧精评分会在下次 `jh match run` 时按新简历重算 ——
+          这句话必须告诉用户，否则他会奇怪"分数怎么和昨天不一样"。
+        """
+        require_schema()
+        source = resume_svc.get_resume(session, resume_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"找不到简历 id={resume_id}")
+        try:
+            content = resume_svc.ResumeContent.model_validate(request.content)
+        except Exception as exc:  # noqa: BLE001 - pydantic 报错形状不稳定，统一转中文
+            raise HTTPException(
+                status_code=422, detail=f"简历内容不符合结构（字段名/类型不对）：{exc}"
+            ) from exc
+        edited, created = resume_svc.save_edited_copy(
+            session,
+            source,
+            content,
+            name=request.name,
+            make_default=request.make_default,
+        )
+        session.commit()
+        return {
+            "resume_id": edited.id,
+            "name": edited.name,
+            "created": created,
+            "is_default": bool(edited.is_default),
+            "content_hash": edited.content_hash,
+            "source_resume_id": source.id,
+            "note": (
+                "已存成新的一份（原始简历没有被改动）。"
+                "简历内容变了 → LLM 缓存 key 也变了，下次 `jh match run` 会按新简历重算分数。"
+                if created
+                else "内容与所选简历完全一致，没有新建记录（设为默认的改动已生效）。"
+            ),
+        }

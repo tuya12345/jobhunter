@@ -60,6 +60,7 @@ from jobhunter.config.vocabulary import BUILTIN_SKILLS
 from jobhunter.models import Resume
 from jobhunter.utils.io import from_json, to_json
 from jobhunter.utils.logging import get_logger
+from jobhunter.utils.time import fmt_datetime_local, now_utc
 
 logger = get_logger(__name__)
 
@@ -88,6 +89,7 @@ __all__ = [
     "parse_resume_file",
     "parse_resume_text",
     "resume_skill_pool",
+    "save_edited_copy",
     "split_resume",
     "strip_volatile_content",
 ]
@@ -2069,6 +2071,67 @@ def parse_resume_file(
             "或换一份文字版 docx。"
         )
     return parse_resume_text(read_result.lines, settings=settings, source_name=target.name)
+
+
+def save_edited_copy(
+    session: Session,
+    source: Resume,
+    content: ResumeContent,
+    *,
+    name: str | None = None,
+    make_default: bool = True,
+    settings: AppSettings | None = None,
+) -> tuple[Resume, bool]:
+    """把"**网页上改过的**简历"存成**新的一份**（P8：在线改简历）。
+
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║ 为什么不原地改那份导入的简历                                            ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    导入的简历是**用户的原始资产**（`jh resume add` 从 docx/txt 解析出来的）。
+    在网页上改字很容易手滑，而"改回去"的代价是重新导入 + 重新解析 ——
+    解析结果未必和当时一模一样（解析器会随版本变）。
+
+    所以这里的语义与"导出只写新文件"（P9 的合规红线）是**同一条**：
+    **编辑 = 新增一份**（名字里带"网页编辑"与时间），原始那份一个字节都不动。
+    用户想回到原始版本，只要在列表里切回去即可（默认简历是可切换的）。
+
+    ★ `content_hash` 必须重算：它是 LLM 缓存 key 的组成部分（见 `compute_content_hash`），
+      也是"改了简历 → 旧的 LLM 精评作废"的判据（ISSUE #17）。
+      调用方要**告诉用户**"下次 `jh match run` 会按新简历重算"。
+
+    Returns:
+        `(简历记录, 是否新建)`。内容与来源完全一致（hash 相同）时返回原记录 + `False`
+        —— 幂等：点两次"保存"不会在库里堆两份一模一样的简历。
+    """
+    settings = settings or get_settings()
+    content_hash = compute_content_hash(content)
+
+    if content_hash == source.content_hash:
+        # 一模一样：不新建（但用户可能刚把它设为默认）
+        if make_default and not source.is_default:
+            _clear_default(session)
+            source.is_default = True
+            session.flush()
+        return source, False
+
+    stamp = fmt_datetime_local(now_utc())
+    resolved_name = name or f"{source.name}（网页编辑 {stamp}）"
+    resume = Resume(
+        name=resolved_name,
+        direction=source.direction or derive_direction(content, settings),
+        content_json=to_json(content.model_dump()),
+        content_hash=content_hash,
+        file_path=None,  # ★ 它不是从文件来的 —— 留空比编一个路径诚实
+        is_default=False,
+    )
+    if make_default:
+        _clear_default(session)
+        resume.is_default = True
+    session.add(resume)
+    session.flush()
+    logger.info("网页编辑的简历存成新的一份：#%s（源 #%s）", resume.id, source.id)
+    return resume, True
 
 
 def add_resume(
